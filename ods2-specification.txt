@@ -1,0 +1,4139 @@
+
+
+
+Files-11 On-Disk Structure Specification
+
+
+Andrew C. Goldstein
+VAX/VMS Software Devlopment
+
+
+11-Jan-1985
+
+
+Copyright (c) 1985 Digital Equipment Corporation, Maynard, Mass.
+
+
+The material included in this functional specification, including  but
+not  limited  to  instruction  times  and  operating  speeds,  is  for
+information purposes only.  All such material  is  subject  to  change
+without  notice.   Consequently Digital Equipment Corporation makes no
+claim and shall not be liable for its accuracy.
+
+
+This software is furnished under a license for use only  on  a  single
+computer system and may be copied only with the inclusion of the above
+copyright notice.  This software, or any other copies thereof, may not
+be provided or otherwise made available to any other person except for
+use on such system and to one  who  agrees  to  these  license  terms.
+Title  to  and  ownership of the software shall at all times remain in
+Digital Equipment Corporation.
+
+
+The information in this document is subject to change  without  notice
+and  should  not  be  construed  as  a commitment by Digital Equipment
+Corporation.
+
+
+Digital Equipment Corporation assumes no responsibility for the use or
+reliability  of  its  software  on  equipment which is not supplied by
+Digital Equipment Corporation.
+
+
+
+Specification Version:
+
+Full Internal Specification
+Files-11 On-Disk Structure                                      Page 2
+
+
+Revision History:
+
+
+15-Jan-1983     Andrew C.  Goldstein
+
+                Corrections   resulting   from   VMS   implementation.
+                Rearrange  reserved file ID's, remove free space file,
+                remove proposed access control list and classification
+                mask formats.
+
+1-Oct-1983      Andrew C.  Goldstein
+
+                Change all field names to VMS  structure  names.   Add
+                disk  quotas,  access control lists, non-discretionary
+                protection, and other  features  developed  since  VMS
+                V1.5.  Add level 0 and level 1 subset descriptions.
+
+11-Jan-1983     Andrew C.  Goldstein
+
+                Changes to level 0 subset definition, based on review.
+Files-11 On-Disk Structure                                      Page 3
+
+
+1  Scope
+
+This document is a specification of the  on-media  structure  that  is
+used  by Files-11.  Files-11 is a general purpose file structure which
+is intended to be the standard file structure for all medium to  large
+PDP-11 and VAX systems.
+
+This document describes structure level 2 of Files-11,  also  referred
+to   as   ODS-2  (on-disk  structure  2).   It  contains  feature  and
+reliability improvements over structure level 1 (ODS-1).
+
+
+
+1.1  Conventions
+
+All numerical values given in this  document  are  in  decimal  radix,
+unless indicated otherwise.
+
+Within the file structure are fields  containing  binary  integers  of
+various  lengths.  Unless otherwise indicated, all these fields are in
+the standard numerical format, which means that the  most  significant
+bits are stored in the highest numbered address.
+
+In the descriptions of various  structures  on  the  disk,  there  are
+fields  that  are  labeled  "not used".  These fields must be zero, so
+that they can be  made  non-zero  for  future  use.   Since  they  are
+reserved  for future use, programs reading these structures should not
+assume that these fields are in fact zero.
+
+
+
+2  Medium
+
+Files-11 is a structure which is imposed on  a  medium.   That  medium
+must  have  certain  properties,  which are described in the following
+section.  Generally speaking, block addressable storage  devices  such
+as  disks  and  Dectape  are  suitable  for  Files-11;  hence Files-11
+structured media are generically referred to as disks.
+
+
+
+2.1  Volume
+
+The basic medium that carries a Files-11 structure is referred to as a
+______                                              _______ ______volume.   A  volume is defined as an ordered set of logical blocks.  A
+logical block is an array of 512 8-bit bytes.  The logical blocks in a
+volume  are  consecutively  numbered  from  0 to n-1, where the volume
+contains n logical blocks.  The number assigned to a logical block  is
+             _______  _____  ______       ___called  its  logical  block  number,  or  LBN.  Files-11 is capable of
+describing volumes up to 2**32 blocks in size.  In practice, a  volume
+should be at least 100 blocks in size to be useful.
+
+The logical blocks of a volume  must  be  randomly  addressable.   The
+volume  must  also  allow  transfers of any length up to 65K bytes, in
+multiples of four bytes.  When a transfer is longer  than  512  bytes,
+Files-11 On-Disk Structure                                      Page 4
+
+
+consecutively  numbered  logical  blocks are transfered until the byte
+count is satisfied.  In other words, the volume can  be  viewed  as  a
+partitioned  array of bytes.  It must allow reads and writes of arrays
+of any length up to 65K bytes, provided that they start on  a  logical
+block  boundary and that the length is a multiple of four bytes.  When
+only part of a block is written, the contents of the remainder of that
+logical block will be undefined.
+
+                                                ________The logical blocks of a volume are grouped into clusters.  The cluster
+is  the  basic  unit  of space allocation on the volume.  Each cluster
+contains one or more logical blocks; the number of blocks in a cluster
+                ______ _______ ______     _______ ___ _______ ______is known as the volume cluster factor, or storage map cluster factor.
+
+                                                    ____  _____A volume is identified as a Files-11 volume by the  home  block.   The
+home  block  is  located at a defined physical location on the volume,
+and is identified by the presence of checksums and predictable values.
+The home block is described in detail in section 5.1.  To identify the
+                                  ______ _____volume, the home block contains a volume label, which is a  string  of
+up  to  12  ASCII  characters.   The  characters are restricted to the
+printing ASCII set (i.e., excluding control  characters  and  rubout).
+Further,  it  is  recommended  that  volume  labels  be  restricted to
+alphanumerics only to avoid conflicts with the  command  languages  of
+supporting systems.  The volume label of a volume may not be null.
+
+
+
+2.2  Volume Sets
+
+  ______ ___A volume set is a collection of  related  volumes  that  are  normally
+treated  as  one logical device in the usual operating system concept.
+Each volume contains its own Files-11 structure; however, files on the
+                                                              ________various  volumes  in  a  volume  set may be referenced with a relative
+______ ______volume number, which uniquely determines which volume in the  set  the
+file is located on.
+
+                                        _________  ____A volume set has associated with it  a  structure  name,  which  is  a
+string  of  up to 12 ASCII characters which identifies the volume set.
+The character set limitations of the volume label also  apply  to  the
+structure name.  The structure name may not be null.
+
+
+
+2.2.1  Tightly Coupled Volume Set
+
+  _______ _______ ______ ___A tightly coupled volume set is a volume set which is  consistent  and
+self  identifying.  The volume labels of the volumes making up the set
+must be unique  within  the  set,  and  must  be  different  from  the
+structure  name.  Relative volume one of the set contains a file which
+lists  the  volume  labels  of  all  the  volumes  in  the  set,  thus
+associating  volume  labels with relative volume numbers.  Each volume
+is identified as being part of the set by carrying the structure name,
+its volume label, and its relative volume number.
+Files-11 On-Disk Structure                                      Page 5
+
+
+2.2.2  Loosely Coupled Volume Set
+
+  _______ _______ ______ ___A loosely coupled volume set is a collection of volumes which  is  not
+self  identifying.   There is no file listing the volume labels.  Only
+one file may cross from any one volume in  the  set  to  another,  and
+files   in   the  set  which  cross  volumes  may  be  processed  only
+sequentially.   Correct  sequencing  of  the  volumes  that   hold   a
+particular  file  is the responsibility of the system operator and the
+application using the volume set.  There are checks  that  will  catch
+most  handling  errors,  but they cannot be foolproof.  The purpose of
+the loosely coupled volume set is to emulate multi-volume magtape, and
+allow  a  file to be read or written sequentially with only one volume
+mounted at a time.
+
+
+
+3  Files
+
+Any data in a volume or volume set that is of any interest (i.e.,  all
+                                                         ____blocks  not  available for allocation) is contained in a file.  A file
+                     _______ ______is an ordered set of virtual blocks, where a virtual block is an array
+of  512  8  bit bytes.  The virtual blocks of a file are consecutively
+numbered from 1 to n, where n is the highest numbered block  that  has
+been allocated to the file.  The number assigned to a virtual block is
+                       _______ _____ ______     ___called (obviously) its virtual block number, or VBN.   Virtual  blocks
+are  mapped  to  unique  logical blocks in the volume set by Files-11.
+Virtual blocks may be processed in the same manner as logical  blocks.
+Any  array  of  bytes  less than 65K in length may be read or written,
+provided that the transfer starts on a virtual block boundary and that
+its length is a multiple of four.
+
+For most files, all VBN's less  than  or  equal  to  the  highest  VBN
+allocated  map  to some LBN in the volume set.  Such files are said to
+   _____                   ______be dense.  Files which are sparse contain virtual  blocks  which  have
+not  been  allocated  logical  blocks.  Unallocated virtual blocks are
+represented by mapping data containing an LBN of all ones (within  the
+applicable  mapping  format).  [Sparsely allocated files have not been
+implemented by any system supporting Files-11 so far.]
+
+
+
+3.1  File ID
+
+                                                      ____ __Each file in a volume set is uniquely identified by a File ID.  A File
+ID  is  a  binary  value consisting of 48 bits.  It is supplied by the
+file system when the file is created, and must be supplied by the user
+whenever he wishes to reference a particular file.
+
+A file ID is divided into the following  fields:   (In  this  and  all
+subsequent structure illustrations, fields are shown 16 bits across.)
+
+
+                |---------------------------------------|
+                |              File Number              |  FID$W_NUM
+                |---------------------------------------|
+Files-11 On-Disk Structure                                      Page 6
+
+
+                |          File Sequence Number         |  FID$W_SEQ
+                |-------------------|-------------------|
+FID$B_NMX       | File Number Ext.  | Rel. Vol. Number  |  FID$B_RVN
+                |-------------------|-------------------|
+
+
+
+3.1.1  FID$W_NUM - 2 Bytes Low Order File Number
+
+          This word contains the low  16  bits  of  the  file  number.
+          Taken together with FID$B_NMX, it forms a 24 bit file number
+          that locates the file within  a  particular  volume  of  the
+          volume  set.   The  set  of  file  numbers  on  a  volume is
+          moderately (but not totally) dense; at any instant in time a
+          file number uniquely identifies one file within that volume.
+          File numbers for a volume start with 1 so that zero  is  not
+          valid.   In  addition, file numbers with the low 16 bits all
+          zero (i.e., multiples of 65536) are not  assigned  to  files
+          for historical reasons.
+
+
+
+3.1.2  FID$W_SEQ - 2 Bytes File Sequence Number
+
+          Identifies the current use of an individual file number on a
+          volume.   File  numbers  are re-used; when a file is deleted
+          its file number becomes available for future  use  for  some
+          other file.  Each time a file number is re-used, a different
+          file sequence number is assigned to distinguish the uses  of
+          that  file  number.   The  file sequence number is essential
+          since it is  perfectly  legal  for  users  to  remember  and
+          attempt  to  use  a  File  ID  long after that file has been
+          deleted.  The preferred method for assigning  file  sequence
+          numbers  is  to maintain the current sequence number in each
+          file header  and  increment  it  each  time  the  header  is
+          re-used.   A  file sequence numbers should only be generated
+          randomly when the previous value of  the  header's  sequence
+          number is unavailable.
+
+
+
+3.1.3  FID$B_RVN - 1 Byte Relative Volume Number
+
+          Identifies which volume of a volume set the file is  located
+          on.   If  the volume in question is not a member of a volume
+          set, then this word is zero.  If the volume  is  part  of  a
+                                                          ___          volume set, then the relative volume number, or RVN, lies in
+          the range from 1 to 255.  In any context where a  particular
+          volume  of  a  volume  set can be identified as the "current
+          volume", such as a file extension linkage, a relative volume
+          number  of  zero means "the current volume".  When a file is
+          referred to in the context of the volume on which  it  lies,
+          it  should  be  referred to with a relative volume number of
+          zero, regardless of the RVN that may  be  assigned  to  that
+          volume.
+Files-11 On-Disk Structure                                      Page 7
+
+
+3.1.4  FID$B_NMX - 1 Byte File Number Extension
+
+          This byte contains the high order part of the  file  number.
+          Together  with  FID$W_NUM, it forms the complete 24 bit file
+          number.
+
+In this specification,  file  ID's  are  referred  to  in  the  format
+"l,m,n",  where  l  is the file number, m is the file sequence number,
+and n is the relative volume number.  If no relative volume number  is
+given (i.e., a file ID of "l,m") it is assumed to be zero.
+
+
+
+3.2  File Header
+
+                                                   ____  ______Each file on a Files-11 volume is described by  a  file  header.   The
+file  header is a block that contains all the information necessary to
+access the file.  It is not part of the file; rather, it is  contained
+in  the  volume's index file.  (The index file is described in section
+5.1).  The header block is organized into  six  areas,  of  which  the
+first five are variable in size.
+
+
+
+3.2.1  Header Area
+
+          The information in the header area permits the  file  system
+          to  verify  that this block is in fact a file header and, in
+          particular, is the header being  sought  by  the  user.   It
+          contains  the  file  number  and file sequence number of the
+          file, as well as its ownership and protection  codes.   This
+          area  also  contains  offsets to the other areas of the file
+          header, thus defining their size.
+
+
+
+3.2.2  Ident Area
+
+          The ident area of a file header contains identification  and
+          accounting data about the file.  Stored here are the primary
+          name of the file,  its  creation  date  and  time,  revision
+          count,  date, and time, expiration date and time, and backup
+          date and time.
+
+
+
+3.2.3  Map Area
+
+          The map area describes the mapping of virtual blocks of  the
+          file  to the logical blocks of the volume.  The mapping data
+                                _________  ________          consists of a list of retrieval  pointers.   Each  retrieval
+          pointer   describes  one  group  of  consecutively  numbered
+          logical blocks that are allocated to  the  file.   Retrieval
+          pointers  are  arranged  in  the order of the virtual blocks
+          they represent.
+Files-11 On-Disk Structure                                      Page 8
+
+
+3.2.4  Access Control List
+
+          The access control list is an optional area that contains  a
+          list  of  users  that  are  allowed access to the file.  The
+          access control list  makes  it  possible  to  describe  user
+          communities  for  a particular file that cannot be expressed
+          with the regular protection  classes.   The  access  control
+          list  area  may also be used to contain other ancillary file
+          information of a variable nature.
+
+
+
+3.2.5  Reserved Area
+
+          This optional area is reserved for the use by CSS or special
+          applications.   It  will  not  be  used by standard Files-11
+          systems.
+
+
+
+3.2.6  End Checksum
+
+          The last two bytes of the  file  header  contain  a  16  bit
+          additive  checksum  of  the  preceding 255 words of the file
+          header.  The checksum is used to help verify that the  block
+          is in fact a file header.
+
+
+
+3.3  Multi-header Files
+
+Since the file header is of fixed size, it is inevitable that for some
+files  the  mapping  or access control information will not fit in the
+allocated space.  A file with a large amount of such data is therefore
+represented  with  a  chain  of  file  headers.   Each  header  maps a
+consecutive set of virtual blocks; the extension linkage in the header
+area  links  the  headers together in order of ascending virtual block
+numbers.  The extension pointer in each file header is the File ID  of
+the  next header in sequence.  The access control list segments in the
+various headers are likewise considered one large access control list,
+concatenated  in  the order of the file headers.  Access control lists
+and arrays of map  pointers  may  be  arbitrarily  intermixed  in  the
+various  headers of a file.  (i.e., each header may contain any amount
+of map or access control  data  regardless  of  its  position  in  the
+sequence.)
+
+Each header of a multi-header file is technically accessible as a file
+because  it  has  a  file  ID of its own.  However, since the complete
+access control information is only visible from the primary header  of
+a  file,  file  systems should restrict access to extension headers as
+files to correctly enforce file protection.
+Files-11 On-Disk Structure                                      Page 9
+
+
+3.4  Multi-volume Files
+
+Multiple headers are also needed for files  that  span  volumes  in  a
+volume  set.   A  header  may  only  map logical blocks located on its
+volume; therefore a multi-volume file is represented by headers on all
+volumes  that  contain  portions of that file.  In a multi-volume file
+contained on a loosely coupled volume set, the File ID  of  the  first
+header on each continuation volume always has the value 7,7,n, where n
+is the RVN of the volume on which the file starts plus the  number  of
+preceding volumes containing portions of the file.
+
+
+
+3.5  File Header - Detailed Description
+
+This section describes in detail  the  items  contained  in  the  file
+header.
+
+
+
+3.5.1  Validity
+
+A valid file header is defined by the following rules:
+
+     1.  The header checksum in FH2$W_CHECKSUM is correct.
+
+     2.  The contents of FH2$B_IDOFFSET is no  less  than  the  offset
+         FH2$L_FILEOWNER/2.   [Due  to subsetting considerations, this
+         value may be changed in the future.]
+
+     3.  The  four  offset   bytes   are   related   in   the   manner
+         (FH2$B_IDOFFSET)  <=  (FH2$B_MPOFFSET) <= (FH2$B_ACOFFSET) <=
+         (FH2$B_RSOFFSET).
+
+     4.  The high byte of FH2$W_STRUCLEV contains the value 2.
+
+     5.  The low byte of FH2$W_STRUCLEV contains a  value  greater  or
+         equal to 1.
+
+     6.  The word FH2$W_FID_NUM contains the file number.
+
+     7.  The word FH2$W_FID_SEQ contains the file sequence number.
+
+     8.  The high byte FH2$W_FID_RVN contains the extended part of the
+         file number, if any.
+
+     9.  The contents of the byte FH2$B_MAP_INUSE must be less than or
+         equal to (FH2$B_ACOFFSET) - (FH2$B_MPOFFSET).
+
+Note that, since the header and ident areas are  variable  in  length,
+software  processing  these  structures must check their length before
+accessing any fields.  Fields contained within the minimum  length  of
+the header area may, of course, be presumed present.
+
+A deleted file header conforms to the format of a  valid  file  header
+Files-11 On-Disk Structure                                     Page 10
+
+
+with the following exceptions:
+
+     1.  FH2$V_MARKDEL is set in FH2$L_FILECHAR.
+
+     2.  FH2$W_FID_NUM, FH2$B_FID_NMX, and FH2$B_FID_RVN contain zero.
+
+     3.  The file header checksum contains zero.
+
+
+
+
+3.5.2  Header Area Description
+
+The header area of the file  header  always  starts  at  byte  0.   It
+contains  the  basic  information  needed for checking the validity of
+accesses to the file.
+
+
+
+3.5.2.1  FH2$B_IDOFFSET - 1 Byte        Ident Area Offset
+
+          This byte contains the number of 16 bit  words  between  the
+          start  of  the  file header and the start of the ident area.
+          It defines the location of the ident area and  the  size  of
+          the header area.
+
+
+
+3.5.2.2  FH2$B_MPOFFSET - 1 Byte        Map Area Offset
+
+          This byte contains the number of 16 bit  words  between  the
+          start  of the file header and the start of the map area.  It
+          defines the location of the  map  area  and,  together  with
+          FH2$B_IDOFFSET, the size of the ident area.
+
+
+
+3.5.2.3  FH2$B_ACOFFSET - 1 Byte        Access Control List Offset
+
+          This byte contains the number of 16 bit  words  between  the
+          start of the file header and the start of the access control
+          list.  It defines the location of the ACL and, together with
+          FH2$B_MPOFFSET, the size of the map area.
+
+
+
+3.5.2.4  FH2$B_RSOFFSET - 1 Byte        Reserved Area Offset
+
+          This byte contains the number of 16 bit  words  between  the
+          start of the header and the start of the reserved area.  The
+          reserved area will not be used by Files-11 itself,  and  may
+          be  used  by  CSS  or  special  applications.  Together with
+          FH2$B_ACOFFSET, this byte defines the  size  of  the  access
+          control  list.   The size of the reserved area is implied by
+          the contents of FH2$B_RSOFFSET and the  end  of  the  header
+Files-11 On-Disk Structure                                     Page 11
+
+
+          block.
+
+          The presence of the ident, map, ACL, and reserved  areas  is
+          optional.   Absence  of  any area is signalled not by a zero
+          offset, but by the equality of the two offsets  that  define
+          that  area's  size.   All five areas are variable in length;
+          implementations of Files-11  must  check  the  length  of  a
+          particular  area before attempting to reference a particular
+          entry.
+
+
+
+3.5.2.5  FH2$W_SEG_NUM - 2 Bytes        Extension Segment Number
+
+          This word contains the value n, where  this  header  is  the
+          n+1th  header  of  the  file;  i.e.,  headers  of a file are
+          numbered sequentially starting with 0.
+
+
+
+3.5.2.6  FH2$W_STRUCLEV - 2 Bytes       Structure Level and Version
+
+          The file structure level and version  is  used  to  identify
+          different  versions of Files-11 as they affect the structure
+          of the file header.  This permits upwards  compatibility  of
+          file  structures  as Files-11 evolves, in that the structure
+          level word identifies the version of Files-11  that  created
+          this  particular  file.   This  document describes structure
+          level 2 of Files-11.  The high byte of  FH2$W_STRUCLEV  must
+          contain  the  value  2.   The  low byte contains the version
+          number, which must be greater or equal to  1.   The  version
+          number will be incremented whenever compatible additions are
+          made to the Files-11 structure that may be safely ignored by
+          an  old version of the file system.  This document describes
+          version 1 of structure level 2.
+
+
+
+3.5.2.7  FH2$W_FID - 6 Bytes            File ID
+
+          This field contains the file ID of the file, whose format is
+          described  in  section  3.1  above.   The following subfield
+          names exist:
+
+          FH2$W_FID_NUM       low order file number
+          FH2$W_FID_SEQ       file sequence number
+          FH2$B_FID_RVN       relative volume number
+          FH2$B_FID_NMX       high order file number
+
+          Because the file ID refers to itself (and  therefore  always
+          points to the same volume) FH2$B_FID_RVN is always zero.
+Files-11 On-Disk Structure                                     Page 12
+
+
+3.5.2.8  FH2$W_EXT_FID - 6 Bytes        Extension File ID
+
+          This field contains the file ID of the file's next extension
+          header, if one exists.  A contents of zero indicates that no
+          extension header  exists.   The  format  of  a  file  ID  is
+          discussed  in  section  3.1  above.   The following subfield
+          names exist:
+
+          FH2$W_EX_FIDNUM     low order file number
+          FH2$W_EX_FIDSEQ     file sequence number
+          FH2$B_EX_FIDRVN     relative volume number
+          FH2$B_EX_FIDNMX     high order file number
+
+
+
+3.5.2.9  FH2$W_RECATTR - 32 Bytes       File Record Attributes
+
+          This area is used by the record manager, or any other higher
+          level  access  mechanism, to store information necessary for
+          processing the file, e.g., record control data, end of  file
+          mark,  etc.  Certain portions of this area are controlled by
+          this specification; see section 6 for details.
+
+
+
+3.5.2.10  FH2$L_FILECHAR - 4 Bytes      File Characteristics
+
+          The file characteristics field contains the  following  flag
+          bits.  The bit names given are defined relative to the start
+          of this field.
+
+          FCH$V_NOBACKUP   Set if incremental backup is to be disabled
+                           for this file.
+
+          FCH$V_WRITEBACK  Set if the file may be  write-back  cached;
+                           i.e., if a cache is used for the file data,
+                           data written by a user is only written back
+                           to  the  disk  when  is it removed from the
+                           cache.   Clear  for   write-through   cache
+                           operation.
+
+          FCH$V_READCHECK  Set if the file is to be read-checked.  All
+                           read  operations  on  the  file,  including
+                           reads  of  the  file  header(s),  will   be
+                           performed  with  a  read,  read-compare  to
+                           assure data integrity.
+
+          FCH$V_WRITCHECK  Set if the file  is  to  be  write-checked.
+                           All write operations on the file, including
+                           modifications of the file  header(s),  will
+                           be  performed with a write, read-compare to
+                           assure data integrity.
+
+          FCH$V_CONTIGB    Set if the  file  is  allocated  contiguous
+                           best   effort;   i.e.,   as  contiguous  as
+Files-11 On-Disk Structure                                     Page 13
+
+
+                           possible.
+
+          FCH$V_LOCKED     Set if the file is  deaccess-locked.   This
+                           bit is used as a flag warning that the file
+                           was not properly  closed  and  may  contain
+                           inconsistent  data.   Access to the file is
+                           denied if this bit is set.
+
+                                                _________  __________          FCH$V_CONTIG     Set if the file  is  logically  contiguous;
+                           i.e.,  if  for  all  virtual  blocks in the
+                           file, virtual block i maps to logical block
+                           k+i  on  one  volume  for  some constant k.
+                           This bit may be implicitly set  or  cleared
+                           by  file  system  operations  that allocate
+                           space to the file; the user may only  clear
+                           it explicitly.
+
+          FCH$V_BADACL     Set if the access control list of this file
+                           is not valid (e.g., a system crash occurred
+                           while it was being updated).
+
+          FCH$V_SPOOL      Set if the  file  is  a  spool  file.   (An
+                           intermediate file for later printing, etc.)
+                           File operations not related to  spool  file
+                           handling are prohibited.
+
+          FCH$V_DIRECTORY  Set if the file is a directory.
+
+          FCH$V_BADBLOCK   Set if there is a bad  data  block  in  the
+                           file.  It indicates that deferred bad block
+                           processing is to be done  on  the  file  at
+                           some  suitable  later time (such as when it
+                           is deleted.)
+
+          FCH$V_MARKDEL    Set if the file is marked for  delete.   If
+                           this  bit  is  set, further accesses to the
+                           file are  denied,  and  the  file  will  be
+                           physically   deleted   when  no  users  are
+                           accessing it.
+
+          FCH$V_NOCHARGE   Set if the space used by this file  is  not
+                           to be charged to its owner.
+
+          FCH$V_ERASE      Set  if  the   file   is   to   be   erased
+                           (overwritten) when it is deleted.
+
+
+
+3.5.2.11  FH2$W_RECPROT - 2 Bytes       Record Protection
+
+          This field contains the record protection bits of the  file.
+          [This  feature  has  never  been implemented, and this field
+          will likely be used instead as a general  extension  of  the
+          file protection mask FH2$W_FILEPROT described below.]
+Files-11 On-Disk Structure                                     Page 14
+
+
+3.5.2.12  FH2$B_MAP_INUSE - 1 Byte      Map Words in Use
+
+          This byte contains a count of the number of map  area  words
+          currently in use.
+
+
+
+3.5.2.13  FH2$B_ACC_MODE - 1 Byte       Accessor Privilege Level
+
+          This byte defines the lowest privilege  level  at  which  an
+          accessor  must  be  running in order to be allowed access to
+          the file.  Each privilege level is a two bit  integer;  zero
+          refers  to  the  lowest  privilege  and  3  is  the highest.
+          Privilege levels may be assigned  separately  to  the  basic
+          file access modes, using the following bit assigment in this
+          byte:
+
+          Read      Bits 0 - 1
+          Write     Bits 2 - 3
+          Execute   Bits 4 - 5
+          Delete    Bits 6 - 7
+
+          An operating system should map its  privilege  level  coding
+          onto  this  code  in  the  smoothest  manner  possible.  For
+          example, the four access modes  of  VMS,  user,  supervisor,
+          exec, and kernel, are coded as 0 through 3, respectively.  A
+          system such as RSX-11M which has only two levels (privileged
+          and  non-privileged),  should  map  the  two  onto  3 and 0,
+          respectively.
+
+          Privilege levels are meant to confine access to the contents
+          of  files  to suitably trustworthy procedures.  Thus, a user
+          might be denied the ability to  write  a  record  structured
+          file  directly  (on  a  virtual  block  basis), but would be
+          permitted to write the  file  through  the  record  manager,
+          which would be suitably privileged.
+
+          For  a  record  structured  file,  an  appropriate  set   of
+          privilege  levels  would  be 0,2,0,0, expressed in the order
+          read - write - execute - delete.
+
+
+
+3.5.2.14  FH2$L_FILEOWNER - 4 Bytes     File Owner UIC
+
+          These words contain  the  binary  user  identification  code
+          (UIC)  of  the owner of the file.  The file owner is usually
+          (but not necessarily) the creator of the file.
+
+
+
+3.5.2.15  FH2$W_FILEPROT - 2 Bytes      File Protection Code
+
+          This word controls what access all users in the  system  may
+          have  to  the  file.   Accessors  of  a file are categorized
+Files-11 On-Disk Structure                                     Page 15
+
+
+          according  to  the  relationship  between  the  UIC  of  the
+          accessor  and  the  UIC  of  the  owner  of  the file.  Each
+          category is controlled by a four bit field in the protection
+          word.  The category of the accessor is selected as follows:
+
+          System    Bits 0 - 3
+
+                    The accessor is subject to  system  protection  if
+                    the  project  number  of the UIC under which he is
+                    running is 10  octal  or  less,  or  is  otherwise
+                    deemed  a  "system" process (e.g., in VMS, holding
+                    SYSPRV privilege).
+
+          Owner     Bits 4 - 7
+
+                    The accessor is subject to owner protection if the
+                    UIC  under which he is running exactly matches the
+                    file owner UIC.
+
+          Group     Bits 8 - 11
+
+                    The accessor is subject to group protection if the
+                    project  number  of  his  UIC  matches the project
+                    number of the file owner UIC.
+
+          World     Bits 12 - 17
+
+                    The accessor is subject to world protection if  he
+                    does not fit into any of the above categories.
+
+          Four types of access are defined in Files-11:  read,  write,
+          execute,  and delete.  Each four bit field in the protection
+          word is bit encoded to permit or deny any combination of the
+          four types of access to that category of accessors.  Setting
+          a bit denies that type of access to that category.  The bits
+          within each four bit field are used as follows:
+
+          Bit 0     Set to deny read access
+          Bit 1     Set to deny write access
+          Bit 2     Set to deny execute access
+          Bit 3     Set to deny delete access
+
+          When a user attempts to access a file, protection checks are
+          performed  in all the categories to which he is eligible, in
+          the order system - owner -  group  -  world.   The  user  is
+          granted access to the file if any of the categories to which
+          he is eligible grants him access.
+
+          A fifth type of access,  called  "control"  access,  governs
+          changing  the  attributes of a file, such as its protection,
+          characteristics, etc.  Control access is not  granted  by  a
+          protection  mask,  but  is  always  available  to system and
+          owner, and never to group and world.
+
+          Recommended defaults for file protection for an "open  shop"
+Files-11 On-Disk Structure                                     Page 16
+
+
+          system  are [RWD,RWD,RW,R] (expressed in the order of system
+          - owner - group -  world,  where  each  letter  denotes  the
+          presence of that permission).  Observe that only files which
+          contain executable programs should have  execute  protection
+          turned  on.  Recommended defaults for a "closed shop" system
+          are [RWD,RWD,R,].
+
+
+
+3.5.2.16  FH2$W_BACKLINK - 6 Bytes      Back Link File ID
+
+          This field  contains  the  file's  back  link  pointer.   It
+          contains the file ID of the directory file that contains the
+          primary directory entry for the file.  If the file header is
+          an  extension  header, the back link contains the file ID of
+          the primary header, if  one  exists.   A  contents  of  zero
+          indicates that no back link exists.  The format of a file ID
+          is discussed in section 3.1 above.  The  following  subfield
+          names exist:
+
+          FH2$W_BK_FIDNUM     low order file number
+          FH2$W_BK_FIDSEQ     file sequence number
+          FH2$B_BK_FIDRVN     relative volume number
+          FH2$B_BK_FIDNMX     high order file number
+
+
+
+3.5.2.17  FH2$W_JOURNAL - 2 Bytes       Journal Control Flags
+
+          This field contains flags used to  control  the  journalling
+          facility  provided  by  a  higher  level access method.  The
+          following flag bits are defined (relative to  the  start  of
+          this field):
+
+          FJN$V_RUACCESS   Set if the file is permitted to be accessed
+                           only  if  the  accessor  is running under a
+                           recovery unit.
+
+          FJN$V_RUJNL      Set if a recovery unit  journal  is  to  be
+                           enabled
+
+          FJN$V_BIJNL      Set if a before  image  journal  is  to  be
+                           enabled
+
+          FJN$V_AIJNL      Set if an after  image  journal  is  to  be
+                           enabled
+
+          FJN$V_ATJNL      Set if an audit  trail  journal  is  to  be
+                           enabled
+
+          FJN$V_NORU       Set if the file is not to be accessed  from
+                           within a recovery unit
+Files-11 On-Disk Structure                                     Page 17
+
+
+3.5.2.18  2 Bytes (not used)
+
+3.5.2.19  FH2$L_HIGHWATER - 4 Bytes     File Highwater Mark
+
+          This field contains the highest virtual block plus 1 of  the
+          file that has been written (i.e., the first VBN that has not
+          been written).  File systems enforcing  security  protection
+          should prevent the reading of blocks past this point.
+
+          If the contents of the highwater mark field is zero  (or  if
+          the header area is too short to contain this field), then no
+          highwater mark has been maintained for the  file.   In  this
+          case,  the  file  system  should  waive  enforcement  of the
+          highwater mark.
+
+
+
+3.5.2.20  FH2$C_LENGTH - 80 Bytes       Size of Default Header Area
+
+          This symbol represents the total size  of  the  header  area
+          containing all of the above entries.
+
+
+
+3.5.2.21  8 Bytes                       (not used)
+
+3.5.2.22  FH2$R_CLASS_PROT - 20 Bytes   Security Classification Mask
+
+          This field contains the security classification of the file,
+          to  be used when the file system enforces a Bell & La Padula
+          lattice model  security  system.   The  classification  mask
+          block has the following structure (the field names given are
+          defined relative to the start  of  the  classification  mask
+          block.)
+
+
+                |-------------------|-------------------|
+CLS$B_INTEG_LEV |  Integrity Level  |  Security Level   |  CLS$B_SECUR_LEV
+                |-------------------|-------------------|
+                |               (Not used)              |
+                |---------------------------------------|
+                |                                       |  CLS$Q_SECUR_CAT
+                |--                                   --|
+                |               Security                |
+                |--             Category              --|
+                |                 Mask                  |
+                |--                                   --|
+                |                                       |
+                |---------------------------------------|
+                |                                       |  CLS$Q_INTEG_CAT
+                |--                                   --|
+                |               Integrity               |
+                |--             Category              --|
+                |                 Mask                  |
+                |--                                   --|
+Files-11 On-Disk Structure                                     Page 18
+
+
+                |                                       |
+                |---------------------------------------|
+
+
+          CLS$B_SECUR_LEV  Security level.   This  byte  contains  the
+                           security classification level, encoded as 0
+                           meaning the least  sensitive  and  255  the
+                           most sensitive.
+
+          CLS$B_INTEG_LEV  Integrity level.  This  byte  contains  the
+                           integrity  classification level, encoded as
+                           0 meaning the least trustworthy and 255 the
+                           most trustworthy.
+
+                           2 bytes - not used.
+
+          CLS$Q_SECUR_CAT  This 8 byte field contains a bitmask of the
+                           security      information      compartments
+                           applicable to the file.
+
+          CLS$Q_INTEG_CAT  This 8 byte field contains a bitmask of the
+                           integrity      information     compartments
+                           applicable to the file.
+
+
+
+3.5.3  Ident Area Description
+
+
+The ident area of the file header begins  at  the  word  indicated  by
+FH2$B_IDOFFSET.   It contains identification and accounting data about
+the file.  To allow more room for map pointers and access control list
+entries, the ident area is customarily truncated in extension headers.
+
+
+
+3.5.3.1  FI2$T_FILENAME - 20 Bytes      File Name
+
+          This area contains the name of the file  in  ASCII.   A  dot
+          separates  name  from  type,  and a semicolon separates type
+          from version; both are  always  present.   If  the  name  is
+          shorter  than  20  bytes, it is padded with blanks; if it is
+          longer, it is continued in the FI2$T_FILENAMEXT field below.
+
+
+
+3.5.3.2  FI2$W_REVISION - 2 Bytes       Revision Number
+
+          This word contains the revision count of the file in binary.
+          The  revision count is the number of times the file has been
+          accessed for write.
+Files-11 On-Disk Structure                                     Page 19
+
+
+3.5.3.3  FI2$Q_CREDATE - 8 Bytes        Creation Date and Time
+
+          These eight bytes contain the date and  time  at  which  the
+          file  was  created.   The  time is expressed in the standard
+          internal time format, which is a 64 bit integer representing
+          tenths  of  microseconds elapsed since midnight, 17 November
+          1858.
+
+
+
+3.5.3.4  FI2$Q_REVDATE - 8 Bytes        Revision Date and Time
+
+          The revision time is the time at which  the  file  was  last
+          deaccessed  after being accessed for write.  It is expressed
+          as the same format as the creation time above.
+
+
+
+3.5.3.5  FI2$Q_EXPDATE - 8 Bytes        Expiration Date and Time
+
+          These eight bytes contain the date and  time  at  which  the
+          file becomes eligible to be deleted.  The format is the same
+          as that of the creation and revision times above.
+
+
+
+3.5.3.6  FI2$Q_BAKDATE - 8 Bytes        Backup Date and Time
+
+          These eight bytes contain the date and  time  at  which  the
+          file  was  last  backed  up.   The format is the same as the
+          other dates and times.
+
+
+
+3.5.3.7  FI2$T_FILENAMEXT - 66 Bytes    File Name Extension
+
+          This  field  contains  the  remainder  of  the  file   name,
+          continued from the FI2$T_FILENAME field above.  The total 86
+          character file name field allows for 80 characters  of  name
+          and type, plus a 5 digit version number.
+
+
+
+3.5.3.8  FI2$C_LENGTH - 120 Bytes       Size of Ident Area
+
+          This symbol represents the size of the ident area containing
+          all of the above entries.
+
+
+
+3.5.4  Map Area Description
+
+
+The map area of the file  header  starts  at  the  word  indicated  by
+FH2$B_MPOFFSET.   It  contains  the  information  necessary to map the
+Files-11 On-Disk Structure                                     Page 20
+
+
+virtual blocks of the file to the logical blocks of the volume.   This
+area  contains  the  retrieval  pointers that actually map the virtual
+blocks of the  file  to  the  logical  blocks  of  the  volume.   Each
+                                ______retrieval  pointer describes an extent, a consecutively numbered group
+of logical blocks which is allocated to the  file.   The  count  field
+contains  the  binary  value  n  to  represent  a group of n+1 logical
+blocks.  The logical block number field  contains  the  logical  block
+number  of  the first logical block in the group.  Thus each retrieval
+pointer maps virtual blocks  j  through  j+n  into  logical  blocks  k
+through  k+n,  respectively,  where  j is the total number plus one of
+virtual blocks represented by all preceding retrieval pointers in this
+and all preceding headers of the file, n is the value contained in the
+count field, and k is the value contained in the logical block  number
+field.  Observe that j, k, and n+1 must always be integer multiples of
+v, the volume cluster factor.
+
+If the LBN field of a  retrieval  pointer  contains  all  ones  (i.e.,
+points  to  block  2**22-1  or  2**32-1),  then that retrieval pointer
+represents an unallocated portion of a sparse file.  The  count  field
+describes  the  number  of  unallocated  virtual  blocks in the normal
+manner.
+
+There are four formats of retrieval  pointers,  identified  by  escape
+codes.   The different formats may be intermixed within a file header.
+The format code of each retrieval pointer is contained in the two high
+order bits of the first word; this field is named FM2$V_FORMAT.
+
+
+
+
+3.5.4.1  FM2$C_PLACEMENT = Format 0 - two bytes
+
+
+                |----|----------------------------------|
+FM2$V_FORMAT    | 00 |     Placement Control Flags      |  FM2$W_WORD0
+                |----|----------------------------------|
+
+
+          Retrieval pointer format 0 is used to store  placement  data
+          in  the  file  header.   It  describes the placement control
+          supplied with the  allocation  that  created  the  following
+          retrieval  pointer,  allowing  the placement of a file to be
+          replicated  when  the  file  is  copied  or  backed  up  and
+          restored.   The  following  flag  bits  exist in a placement
+          pointer:
+
+          FM2$V_EXACT      Set if exact placement was requested (i.e.,
+                           the allocation must be done as specified)
+
+          FM2$V_ONCYL      Set if the allocation was to be located  on
+                           one cylinder of the volume
+
+          FM2$V_LBN        Set if the allocation was to be located  at
+                           the starting LBN contained in the following
+                           retrieval pointer
+Files-11 On-Disk Structure                                     Page 21
+
+
+          FM2$V_RVN        Set if the allocation was to be located  on
+                           the  specified  volume (i.e., the volume on
+                           which this extent is located)
+
+
+
+3.5.4.2  FM2$C_FORMAT1 = Format 1 - four bytes.
+
+
+                |----|--------------|-------------------|
+FM2$V_FORMAT    | 01 |   High LBN   |    Block Count    |  FM2$B_COUNT1
+FM2$V_HIGHLBN   |----|--------------|-------------------|
+                |             Low Order LBN             |  FM2$W_LOWLBN
+                |---------------------------------------|
+
+
+          Retrieval pointer format 1 provides an 8 bit count field and
+          a 22 bit LBN field.  It is therefore capable of representing
+          a group of up to 256 blocks on a volume up to  2**22  blocks
+          in size.
+
+
+
+3.5.4.3  FM2$C_FORMAT2 = Format 2 - six bytes.
+
+
+                |----|----------------------------------|
+FM2$V_FORMAT    | 10 |           Block Count            |  FM2$V_COUNT2
+                |----|----------------------------------|
+                |                                       |  FM2$L_LBN2
+                |--                LBN                --|
+                |                                       |
+                |---------------------------------------|
+
+
+          Retrieval pointer format 2 provides a 14 bit count field and
+          a  32  bit LBN field.  It is capable of representing a group
+          of up to 16384 blocks on a volume  up  to  2**32  blocks  in
+          size.
+
+
+
+3.5.4.4  FM2$C_FORMAT3 = Format 3 - eight bytes.
+
+
+                |----|----------------------------------|
+FM2$V_FORMAT    | 11 |      High Order Block Count      |  FM2$V_COUNT2
+                |----|----------------------------------|
+                |         Low Order Block Count         |  FM2$W_LOWCOUNT
+                |---------------------------------------|
+                |                                       |  FM2$L_LBN3
+                |--                LBN                --|
+                |                                       |
+                |---------------------------------------|
+Files-11 On-Disk Structure                                     Page 22
+
+
+          Retrieval pointer format 3 provides a 30 bit count field and
+          a  32 bit LBN field.  It is capable of describing a group of
+          up to 2**30 blocks on a volume up to 2**32 blocks in size.
+
+
+
+
+
+3.5.5  Access Control List
+
+(Reserved for future use by DEC).
+
+
+
+3.5.6  Reserved Area
+
+
+The reserved area of the file header starts at the word  indicated  by
+the  byte  FH2$B_RSOFFSET.  This area is not used by standard Files-11
+file  managers,  but  is  available  for  use  by  CSS   and   special
+applications.
+
+
+
+3.5.7  End Checksum Description
+
+
+The header checksum occupies the last two bytes of  the  file  header.
+It  is  verified  every time a header is read, and is recomputed every
+time a header is written.
+
+
+
+3.5.7.1  FH2$W_CHECKSUM - 2 Bytes       Block Checksum
+
+
+          This word is a simple additive checksum of all  other  words
+          in  the  block.   It  is  computed  by  the following PDP-11
+          routine or its equivalent:
+
+                  MOV     Header-address,R0
+                  CLR     R1
+                  MOV     #255.,R2
+          10$:    ADD     (R0)+,R1
+                  SOB     R2,10$
+                  MOV     R1,(R0)
+
+
+
+3.6  File Header Layout
+
+The following is a graphical layout of the fields in the file header.
+Files-11 On-Disk Structure                                     Page 23
+
+
+Header Area
+
+                |-------------------|-------------------|
+FH2$B_MPOFFSET  |  Map Area Offset  | Ident Area Offset |   FH2$B_IDOFFSET
+                |-------------------|-------------------|
+FH2$B_RSOFFSET  | Resv. Area Offset |  ACL Area Offset  |   FH2$B_ACOFFSET
+                |-------------------|-------------------|
+                |          File Segment Number          |   FH2$W_SEG_NUM
+                |---------------------------------------|
+                |         File Structure Level          |   FH2$W_STRUCLEV
+                |---------------------------------------|   FH2$W_FID
+                |                                       |   FH2$W_FID_NUM
+                |--                                   --|
+                |                File ID                |   FH2$W_FID_SEQ
+                |--                                   --|
+FH2$B_FID_NMX   |                                       |   FH2$B_FID_RVN
+                |---------------------------------------|   FH2$W_EXT_FID
+                |                                       |   FH2$W_EX_FIDNUM
+                |--                                   --|
+                |           Extension File ID           |   FH2$W_EX_FIDSEQ
+                |--                                   --|
+FH2$B_EX_FIDNMX |                                       |   FH2$B_EX_FIDRVN
+                |---------------------------------------|
+                |                                       |   FH2$W_RECATTR
+                |                                       |
+                |                                       |
+                |         Record Attributes Area        |    
+                |                                       |
+                |                                       |
+                |                                       |
+                |---------------------------------------|
+                |                                       |   FH2$L_FILECHAR
+                |--        File Characteristics       --|
+                |                                       |
+                |---------------------------------------|
+                |            Record Protection          |   FH2$W_RECPROT
+                |-------------------|-------------------|
+FH2$B_ACC_MODE  |    Access Level   | Map Words in Use  |   FH2$B_MAP_INUSE
+                |-------------------|-------------------|
+                |                                       |   FH2$L_FILEOWNER
+                |--          File Owner UIC           --|
+                |                                       |
+                |---------------------------------------|
+                |            File Protection            |   FH2$W_FILEPROT
+                |---------------------------------------|   FH2$W_BACKLINK
+                |                                       |   FH2$W_BK_FIDNUM
+                |--                                   --|
+                |         File Header Back Link         |   FH2$W_BK_FIDSEQ
+                |--                                   --|
+FH2$B_BK_FIDNMX |                                       |   FH2$B_BK_FIDRVN
+                |---------------------------------------|
+                |         Journal Control Flags         |   FH2$W_JOURNAL
+                |---------------------------------------|
+                |              (not used)               |
+                |---------------------------------------|
+Files-11 On-Disk Structure                                     Page 24
+
+
+                |                                       |   FH2$L_HIGHWATER
+                |--        File Highwater Mark        --|
+                |                                       |
+                |---------------------------------------|   FH2$C_LENGTH
+                |                                       |
+                |--                                   --|
+                |                                       |
+                |--            (not used)             --|
+                |                                       |
+                |--                                   --|
+                |                                       |
+                |---------------------------------------|
+                |                                       |   FH2$R_CLASS_PROT
+                |--                                   --|
+                |                                       |
+                |--                                   --|
+                |      Security Classification Mask     |
+                |--                                   --|
+                |                                       |
+                |--                                   --|
+                |                                       |
+                |---------------------------------------|
+
+
+Ident Area
+
+                |---------------------------------------|
+                |                                       |   FI2$T_FILENAME
+                |--                                   --|
+                |                                       |
+                |--                                   --|
+                |               File Name               |    
+                |--                                   --|
+                |                                       |
+                |--                                   --|
+                |                                       |
+                |---------------------------------------|
+                |            Revision Number            |   FI2$W_REVISION
+                |---------------------------------------|
+                |                                       |   FI2$Q_CREDATE
+                |--                                   --|
+                |                                       |
+                |--           Creation Date           --|
+                |                                       |
+                |--                                   --|
+                |                                       |
+                |---------------------------------------|
+                |                                       |   FI2$Q_REVDATE
+                |--                                   --|
+                |                                       |
+                |--           Revision Date           --|
+                |                                       |
+                |--                                   --|
+                |                                       |
+                |---------------------------------------|
+Files-11 On-Disk Structure                                     Page 25
+
+
+                |                                       |   FI2$Q_EXPDATE
+                |--                                   --|
+                |                                       |
+                |--          Expiration Date          --|
+                |                                       |
+                |--                                   --|
+                |                                       |
+                |---------------------------------------|   
+                |                                       |   FI2$Q_BAKDATE
+                |--                                   --|
+                |                                       |
+                |--            Backup Date            --|
+                |                                       |
+                |--                                   --|
+                |                                       |
+                |---------------------------------------|
+                |                                       |   FI2$T_FILENAMEXT
+                |                                       |
+                |                                       |
+                |          File Name Extension          |
+                |                                       |
+                |                                       |
+                |                                       |
+                |---------------------------------------|   FI2$C_LENGTH
+
+
+
+Map, ACL, and Reserved Areas
+
+                |---------------------------------------|
+                |                                       |
+                |                                       |
+                |                                       |
+                |          Retrieval Pointers           |    
+                |                                       |
+                |                                       |
+                |                                       |
+                |---------------------------------------|
+                |                                       |
+                |                                       |
+                |                                       |
+                |          Access control List          |    
+                |                                       |
+                |                                       |
+                |                                       |
+                |---------------------------------------|
+                |                                       |
+                |                                       |
+                |                                       |
+                |             Reserved Area             |   
+                |                                       |
+                |                                       |
+                |                                       |
+                |---------------------------------------|
+                |         File Header Checksum          |   FH2$W_CHECKSUM
+Files-11 On-Disk Structure                                     Page 26
+
+
+                |---------------------------------------|
+
+
+
+4  Directories
+
+Files-11 provides directories to allow the organization of files in  a
+meaningful  way.   While  the  File  ID is sufficient to locate a file
+uniquely on a volume set, it  is  hardly  mnemonic.   Directories  are
+files whose function is to associate alphabetic names with File ID's.
+
+
+
+4.1  Directory Heirarchies
+
+Since directories are files with no  special  attributes,  directories
+may  list  files  that  are  in  turn  directories.  Thus the user may
+construct directory heirarchies of arbitrary depth and  complexity  to
+structure his files as he pleases.
+
+
+
+4.1.1  Two Level Directory Heirarchy
+
+
+Implementations of Files-11 on existing PDP-11 systems all  support  a
+two  level  directory  heirarchy  which  is  tied  in  with  the  user
+identification mechanism of the operating system.  Each UIC  known  to
+                                ____ ____ _________the system is associated with a user file directory (UFD).  References
+to files that do not specify a directory are  generally  defaulted  to
+the  UFD  associated with the user's UIC.  The syntax used to refer to
+UIC's is the same as that used to identify the  directory  in  a  file
+name  string.   The construct "[n,m]" is used to refer to group number
+n, member number m.  All UFD's are listed in the volume's master  file
+directory  (MFD)  under  a  file  name  constructed from the directory
+string.  (See section 5.0 for a description of the MFD.) A  string  of
+"[n,m]"  associates with a directory name of "nnnmmm.DIR;1", where nnn
+and mmm are n and m padded out  to  three  digits  each  with  leading
+zeroes.  Note that all number conversions are done in octal.
+
+Two points should be noted here.  The UFD structure described here  is
+not  intrinsically  part of the Files-11 on-disk structure; rather, it
+is  a  convenient  cataloging  system  applied  by  various  operating
+systems.   Also,  there  is  no hard and fast relationship between the
+owner UIC of a file and the UFD in which  it  is  listed.   Generally,
+they will correspond, but not necessarily.
+
+
+
+4.1.2  Multi-level Directory Heirarchy
+
+
+Contemporary implementations of Files-11 such as VMS use a multi-level
+directory  heirarchy,  where the first level below the MFD is referred
+to as the user file directory (UFD) and subsequent levels are referred
+Files-11 On-Disk Structure                                     Page 27
+
+
+to  as  sub  file  directories  (SFD's).   The  top level directory is
+typically  used  to  represent  individual  system  users,  or   major
+facilities,  etc.  Thus MFD entries would correspond to the user names
+in  a  multi-user  system.   A  directory  specifier  has  the  format
+"[name1.name2.name3. ... ]".   Each  name  in the list translates to a
+directory file name of the form "name.DIR;1" and is  searched  for  in
+the current directory level.
+
+Observe that the directory protocol is not tied to the structure level
+of  the disk.  Thus new systems will always have to handle the "[n,m]"
+construct, which maps to a UFD name  of  "nnnmmm.DIR;1"  and  provides
+only  two levels of directory.  Old systems will not be able to handle
+volumes written with a multi-level directory structure.
+
+
+
+4.1.3  Multi-Volume Directory Structure
+
+In a volume set, the MFD for the all of the user files on  the  volume
+set  is  the MFD of relative volume 1.  Its entries can point to UFD's
+located on any volume in the set, whose entries can in turn  point  to
+files  and sub directories on any volume in the set.  The MFD's of the
+remaining volumes in the set only list  the  reserved  files  on  each
+volume.
+
+The assignment of volumes to specific directories  and  files  is  not
+covered  by  this  specification.   Different  systems  may  implement
+different  policies  to  trade  off  factors  such   as   performance,
+reliability,   and  separability.   Optimizing  for  performance,  for
+example, usually means scattering the files as  randomly  as  possible
+across  the  volume set to make the most use of the available multiple
+positioners.  Maximum separability (the ability to make  use  of  only
+part  of  the  volume  set)  is achieved by locating files on the same
+volume as their directories, and possibly entering the directories  in
+the MFD's of the volumes on which they reside.
+
+
+
+4.2  Directory Structure
+
+A  directory  is  a  contiguous  file  which  has  the  directory  bit
+(FCH$V_DIRECTORY)  set  in  its file characteristics (FH2$L_FILECHAR).
+It is organized as a sequential file  with  variable  length  records,
+with  the  attribute  set  that  records do not cross block boundaries
+(FAT$V_NOSPAN), and no carriage control attributes.  The last word  of
+the  directory  file's record attributes area (FAT$W_VERSIONS) is used
+to store the directory's default version limit.  This version limit is
+assigned  to all new files created in the directory if a version limit
+is not specified by the creator.
+
+Directory records within each block are packed together to conform  to
+the  variable  length  record  format.   At the end of the sequence of
+records in each block, a word of -1 signals the  end  of  records  for
+that  block.  (See section 6 for a discussion of record formats.) Note
+that in a directory block, the -1 word is always present,  whereas  in
+Files-11 On-Disk Structure                                     Page 28
+
+
+the variable length record format its presence is optional.
+
+The entries in a directory are sorted alphabetically,  permitting  the
+use  of  an  optimized search.  Entries which are multiple versions of
+the same name and type are arranged in  order  of  decreasing  version
+number  to optimize version related operations.  Each directory record
+consists of the following:
+
+
+                |---------------------------------------|
+                |           Record Byte Count           |   DIR$W_SIZE
+                |---------------------------------------|
+                |             Version Limit             |   DIR$W_VERLIMIT
+                |-------------------|-------------------|
+DIR$B_NAMECOUNT |  Name Byte Count  |       Flags       |   DIR$B_FLAGS
+                |-------------------|-------------------|
+                |                                       |   DIR$T_NAME
+                |                                       |
+                |                                       |
+                |           File Name String            |
+                |                                       |
+                |                                       |
+                |                                       |
+                |---------------------------------------|
+                |                                       |
+                |                                       |
+                |              Value Field              |
+                |                                       |
+                |                                       |
+                |---------------------------------------|
+
+
+
+4.2.1  DIR$W_SIZE - 2 Bytes   Record Byte Count
+
+          This field is the standard byte count field  of  a  variable
+          length  record.   It  contains  the  length  in bytes of the
+          record (not including the two bytes of the count).  The byte
+          count is always even.
+
+
+
+4.2.2  DIR$W_VERLIMIT - 2 Bytes         File Version Limit
+
+          This word contains the maximum number of versions  that  are
+          to  be retained for this name and type.  An attempt to enter
+          more versions than the limit will result in the deletion  of
+          the  least  recent  version,  or  an  error  return,  at the
+          implementing system's option.
+Files-11 On-Disk Structure                                     Page 29
+
+
+4.2.3  DIR$B_FLAGS - 1 Byte   Flags
+
+          This byte contains the type code of the directory entry  and
+          assorted flag bits.  It contains the following subfields and
+          status bits:
+
+          DIR$V_TYPE       The type code is contained in the three low
+                           bits  of  the flags byte.  It is one of the
+                           following values:
+
+          DIR$C_FID        The  value  field  is  a  list  of  version
+                           numbers and 48 bit File Id's.
+
+          DIR$C_LINKNAME   The value field is a symbolic  link  string
+                           (i.e.,  an  alphabetic file specification).
+                           [Symbolic links are not  yet  supported  by
+                           any implementation of Files-11.]
+
+                           [No status bits are defined at present.]
+
+
+
+4.2.4  DIR$B_NAMECOUNT - 1 Byte         File Name Length
+
+          This field contains the length in bytes of the file name.
+
+
+
+4.2.5  DIR$T_NAME - Variable            File Name String
+
+          This field  contains  the  file  name  and  type  in  ASCII,
+          separated  by  a  a  dot.  The dot is present even if either
+          name, or type, or both, are  null.   Only  name  constituent
+          characters  may  be  present  in  the  name  and type.  Name
+          constituent  characters  include  alphanumerics   (including
+          supported foreign language characters), $, _, and -.  If the
+          length of the name is odd, the name string is padded with  a
+          single null.  [Note:  At present, the collating sequence for
+          foreign language alphabetics has not yet been defined.  This
+          will  occur in the near future when the first implementation
+          is done.]
+
+
+
+4.2.6  Value Field - Variable
+
+          This field contains the  "value"  of  the  directory  entry;
+          i.e.,  the  information  returned  to the user from a lookup
+          operation.  If the directory record is a File ID  list  (the
+          type  field  is  DIR$C_FID),  the  value  field is a list of
+          version numbers and corresponding file  ID's,  appearing  in
+          descending  order  by version number.  The number of entries
+          in the list is deduced from the record byte count.
+Files-11 On-Disk Structure                                     Page 30
+
+
+                |---------------------------------------|
+                |            Version Number             |   DIR$W_VERSION
+                |---------------------------------------|   DIR$W_FID
+                |                                       |   DIR$W_FID_NUM
+                |--                                   --|
+                |                File ID                |   DIR$W_FID_SEQ
+                |--                                   --|
+DIR$B_FID_NMX   |                                       |   DIR$B_FID_RVN
+                |---------------------------------------|
+                |            Version Number             |
+                |---------------------------------------|
+                |                                       |
+                |--                                   --|
+                |                File ID                |
+                |--                                   --|
+                |                                       |
+                |---------------------------------------|
+                |                                       |
+                                    :
+                                    :
+                                    :
+                                    :
+                                    :
+                |                                       |
+                |---------------------------------------|
+                |            Version Number             |
+                |---------------------------------------|
+                |                                       |
+                |--                                   --|
+                |                File ID                |
+                |--                                   --|
+                |                                       |
+                |---------------------------------------|
+
+
+
+4.2.7  DIR$W_VERSION - 2 Bytes          Version Number
+
+          This word contains the version number of the directory entry
+          in  binary.  Version numbers must lie in the range from 1 to
+          32767.
+
+
+
+4.2.8  DIR$W_FID - 6 Bytes              File ID
+
+          These three words are the file ID that the  directory  entry
+          points to.
+
+
+
+4.3  Multiple Directory Records
+
+Since directory records may not cross block  boundaries,  there  is  a
+limit  to  the  number of file versions that may be represented in one
+Files-11 On-Disk Structure                                     Page 31
+
+
+directory record.  (That number is 62 for the shortest  possible  file
+name.)  To  represent  more  versions of a file than will fit into one
+directory block, multiple directory records are used.  The records are
+ordered  by descending version number, as are the versions within each
+record.  Each record contains the full file name.
+
+
+
+5  Reserved Files
+
+Clearly any file system must  maintain  some  data  structure  on  the
+medium  which  is  used to control the file organization.  In Files-11
+this data is kept in several files.  These files are  created  when  a
+new  volume  is  initialized.  They are unique in that their File ID's
+are known constants.  Note, however, that the relative  volume  number
+used  when accessing one of these files depends upon the context.  The
+exact number of these files which is present on  a  particular  volume
+may  vary; however, at least five must be present.  All of these files
+are non-deletable.  These files have the following uses:
+
+                   _____ ____File ID 1,1 is the index file.  The index file  is  the  root  of  the
+entire  Files-11  structure.  It contains the volume's bootstrap block
+and the home block, which is used to identify the  volume  and  locate
+the  rest  of the file structure.  The index file also contains all of
+the file  headers  for  the  volume,  and  a  bitmap  to  control  the
+allocation of file headers.
+
+                   _______ ______ ____File ID 2,2 is the storage bitmap file.  It is  used  to  control  the
+allocation of logical blocks on the volume.
+
+                   ___ _____ ____File ID 3,3 is the bad block file.  It is a file containing all of the
+known bad blocks on the volume.
+
+                          ______ ____ _________      ___File ID 4,4 is the volume master file directory (or  MFD).   It  forms
+the  root of the volume's directory structure.  The MFD lists the five
+known files, all first level  user  directories,  and  whatever  other
+files the user chooses to enter.
+
+                          ____  _____  ____File ID 5,5 is the system core  image  file.   Its  use  is  operating
+system dependent; its basic purpose is to provide a file of known File
+ID for the use of the operating system.
+
+                   ______ ___ ____ ____File ID 6,6 is the volume set list file.  If this volume  is  relative
+volume  one of a tightly coupled volume set, this file contains a list
+of the labels of all the volumes in the set.
+
+                   ________ ____________ ____File ID 7,7 is the standard continuation file.  If this volume is part
+of  a loosely coupled volume set, this file contains the first segment
+of the portion of the multi-volume file that resides on this volume.
+
+                   ______ _______ ____File ID 8,8 is the backup journal file.  This file is used to log  and
+control the use of an incremental backup system.
+
+                   _______ ___ _____ ___ ____File ID 9,9 is the pending bad block log file.  This file  contains  a
+list  of  suspected  bad  blocks  on the volume that have not yet been
+Files-11 On-Disk Structure                                     Page 32
+
+
+turned over to the bad block file.
+
+More File ID's may be reserved in the future; users  should  not  make
+any assumptions about the values of user created File ID's.
+
+
+
+5.1  Index File
+
+The index  file  is  File  ID  1,1.   It  is  listed  in  the  MFD  as
+INDEXF.SYS;1.  The index file is the root of the Files-11 structure in
+that it provides the means for identification and initial access to  a
+Files-11  volume,  and  contains  the access data for all files on the
+volume (including itself).  This file has the  record  format  of  512
+byte  fixed  length records, with no carriage control.  (See section 6
+for a description of the sequential file format.)
+
+
+
+5.1.1  Bootstrap Block
+
+
+                                                  ____ _____Virtual block 1 of the index file is the volume's boot block.   It  is
+almost  always mapped to logical block 0 of the volume.  If the volume
+is the system device of an operating system, the boot  block  contains
+an operating system dependent program which reads the operating system
+into memory when the boot block is read and executed  by  a  machine's
+hardware  bootstrap.   If  the volume is not a system device, the boot
+block contains a small program that outputs a message  on  the  system
+console to inform the operator to that effect.  If block 0 of a volume
+is bad, it is permissible to map virtual block 1 of the index file  to
+some  other block.  In this case, obviously, the volume cannot be used
+as a system volume.
+
+[Standardization efforts are currently underway for the format of  the
+boot  block.   When  this work is completed, a copy of or reference to
+that standard will be included here.]
+
+
+
+5.1.2  Home Block
+
+
+                                                    ____  _____Virtual block 2 of the index file is the  volume's  home  block.   The
+purpose  of  the  home  block  is  to identify the volume as Files-11,
+establish the specific identity of the volume, and serve as the ground
+zero  entry point into the volume's file structure.  The home block is
+recognized as a home block by  the  presence  of  checksums  in  known
+places and by the presence of predictable values in certain locations.
+
+The home block is located on the first good block of  the  home  block
+search sequence.  The search sequence is of the form
+
+               1 + n * delta, n = 0, 1, 2, 3, 4 ......
+Files-11 On-Disk Structure                                     Page 33
+
+
+The home block search delta is  computed  from  the  geometry  of  the
+volume  such  that,  if  the  volume  is viewed as a three dimensional
+space, the search sequence will travel  approximately  down  the  body
+diagonal of the space.  Since volume failures tend to occur across one
+dimension, this minimizes the chance of a  single  failure  destroying
+both home blocks of the volume.  The search delta is computed from the
+volume  geometry,  expressed  in  sectors,  tracks   (surfaces),   and
+cylinders, according to the following rules, to handle the cases where
+one or two dimensions of the volume have a size of 1.
+
+          Geometry:     Delta
+
+          s x 1 x 1:    1
+          1 x t x 1:    1
+          1 x 1 x c:    1
+
+          s x t x 1:    s+1
+          s x 1 x c:    s+1
+          1 x t x c:    t+1
+
+          s x t x c:    (t+1)*s+1
+
+[Volumes are coming into  existence  whose  geometry  is  not  regular
+(i.e.,  which  have  different numbers of sectors on different tracks)
+due to density considerations.  The delta computation  algorithm  will
+have to be amended to deal with such volumes in a reasonable way.]
+
+In most cases, the home block is located on LBN 1.
+
+
+
+5.1.3  Cluster Filler
+
+
+If v, the cluster factor of the volume, is greater than  1,  then  the
+next  v*2-2 blocks of the index file are copies of the home block used
+to fill out the first two clusters of the index file.  Note that,  for
+cluster factors greater than 1, this results in a wasted disk cluster.
+The benefit of this technique is a much simpler rule for  finding  the
+VBN of interesting parts of the index file.
+
+
+
+5.1.4  Backup Home Block
+
+
+The backup home block is a second  copy  of  the  home  block  located
+farther down the home block search sequence.  It permits the volume to
+be used even if the primary home block is destroyed.
+
+In general, the backup home block should be allocated  on  the  second
+good  block  of the search sequence.  If it is not, then all preceding
+blocks on the sequence must not be available for allocation.  This  is
+to   prevent   the  situation  of  a  malicious  user  constructing  a
+counterfeit index file, which would be used if the primary home  block
+Files-11 On-Disk Structure                                     Page 34
+
+
+ever went bad.
+
+The cluster which contains the backup home block is  mapped  into  the
+index  file as virtual blocks v*2+1 through v*3, where v is the volume
+cluster factor.  Observe that the backup home  block  may  be  located
+anywhere  within  this  cluster,  because  there  is  no hard and fast
+relationship between the cluster factor and  the  volume's  track  and
+cylinder  boundaries.  The entire cluster is therefore filled out with
+copies of the home block.
+
+
+
+5.1.5  Backup Index File Header
+
+
+The next cluster of the index file contains a backup copy of the index
+file  header, so that data on the volume can be recovered if the index
+file header goes bad.   The  cluster  occupies  virtual  blocks  v*3+1
+through  v*4,  where  v  is the volume cluster factor.  The LBN of the
+backup index file header is stored in location HM2$L_ALTIDXLBN in  the
+home  block.  The backup index file header occupies the first block of
+this cluster; the remaining blocks are not used and their contents are
+undefined.
+
+
+
+5.1.6  Index File Bitmap
+
+
+    _____ ____ ______The index file bitmap is  used  to  control  the  allocation  of  file
+numbers (and hence file headers).  It is simply a bit string of length
+n, where n is the maximum number of  files  permitted  on  the  volume
+(contained  in  offset  HM2$L_MAXFILES in the home block).  The bitmap
+spans over as many blocks as is necessary to hold it, i.e., max number
+of  files divided by 4096 and rounded up.  The number of blocks in the
+bitmap is contained in offset HM2$W_IBMAPSIZE of the home block.
+
+The bits in the index file bitmap are numbered sequentially from 0  to
+n-1  in the obvious manner, i.e., from right to left in each byte, and
+in order of increasing byte address.  Bit j is used to represent  file
+number  j+1:  if the bit is 1, then that file number is in use; if the
+bit is 0, then that file number is not in use and may be assigned to a
+newly  created  file.   Note that the index file bitmap is not used to
+determine whether a header is valid when accessing an  existing  file;
+that is done solely with the contents of the header itself.
+
+The index file bitmap starts at virtual block v*4+1 of the index  file
+and  continues  through  VBN v*4+m, where m is the number of blocks in
+the bitmap, and v is the storage map cluster factor.  It is located at
+the  logical  block  indicated  by  offset  HM2$L_IBMAPLBN in the home
+block.
+Files-11 On-Disk Structure                                     Page 35
+
+
+5.1.7  File Headers
+
+
+The rest of the index file contains  all  the  file  headers  for  the
+volume.   The  first  16  file  headers (for file numbers 1 to 16) are
+logically contiguous with the index file bitmap  to  facilitate  their
+location; the rest may be allocated wherever the file system sees fit.
+Thus the first 16 file headers may be located from data  in  the  home
+block  (HM2$W_IBMAPSIZE  and  HM2$L_IBMAPLBN)  while  the rest must be
+located through the mapping data in the index file header.   The  file
+header  for file number n is located at virtual block v*4+m+n (where m
+is the number of blocks in the index file bitmap, and v is the storage
+map cluster factor).
+
+The end of file mark for the index file is located at  or  beyond  the
+last  file header ever used.  All header blocks located before the EOF
+are subject to validation when used to create  a  new  file.   If  the
+block  contains  garbage,  the  new header is assigned a file sequence
+number of 1, being the first use of this header block.  If  the  block
+contains  a deleted file header, the new header is assigned a sequence
+number one higher than the  one  contained  in  the  block.   A  block
+containing  a  valid  file  header  must never be used to create a new
+file, even if it is marked  free  in  the  index  file  bitmap.   This
+prevents  files  from  being  lost  if bits are dropped in the bitmap.
+Index file blocks beyond the EOF are assumed to  contain  garbage  for
+the purpose of creating new file headers.
+
+In all cases, the file header is the final authority on  the  volume's
+file  structure.  If a volume has been damaged, reconstruction (of the
+bitmaps, directories, etc.) may be done using the file headers as  the
+source of file structure information.
+
+
+
+5.1.8  Index File Layout
+
+
+The following is a sketch of the blocks in the  index  file.   Observe
+that  this  illustration  assumes a storage map cluster factor greater
+than 2.
+
+
+          |-------------------|---
+          |                   |   \
+          |       Boot        |    |  
+          |       Block       |    |  
+          |                   |    |  
+          |-------------------|    |  
+          |                   |    |  
+          |       Home        |    |  
+          |       Block       |    | Cluster 1
+          |                   |    |
+          |-------------------|    |
+          |       More        |    |
+          |       Home        |    |
+Files-11 On-Disk Structure                                     Page 36
+
+
+          |      Blocks       |    |
+          |         :         |    |
+          |         :         |    |
+          |         :         |   /
+          |-------------------|---
+          |                   |   \ 
+          |       More        |    |
+          |       Home        |    |
+          |      Blocks       |    | Cluster 2
+          |         :         |    |
+          |         :         |    |
+          |         :         |   /
+          |-------------------|---
+          |      Backup       |   \ 
+          |       Home        |    |
+          |       Block       |    |
+          |                   |    |
+          |-------------------|    |
+          |       More        |    | Cluster 3
+          |       Home        |    |
+          |      Blocks       |    |
+          |         :         |    |
+          |         :         |    |
+          |         :         |   / 
+          |-------------------|---
+          |      Backup       |   \ 
+          |       Index       |    |
+          |       File        |    |
+          |      Header       |    |
+          |-------------------|    |
+          |                   |    | Cluster 4
+          |                   |    |
+          |       (not)       |    |
+          |      (used)       |    |
+          |                   |    |
+          |                   |   /
+          |-------------------|---
+          |                   |   \
+          |       Index       |    |
+          |       File        |    |
+          |      Bitmap       |    |
+          |                   |    |
+          |                   |    |
+          |-------------------|    | Contiguous
+          |                   |    |
+          |        16         |    |
+          |       File        |    |
+          |      Headers      |    |
+          |                   |    |
+          |                   |   /
+          |-------------------|---
+          |                   |
+          |                   |
+          |                   |
+          |       Lots        |
+Files-11 On-Disk Structure                                     Page 37
+
+
+          |       More        |
+          |       File        |
+          |      Headers      |
+          |                   |
+          |                   |
+          |                   |
+          |                   |
+          |-------------------|
+
+
+
+5.1.9  Home Block Details
+
+The following is a detailed description of the home block.  Note  that
+all  copies of the volume's home block contain the same data, with the
+exception of the cells containing the block's VBN and LBN.
+
+
+
+5.1.9.1  HM2$L_HOMELBN - 4 Bytes        Home Block LBN
+
+
+          This longword contains the  logical  block  number  of  this
+          particular copy of the home block.
+
+
+
+5.1.9.2  HM2$L_ALHOMELBN - 4 Bytes      Alternate Home Block LBN
+
+
+          This longword contains the LBN  of  the  volume's  secondary
+          home block.  One may determine, when scanning the home block
+          sequence, whether the block read is the primary or secondary
+          home  block  by comparing HM2$L_HOMELBN and HM2$L_ALHOMELBN.
+          This value must be non-zero for a valid home block.
+
+
+
+5.1.9.3  HM2$L_ALTIDXLBN - 4 Bytes      Backup Index File Header LBN
+
+
+          This longword contains the logical block on which the backup
+          index  file  header is located.  This value must be non-zero
+          for a valid home block.
+
+
+
+5.1.9.4  HM2$W_STRUCLEV - 2 Bytes       Structure Level and Version
+
+
+          The volume structure level and version is used  to  identify
+          different  versions of Files-11 as they affect the structure
+          of all parts of the volume except  the  file  header.   This
+          permits upwards compatibility of file structures as Files-11
+          evolves, in that the structure  level  word  identifies  the
+Files-11 On-Disk Structure                                     Page 38
+
+
+          version  of  Files-11  that  created this particular volume.
+          This document describes structure level 2 of Files-11.   The
+          high  byte  of HM2$W_STRUCLEV must contain the value 2.  The
+          low byte contains the version number, which must be  greater
+          or  equal  to  1.   The  version  number will be incremented
+          whenever compatible  additions  are  made  to  the  Files-11
+          structure  that  may  be safely ignored by an old version of
+          the file system.   This  document  describes  version  1  of
+          structure level 2.
+
+
+
+5.1.9.5  HM2$W_CLUSTER - 2 Bytes        Storage Bitmap Cluster Factor
+
+
+          This word contains the cluster factor used  in  the  storage
+          bitmap  file.   The  cluster  factor is the number of blocks
+          represented by each bit in the storage bitmap.   This  value
+          is also referred to as the volume cluster factor.
+
+
+
+5.1.9.6  HM2$W_HOMEVBN - 2 Bytes        Home Block VBN
+
+
+          This word contains the virtual block  that  this  particular
+          copy  of  the  home  block occupies in the index file.  This
+          value must be non-zero for a valid home block.
+
+
+
+5.1.9.7  HM2$W_ALHOMEVBN - 2 Bytes      Backup Home Block VBN
+
+
+          This word contains the virtual block number that the cluster
+          containing  the  secondary  home block occupies in the index
+          file.  The contents of this word is v*2+1, where  v  is  the
+          storage map cluster factor.
+
+
+
+5.1.9.8  HM2$W_ALTIDXVBN - 2 Bytes      Backup Index File Header VBN
+
+
+          This word contains the virtual block number that the  backup
+          index  file header occupies in the index file.  The contents
+          of this word is v*3+1, where v is the  storage  map  cluster
+          factor.
+
+
+
+5.1.9.9  HM2$W_IBMAPVBN - 2 Bytes       Index File Bitmap VBN
+
+
+          This word contains the starting virtual block number of  the
+Files-11 On-Disk Structure                                     Page 39
+
+
+          index  file  bitmap.  The contents of this word is the value
+          v*4+1, where v is the storage map cluster factor.
+
+
+
+5.1.9.10  HM2$L_IBMAPLBN - 4 Bytes      Index File Bitmap LBN
+
+
+          This longword contains the starting logical block address of
+          the  index file bitmap.  Once the home block of a volume has
+          been found, it is this value that  provides  access  to  the
+          rest  of  the index file and to the volume.  This value must
+          be non-zero for a valid home block.
+
+
+
+5.1.9.11  HM2$L_MAXFILES - 4 Bytes      Maximum Number of Files
+
+
+          This longword contains the maximum number of files that  may
+          be  present  on  the volume at any time.  This value must be
+          greater than the contents of  HM2$W_RESFILES  for  the  home
+          block  to  be valid.  If the maximum number of files is less
+          than 65536, then the third word  of  File  ID's  referencing
+          files  on  this volume is simply the relative volume number,
+          and the volume set of which this  volume  is  a  member  may
+          contain up to 65535 volumes.  If the maximum number of files
+          is greater than or equal to 65536, however,  then  the  high
+          byte  of the third word of File ID's is the high byte of the
+          file number, and the volume set may consist  of  up  to  255
+          volumes.   Under  no circumstances may the maximum number of
+          files be greater than 2**24-1.
+
+
+
+5.1.9.12  HM2$W_IBMAPSIZE - 2 Bytes     Index File Bitmap Size
+
+
+          This 16 bit word contains the number of blocks that make  up
+          the  index  file  bitmap.  This value must be non-zero for a
+          valid home block.
+
+
+
+5.1.9.13  HM2$W_RESFILES - 2 Bytes      Number of Reserved Files
+
+
+          This word contains the number of of  reserved  file  on  the
+          volume.   The  file sequence number of each reserved file is
+          always equal to its file number.  Reserved files may not  be
+          deleted.   This word must contain a minimum value of 5 to be
+          valid.
+Files-11 On-Disk Structure                                     Page 40
+
+
+5.1.9.14  HM2$W_DEVTYPE - 2 Bytes       Disk Device Type
+
+
+          This word is an index identifying  the  type  of  disk  that
+          contains  this  volume.  It is currently not used and always
+          contains 0.
+
+
+
+5.1.9.15  HM2$W_RVN - 2 Bytes Relative Volume Number
+
+
+          This word contains the  relative  volume  number  that  this
+          volume  has been assigned in a volume set.  If the volume is
+          not part of a volume set, then this word contains zero.
+
+
+
+5.1.9.16  HM2$W_SETCOUNT - 2 Bytes      Number of Volumes
+
+
+          This word contains the total number of volumes in a  tightly
+          coupled  volume set if the contents of HM2$W_RVN is 1 (i.e.,
+          if this volume is the  first  volume  of  the  volume  set).
+          Otherwise, this word contains zero.
+
+
+
+5.1.9.17  HM2$W_VOLCHAR - 2 Bytes       Volume Characteristics
+
+
+          This word contains bits  which  provide  additional  control
+          over access to the volume.  The following bits are defined:
+
+          HM2$V_READCHECK  Set if the volume is to  be  read  checked.
+                           All  block  reads done on this volume, both
+                           for data and for file  structure,  will  be
+                           performed   with   a   read,   read-compare
+                           sequence to insure data integrity.
+
+          HM2$V_WRITCHECK  Set if the volume is to be  write  checked.
+                           All  block writes done on this volume, both
+                           for data and for file  structure,  will  be
+                           performed   with   a   write,  read-compare
+                           sequence to insure data integrity.
+
+          HM2$V_ERASE      Set if all files on the volume  are  to  be
+                           erased when they are deleted.
+
+          HM2$V_NOHIGHWATER Set if highwater mark enforcement is to be
+                           disabled on the volume.
+Files-11 On-Disk Structure                                     Page 41
+
+
+5.1.9.18  HM2$L_VOLOWNER - 4 Bytes      Volume Owner UIC
+
+
+          This longword contains the binary UIC of the  owner  of  the
+          volume.   The  format  is the same as that of the file owner
+          UIC stored in the file header.
+
+
+
+5.1.9.19  4 Bytes (not used)
+
+5.1.9.20  HM2$W_PROTECT - 2 Bytes       Volume Protection Code
+
+
+          This word  contains  the  protection  code  for  the  entire
+          volume.  All operations on all files on the volume must pass
+          both  the  volume  and  the  file  protection  check  to  be
+          permitted.   Accessors  to  the  volume are categorized into
+          system, owner, group, and world with respect to  the  volume
+          owner  UIC  in the same manner as for file protection.  Each
+          category is controlled by the familiar four bit field.   The
+          four access modes are bit encoded as follows:
+
+          Bit 0     Set to deny reading files
+          Bit 1     Set to deny writing existing files
+          Bit 2     Set to deny creating files
+          Bit 3     Set to deny deleting files
+
+
+
+5.1.9.21  HM2$W_FILEPROT - 2 Bytes      Default File Protection
+
+
+          This word contains the file protection that will be assigned
+          to  files  created  on  this volume if no file protection is
+          specified by the user or the operating system.
+
+
+
+5.1.9.22  2 Bytes (not used)
+
+5.1.9.23  HM2$W_CHECKSUM1 - 2 Bytes     First Checksum
+
+
+          This word is an additive checksum of all  entries  preceding
+          in  the  home  block  (i.e., all those listed above).  It is
+          computed by the same sort of algorithm as  the  file  header
+          checksum (see section 3.5.7.1).
+
+
+
+5.1.9.24  HM2$Q_CREDATE - 8 Bytes       Volume Creation Date
+
+
+          This area contains the date and time  that  the  volume  was
+Files-11 On-Disk Structure                                     Page 42
+
+
+          initialized.   It  is  in the same binary format used in the
+          file header (see section 3.5.3.3).
+
+
+
+5.1.9.25  HM2$B_WINDOW - 1 Byte         Default Window Size
+
+
+          This byte contains the number  of  retrieval  pointers  that
+          will  be  used  for  the "window" (in core file access data)
+          when files are accessed on  the  volume,  if  not  otherwise
+          specified by the accessor.
+
+
+
+5.1.9.26  HM2$B_LRU_LIM - 1 Byte        Directory Pre-access Limit
+
+
+          This byte contains a count of the number of  directories  to
+          be stored in the file system's directory access cache.  More
+          generally, it is an estimate of  the  number  of  concurrent
+          users  of  the  volume and its use may be generalized in the
+          future.
+
+
+
+5.1.9.27  HM2$W_EXTEND - 2 Bytes        Default File Extend
+
+
+          This word  contains  the  number  of  blocks  that  will  be
+          allocated  to  a  file when a user extends the file and asks
+          for the system default value for allocation.
+
+
+
+5.1.9.28  HM2$Q_RETAINMIN - 8 Bytes     Minimum File Retention Period
+
+          This field contains the minimum length of time that  a  file
+          will be retained by a file expiration system after that file
+          is last accessed.  Its value is expressed  in  the  standard
+          delta  time  format;  i.e.,  minus  the  time  in  tenths of
+          microseconds.
+
+
+
+5.1.9.29  HM2$Q_RETAINMAX - 8 Bytes     Maximum File Retention Period
+
+          This field contains the maximum length of time that  a  file
+          will be retained by a file expiration system after that file
+          is last accessed.  Its value is likewise  expressed  in  the
+          standard delta time format.
+
+          The minimum and maximum retention fields are  used  together
+          as  follows:   When  a  file  is accessed, if the sum of the
+          current time plus the minimum retention period  exceeds  the
+Files-11 On-Disk Structure                                     Page 43
+
+
+          current  expiration  date  of  the  file,  then  the  file's
+          expiration date is reset to the sum of the current time plus
+          the  maximum  retention  period.   The  net  effect  of this
+          process is that the frequency of update  of  the  expiration
+          date  of  a  frequently  accessed  file is determined by the
+          difference  between  the  minimum  and   maximum   retention
+          periods.
+
+
+
+5.1.9.30  HM2$Q_REVDATE - 8 Bytes       Volume Revision Date
+
+          This field contains the date and  time  at  which  the  last
+          significant  modification  was  made  to  the  volume.  Such
+          modifications include  copying  via  a  full  backup,  state
+          change of a volume shadow set, etc.
+
+
+
+5.1.9.31  HM2$R_MIN_CLASS - 20 Bytes    Minimum Security Class
+
+          This field contains a classification  mask  that  represents
+          the  minimum  security and integrity classification of files
+          that may be created on this volume.  The structure  of  this
+          field  is  the  same  as its counterpart in the file header,
+          described in section 3.5.2.22.
+
+
+
+5.1.9.32  HM2$R_MAX_CLASS - 20 Bytes    Maximum Security Class
+
+          This field contains a classification  mask  that  represents
+          the  maximum  security and integrity classification of files
+          that may be created on this volume.  The structure  of  this
+          field  is  the  same  as its counterpart in the file header,
+          described in section 3.5.2.22.
+
+
+
+5.1.9.33  320 Bytes                     Not Used
+
+5.1.9.34  HM2$L_SERIALNUM - 4 Bytes     Media Serial Number
+
+          This field contains the binary serial number of the physical
+          medium on which the volume is located.
+
+
+
+5.1.9.35  HM2$T_STRUCNAME - 12 Bytes    Structure Name
+
+
+          This area contains the ASCII name of the volume set to which
+          this volume belongs, padded out to 12 bytes with spaces.  If
+          this volume is not a member of a volume set, then this  area
+          is filled with spaces.
+Files-11 On-Disk Structure                                     Page 44
+
+
+5.1.9.36  HM2$T_VOLNAME - 12 Bytes      Volume Name
+
+
+          This area contains the volume label in ASCII.  It is  padded
+          out to 12 bytes with spaces.
+
+
+
+5.1.9.37  HM2$T_OWNERNAME - 12 Bytes    Volume Owner
+
+
+          This area contains an ASCII string identifying the owner  of
+          the  volume.   The  area  is  padded  out  to  12 bytes with
+          trailing spaces.
+
+
+
+5.1.9.38  HM2$T_FORMAT - 12 Bytes       Format Type
+
+
+          This field contains the ASCII string "DECFILE11B" padded out
+          to  12 bytes with spaces.  It identifies the volume as being
+          of Files-11 format, structure level 2.
+
+
+
+5.1.9.39  2 Bytes                       Not Used
+
+5.1.9.40  HM2$W_CHECKSUM2 - 2 Bytes     Second Checksum
+
+
+          This word is the last word of the home block.   It  contains
+          an  additive checksum of the preceding 255 words of the home
+          block, computed according to the algorithm listed in section
+          3.5.7.1.
+Files-11 On-Disk Structure                                     Page 45
+
+
+5.1.9.41  Home Block Layout
+
+                |---------------------------------------|
+                |                                       |   HM2$L_HOMELBN
+                |--         LBN of This Block         --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$L_ALHOMELBN
+                |--    LBN of Secondary Home Block    --|
+                |                                       |    
+                |---------------------------------------|
+                |            LBN of Secondary           |   HM2$L_ALTIDXLBN
+                |--                                   --|
+                |           Index File Header           |    
+                |---------------------------------------|
+                |        Volume Structure Level         |   HM2$W_STRUCLEV
+                |---------------------------------------|
+                |     Storage Bitmap Cluster Factor     |   HM2$W_CLUSTER
+                |---------------------------------------|
+                |           VBN of This Block           |   HM2$W_HOMEVBN
+                |---------------------------------------|
+                |         Backup Home Block VBN         |   HM2$W_ALHOMEVBN
+                |---------------------------------------|
+                |        Backup Index Header VBN        |   HM2$W_ALTIDXVBN
+                |---------------------------------------|
+                |         Index File Bitmap VBN         |   HM2$W_IBMAPVBN
+                |---------------------------------------|
+                |              Index File               |   HM2$L_IBMAPLBN
+                |--                                   --|
+                |              Bitmap LBN               |    
+                |---------------------------------------|
+                |                                       |   HM2$L_MAXFILES
+                |--      Maximum Number of Files      --|
+                |                                       |   
+                |---------------------------------------|
+                |        Index File Bitmap Size         |   HM2$W_IBMAPSIZE
+                |---------------------------------------|
+                |       Number of Reserved Files        |   HM2$W_RESFILES
+                |---------------------------------------|
+                |           Disk Device Type            |   HM2$W_DEVTYPE
+                |---------------------------------------|
+                |         Relative Volume Number        |   HM2$W_RVN
+                |---------------------------------------|
+                |       Number of Volumes in Set        |   HM2$W_SETCOUNT
+                |---------------------------------------|
+                |        Volume Characteristics         |   HM2$W_VOLCHAR
+                |---------------------------------------|
+                |                                       |   HM2$L_VOLOWNER
+                |--         Volume Owner UIC          --|
+                |                                       |   
+                |---------------------------------------|
+                |                                       |
+                |--            (not used)             --|
+                |                                       |   
+                |---------------------------------------|
+Files-11 On-Disk Structure                                     Page 46
+
+
+                |           Volume Protection           |   HM2$W_PROTECT
+                |---------------------------------------|
+                |        Default File Protection        |   HM2$W_FILEPROT
+                |---------------------------------------|
+                |              (not used)               |
+                |---------------------------------------|
+                |            First Checksum             |   HM2$W_CHECKSUM1
+                |---------------------------------------|
+                |                                       |   HM2$Q_CREDATE
+                |--                                   --|
+                |                                       |   
+                |--       Volume Creation Date        --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |-------------------|-------------------|
+HM2$B_LRU_LIM   |  Directory Limit  | Def. Window Size  |   HM2$B_WINDOW
+                |-------------------|-------------------|
+                |          Default File Extend          |   HM2$W_EXTEND
+                |---------------------------------------|
+                |                                       |   HM2$Q_RETAINMIN
+                |--                                   --|
+                |              Minimum File             |   
+                |--          Retention Period         --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$Q_RETAINMAX
+                |--                                   --|
+                |              Maximum File             |   
+                |--          Retention Period         --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$Q_REVDATE
+                |--                                   --|
+                |                                       |   
+                |--       Volume Revision Date        --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$R_MIN_CLASS
+                |--                                   --|
+                |                                       |   
+                |--       Minimum File Security       --|
+                |          Classification Level         |   
+                |--                                   --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$R_MAX_CLASS
+Files-11 On-Disk Structure                                     Page 47
+
+
+                |--                                   --|
+                |                                       |   
+                |--       Maximum File Security       --|
+                |          Classification Level         |   
+                |--                                   --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |    
+                |                                       |    
+                |                                       |    
+                |                                       |    
+                |              (not used)               |
+                |                                       |    
+                |                                       |    
+                |                                       |    
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$L_SERIALNUM
+                |--        Media Serial Number        --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$T_STRUCNAME
+                |--                                   --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |--         Volume Set Name           --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$T_VOLNAME
+                |--                                   --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |--            Volume Name            --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$T_OWNERNAME
+                |--                                   --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |--           Volume Owner            --|
+                |                                       |    
+                |--                                   --|
+Files-11 On-Disk Structure                                     Page 48
+
+
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$T_FORMAT
+                |--                                   --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |--            Format Type            --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |---------------------------------------|
+                |              (not used)               |
+                |---------------------------------------|
+                |            Second Checksum            |   HM2$W_CHECKSUM2
+                |---------------------------------------|
+
+
+
+5.2  Storage Bitmap File
+
+The storage bitmap file is File ID 2,2.  It is listed in  the  MFD  as
+BITMAP.SYS;1.   The  storage  bitmap  is used to control the available
+                                        _______  _______  _____space on a volume.  It consists  of  a  storage  control  block  which
+contains  summary  information about the volume, and the bitmap itself
+which lists the availablilty of individual blocks.  This file has  the
+record  format  of  512  byte  fixed  length records, with no carriage
+control.  The end of file mark is positioned  to  point  to  the  last
+block used.  The storage bitmap file must be contiguous.
+
+
+
+5.2.1  Storage Control Block
+
+
+Virtual block 1 of the storage bitmap is the  storage  control  block.
+It   contains   summary  information  about  the  volume.   Note  that
+implementation of some of the features in the  storage  control  block
+may require it to be written at mount and dismount.
+
+
+
+5.2.1.1  SCB$W_STRUCLEV - 2 Bytes       Storage Map Structure Level
+
+
+          This word  contains  the  structure  level  of  the  storage
+          control  block.   The  high  byte  contains  the  value 2 to
+          indicate Files-11 structure level 2.  The low byte  contains
+          the  version  number, which must be equal to or greater then
+          1.
+Files-11 On-Disk Structure                                     Page 49
+
+
+5.2.1.2  SCB$W_CLUSTER - 2 Bytes        Storage Map Cluster Factor
+
+
+          This word contains the storage map  cluster  factor  of  the
+          volume.   Its  contents  are  identical  to  the contents of
+          HM2$W_CLUSTER in the home block.   It  is  placed  here  for
+          convenience.
+
+
+
+5.2.1.3  SCB$L_VOLSIZE - 4 Bytes        Volume Size
+
+
+          This field contains the volume  size  expressed  in  logical
+          blocks.
+
+
+
+5.2.1.4  SCB$L_BLKSIZE - 4 Bytes        Blocking Factor
+
+
+          This field contains the blocking factor of the volume; i.e.,
+          the  number  of  physical blocks or sectors that make up one
+          logical block.
+
+
+
+5.2.1.5  SCB$L_SECTORS - 4 Bytes        Sectors Per Track
+
+
+          This field contains the number of  logical  blocks  in  each
+          track of the volume.
+
+
+
+5.2.1.6  SCB$L_TRACKS - 4 Bytes         Tracks Per Cylinder
+
+
+          This field contains the number of tracks contained  in  each
+          cylinder of the volume.
+
+
+
+5.2.1.7  SCB$L_CYLINDER - 4 Bytes       Number of Cylinders
+
+
+          This field contains the total number  of  cylinders  on  the
+          volume.   The  above  three quantities are present to assist
+          optimized allocation of space on physical boundaries in  the
+          volume.
+Files-11 On-Disk Structure                                     Page 50
+
+
+5.2.1.8  SCB$L_STATUS - 4 Bytes         Status Word
+
+
+          This word contains the following status bits:
+
+
+
+
+5.2.1.9  SCB$L_STATUS2 - 4 bytes        Secondary Status
+
+          This word contains a copy of the  primary  status  word  for
+          deferred use.
+
+
+
+5.2.1.10  SCB$W_WRITECNT - 2 Bytes      Writer Count
+
+          This word contains the number of  independent  systems  that
+          currently have the volume mounted for write.
+
+
+
+5.2.1.11  SCB$T_VOLOCKNAME - 12 Bytes   Volume Lock Name
+
+          This field contains a unique name which is used  as  a  root
+          for synchronization resource names for the volume.
+
+
+
+5.2.1.12  SCB$Q_MOUNTTIME - 4 Bytes     Time of Last Mount
+
+          This field contains the date and time of the last  time  the
+          volume  was  mounted  for  write.   It  is  expressed in the
+          standard time format.
+
+
+
+5.2.1.13  456 Bytes                     (not used)
+
+5.2.1.14  SCB$W_CHECKSUM - 2 Bytes      Block Checksum
+
+
+          This word contains the ubiquitous  block  checksum.   It  is
+          computed  using  the  same  algorithm  as  the  file  header
+          checksum (section 3.5.7.1).
+
+
+
+5.2.1.15  Storage Control Block Layout
+
+
+
+                |---------------------------------------|
+                |            Structure Level            |   SCB$W_STRUCLEV
+                |---------------------------------------|
+Files-11 On-Disk Structure                                     Page 51
+
+
+                |      Storage Map Cluster Factor       |   SCB$W_CLUSTER
+                |---------------------------------------|
+                |                                       |   SCB$L_VOLSIZE
+                |--       Volume Size in Blocks       --|
+                |                                       |   
+                |---------------------------------------|
+                |                                       |   SCB$L_BLKSIZE
+                |--          Blocking Factor          --|
+                |                                       |   
+                |---------------------------------------|
+                |                                       |   SCB$L_SECTORS
+                |--         Sectors Per Track         --|
+                |                                       |   
+                |---------------------------------------|
+                |                                       |   SCB$L_TRACKS
+                |--        Tracks Per Cylinder        --|
+                |                                       |   
+                |---------------------------------------|
+                |                                       |   SCB$L_CYLINDER
+                |--        Cylinders on Volume        --|
+                |                                       |   
+                |---------------------------------------|
+                |                                       |   SCB$L_STATUS
+                |--           Volume Status           --|
+                |                                       |   
+                |---------------------------------------|
+                |                                       |   SCB$L_STATUS2
+                |--      Secondary Volume Status      --|
+                |                                       |   
+                |---------------------------------------|
+                |          Volume Writer Count          |   SCB$W_WRITECNT
+                |---------------------------------------|
+                |                                       |   SCB$T_VOLOCKNAME
+                |--                                   --|   
+                |                                       |   
+                |--                                   --|   
+                |         Volume Synchronization        |   
+                |--             Lock Name             --|   
+                |                                       |   
+                |--                                   --|   
+                |                                       |   
+                |--                                   --|   
+                |                                       |   
+                |---------------------------------------|
+                |                                       |   SCB$Q_MOUNTTIME
+                |--                                   --|   
+                |             Time of Last              |   
+                |--           Initial Mount           --|   
+                |                                       |   
+                |--                                   --|   
+                |                                       |   
+                |---------------------------------------|
+                |                                       |   
+                |                                       |   
+                |                                       |   
+Files-11 On-Disk Structure                                     Page 52
+
+
+                |                                       |   
+                |                                       |   
+                |              (not used)               |   
+                |                                       |   
+                |                                       |   
+                |                                       |   
+                |                                       |   
+                |                                       |   
+                |---------------------------------------|
+                |            Block Checksum             |   SCB$W_CHECKSUM
+                |---------------------------------------|
+
+
+
+5.2.2  Storage Bitmap
+
+Virtual blocks 2 through n+1 are the storage  bitmap  itself.   It  is
+best viewed as a bit string of length m, numbered from 0 to m-1, where
+m is the total number of allocatable clusters on the volume rounded up
+to the next multiple of 4096.  Each cluster contains v logical blocks,
+where v is the storage map cluster factor (also  referred  to  as  the
+volume cluster factor) contained in location HM2$W_CLUSTER in the home
+block.  The bits are addressed in the usual manner  (packed  right  to
+left  in sequentially numbered bytes).  Since each virtual block holds
+4096 bits, n blocks, where n = m/4096, are used to  hold  the  bitmap.
+Bit  j  of the bitmap represents logical blocks j*v through j*v+v-1 of
+the volume; if the bit is set, the blocks  are  free;  if  clear,  the
+blocks  are  allocated.   Clearly  the  last  k bits of the bitmap are
+always clear, where k is the difference between the true size  of  the
+volume and m, the length of the bitmap.
+
+Rounding the storage map file up to the next multiple  of  the  volume
+cluster  factor  may  result  in  some unused blocks at the end of the
+file.  The end of file mark points to the last block used.
+
+
+
+5.3  Bad Block File
+
+The bad block file is File ID  3,3.   It  is  listed  in  the  MFD  as
+BADBLK.SYS;1.   The  bad block file is simply a file containing all of
+the known bad blocks on the volume.  This file has the  record  format
+of 512 byte fixed length records, with no carriage control.
+
+On  disks  containing  a  bad  block  descriptor  (see  following  two
+sections),  the  last  track  of  the  volume  should occupy the first
+several clusters of the bad block file.  This  ensures  that  the  bad
+block  data  is available to software in a file structured manner, and
+is preserved for future re-initialization of the volume.
+
+The end of file mark may be placed as the operating system's bad block
+handling  strategy  finds  useful.  Volume initialization should place
+the EOF at the end of the bad blocks found during initialization.   At
+all times, the EOF should at least point past the bad block descriptor
+data.
+Files-11 On-Disk Structure                                     Page 53
+
+
+5.3.1  Factory Bad Block Descriptor
+
+Many DEC supplied disks preceding DSA disks have  a  factory  supplied
+format  that  lists  the  known bad blocks in the volume's last track.
+Disks of this type include the RK06,  RK07,  RL02,  RP06,  RM03,  etc.
+This  track  contains  redundantly  recorded  descriptions  of the bad
+blocks on the volume, as described in DEC STD.   144,  "Disk  Standard
+for Recording and Handling Manufacturing Detected Bad Sectors".
+
+
+
+5.3.2  Software Bad Block Descriptor
+
+For disks that do not have  factory  last  track  bad  block  data,  a
+software  generated  bad  block  map  may  be  supplied.  It is always
+located on the last good block of the volume.  The software bad  block
+descriptor  is  most  of a Files-11 Structure Level 1 header map area.
+The first two bytes contain the constants 1 and 3, respectively.   The
+third byte contains the number of words that contain data.  The fourth
+byte contains the number of words available for bad block  data.   The
+last  word  of  the  block  contains the usual additive checksum.  The
+retrieval pointers  are  structure  level  1  format  1  pointers,  as
+described below.
+
+
+Bad Block Descriptor Layout
+
+
+                |-------------------|-------------------|
+BBM$B_LBNSIZE   |         3         |         1         |   BBM$B_COUNTSIZE
+                |-------------------|-------------------|
+BBM$B_AVAIL     | Map Words Avail.  | Map Words in Use  |   BBM$B_INUSE
+                |-------------------|-------------------|
+                |                                       |   BBM$C_POINTERS
+                |                                       |
+                |                                       |
+                |          Retrieval Pointers           |    
+                |                                       |
+                |                                       |
+                |                                       |
+                |---------------------------------------|
+                |            Block Checksum             |   BBM$W_CHECKSUM
+                |---------------------------------------|
+
+
+Each retrieval pointer is four bytes in length.  Byte 1  contains  the
+high  order  bits  of the 24 bit LBN.  Byte 2 contains the count field
+(in excess 1 format), and bytes 3 and 4 contain the low 16 bits of the
+LBN.
+
+                |-------------------|-------------------|
+BBM$B_COUNT     |    Block Count    |  High Order LBN   |   BBM$B_HIGHLBN
+                |-------------------|-------------------|
+                |             Low Order LBN             |   BBM$W_LOWLBN
+                |---------------------------------------|
+Files-11 On-Disk Structure                                     Page 54
+
+
+5.4  Master File Directory
+
+The master file directory is File ID 4,4.  It is  listed  in  the  MFD
+(itself)  as  000000.DIR;1.   The  MFD  is  the  root  of the volume's
+directory structure.  It lists the reserved files, plus  whatever  the
+user  chooses  to  enter.   The  format  of the MFD is the same as all
+directory files,  and  is  described  in  section  4.3.   In  the  UFD
+structures  described  in  sections  4.1.1 and 4.1.2, the MFD contains
+entries for all top level user file directories.
+
+
+
+5.5  Core Image File
+
+The core image file is File ID 5,5.   It  is  listed  in  the  MFD  as
+CORIMG.SYS;1.   Its use is operating system dependent.  In general, it
+provides a file of known File ID for the use of the operating  system,
+for  use  as  a  swap area, for example, or as a monitor overlay area,
+etc.  This file has  the  record  format  of  512  byte  fixed  length
+records, with no carriage control.  The end of file mark is positioned
+to point to the physical end of file.
+
+
+
+5.6  Volume Set List
+
+The volume set list is File ID 6,6.   It  is  listed  in  the  MFD  as
+VOLSET.SYS;1.   It  is  used  only on relative volume one of a tightly
+coupled volume set.  There, it contains a list of the volume labels of
+the  volumes contained in this volume set.  The format of this file is
+64 byte fixed length records with implied carriage control.  The first
+12  bytes  of  record  1 contain the structure name of the volume set.
+The first 12 bytes of record n contain the volume  label  of  relative
+volume  n-1.   The  remaining 52 bytes of each record are reserved for
+future use.
+
+
+
+5.7  Continuation File
+
+The standard continuation file is File ID 7,7.  It is  listed  in  the
+MFD  as CONTIN.SYS;1.  It is used as the extension File ID when a file
+crosses from one volume of a loosely coupled volume  set  to  another.
+The  purpose  of this reserved File ID is allow a multi-volume file to
+be written sequentially with  only  one  volume  mounted  at  a  time.
+Ordinarily,  when  a  file  is  extended  onto another volume, the new
+header must be created first to obtain the  new  File  ID  before  the
+extension  linkage  in  the current header can be written.  The use of
+this reserved File ID allows the extension linkage to be written  with
+a known constant before the next volume is even on line.
+Files-11 On-Disk Structure                                     Page 55
+
+
+5.8  Backup Log File
+
+The backup log file is File ID 8,8,0.  It is  listed  in  the  MFD  as
+BACKUP.SYS;1.   This file contains a history of volume and incremental
+backups performed on the volume.  The format of this file is  64  byte
+fixed  length  records.   No  implementations  of  Files-11  currently
+support the backup log file, and its contents is at present undefined.
+
+
+
+5.9  Pending Bad Block Log File
+
+The pending bad block log file is File ID 9,9,0.  It is listed in  the
+MFD  as BADLOG.SYS;1.  This file contains a list identifying suspected
+bad blocks on the volume that  are  not  currently  contained  in  the
+volume's  bad  block  file.   The format of this file is 16 byte fixed
+length records.  Each record represents one bad  block,  and  has  the
+following format:
+
+
+                |---------------------------------------|
+                |                                       |   PBB$W_FID
+                |--              File ID              --|
+                |               containing              |
+                |--             bad block             --|
+                |                                       |
+                |-------------------|-------------------|
+PBB$B_COUNT     |    Error Count    |      Flags        |   PBB$B_FLAGS
+                |-------------------|-------------------|
+                |                                       |   PBB$L_VBN
+                |--          VBN within file          --|
+                |                                       |
+                |---------------------------------------|
+                |                                       |   PBB$L_LBN
+                |--                LBN                --|
+                |                                       |
+                |---------------------------------------|
+
+
+The following bits are defined in the flags byte:
+
+          PBB$V_READERR    Set if a read error has  occurred  on  this
+                           block.
+
+          PBB$V_WRITERR    Set if a write error has occurred  on  this
+                           block.
+
+
+
+6  Sequential Record File Structure
+
+The Files-11 structure supports  several  sequential  record  formats,
+which  are  described  in  this  section.   These  record  formats are
+implemented by  the  record  support  packages  of  various  operating
+systems,  such  as  FCS-11,  RMS-11,  and  VAX-11 RMS.  Record control
+Files-11 On-Disk Structure                                     Page 56
+
+
+information is maintained in the file's record  attributes  area,  and
+embedded within the data blocks.
+
+Other record formats (such as ISAM, direct, DBMS, etc.) are  supported
+by  various operating systems.  Their structure is not covered by this
+specification.
+
+
+
+6.1  File Attributes
+
+The record control information that applies to the file as a whole  is
+kept in the file's record attributes area (FH2$W_RECATTR).  This block
+contains the following fields:
+
+
+
+6.1.1  FAT$B_RTYPE - 1 Byte             Record Type
+
+
+          This byte identifies the file organization and record format
+          of the file.  It is devided into two four bit subfields:
+
+       FAT$V_RTYPE - 4 Bits             Record Format
+
+          This field identifies the format of the records in the file.
+          It may contain one of the following values:
+
+          FAT$C_UNDEFINED  Undefined record format.  Record structure,
+                           if  any,  is  supplied  by  the application
+                           processing  the  file  by  specifying   the
+                           number  of bytes to be read or written with
+                           each record operation.
+
+          FAT$C_FIXED      Fixed length records.  All records are  the
+                           same  length, and stored with no additional
+                           intervening record control information.
+
+          FAT$C_VARIABLE   Variable  length  records.    Records   are
+                           variable  in  length  from 1 to 32767 bytes
+                           and are stored with a  16  bit  byte  count
+                           preceding each record.
+
+          FAT$C_VFC        Sequenced variable length records.  Records
+                           are variable in length, and are stored with
+                           a 16 bit byte  count,  plus  a  fixed  size
+                           control  area,  preceding each record.  The
+                           control  area  is  treated  as  an   entity
+                           separate from the record.
+
+          FAT$C_STREAM     General stream format.  Records are assumed
+                           to  consist  of  ASCII  characters, and are
+                           packed into the file's virtual blocks  with
+                           no  additional  record control information.
+                           The common line delimiter characters  (line
+Files-11 On-Disk Structure                                     Page 57
+
+
+                           feed,  form  feed,  vertical  tab, carriage
+                           return, and escape) are treated  as  record
+                           separators.
+
+          FAT$C_STREAMLF   Line  feed  stream  format.   Records   are
+                           assumed to consist of ASCII characters, and
+                           are packed into the file's  virtual  blocks
+                           with    no    additional   record   control
+                           information.   Line  feed  characters   are
+                           treated as record separators.
+
+          FAT$C_STREAMCR   Carriage return stream format.  Records are
+                           assumed to consist of ASCII characters, and
+                           are packed into the file's  virtual  blocks
+                           with    no    additional   record   control
+                           information.   Carriage  return  characters
+                           are treated as record separators.
+
+
+       FAT$V_FILEORG - 4 Bits File Organization
+
+          This field specifies the overall organization of  the  file.
+          It contains one of the following values:
+
+          FAT$C_SEQUENTIAL Sequential  file.   This  is   the   format
+                           covered    in    this    section   of   the
+                           specification.
+
+          FAT$C_RELATIVE   Relative file.   This  file  format  allows
+                           access  by  relative  record  number (e.g.,
+                           Fortran direct access  and  Cobol  relative
+                           file).
+
+          FAT$C_INDEXED    Indexed  file.   This  file  format  allows
+                           access  by  one  of  several indices (e.g.,
+                           Cobol indexed access).
+
+          FAT$C_DIRECT     Direct (hashed)  file.   This  file  format
+                           allows  direct access to records by hashing
+                           of a record key.   [Direct  files  are  not
+                           currently  supported by any implementations
+                           of Files-11.]
+
+
+
+6.1.2  FAT$B_RATTRIB - 1 Byte           Record Attributes
+
+
+          This byte contains record attribute bits  that  control  the
+          handling  of  records under various contexts.  The following
+          flag bits are defined:
+
+          FAT$V_FORTRANCC  Use Fortran carriage control if  set.   The
+                           first   byte   of  each  record  is  to  be
+                           interpreted as a standard Fortran  carriage
+Files-11 On-Disk Structure                                     Page 58
+
+
+                           control character when the record is copied
+                           to a carriage control device.
+
+          FAT$V_IMPLIEDCC  Use implied carriage control if set.   When
+                           the  file  is  copied to a carriage control
+                           device, each record is to be preceded by  a
+                           line   feed  and  followed  by  a  carriage
+                           return.  Note that the FAT$V_FORTRANCC  and
+                           FAT$V_IMPLIEDCC     bits    are    mutually
+                           exclusive.
+
+          FAT$V_PRINTCC    Use print  file  carriage  control.   Legal
+                           only  if  the  record type is FAT$C_VFC and
+                           the    size    of    the    control    area
+                           (FAT$B_VFCSIZE)  is  two.   The leading two
+                           byte  field  of  each  record  is  used  as
+                           carriage  control  instead of as a sequence
+                           number.  The first  and  second  bytes  are
+                           used   as  leading  and  trailing  carriage
+                           formatting,       respectively.         The
+                           interpretation   of  the  carriage  control
+                           bytes is described below in section 6.3.3.
+
+                           If none of the  above  attributes  is  set,
+                           then  the file has no carriage control, and
+                           no additional formatting data is  added  to
+                           the record contents when the file is copied
+                           to a carriage control device.
+
+          FAT$V_NOSPAN     Records do not cross  block  boundaries  if
+                           set.   Generally,  there will be dead space
+                           at the end  of  each  block;  how  this  is
+                           handled  is explained in the description of
+                           record formats in section 6.3.
+
+
+
+6.1.3  FAT$W_RSIZE - 2 Bytes            Record Size
+
+
+          In a fixed length record file, this word contains  the  size
+          of  the records in bytes.  In a variable length record file,
+          this word contains the size in bytes of the  longest  record
+          in the file.
+
+
+
+6.1.4  FAT$L_HIBLK - 4 Bytes            Highest VBN Allocated
+
+
+          This 32 bit number is a  count  of  the  number  of  virtual
+          blocks  allocated to the file.  For historical reasons, this
+          quantity is stored in swapped  format;  that  is,  the  high
+          order  16  bits occupy the first two bytes and the low order
+          16 bits the second two bytes.
+Files-11 On-Disk Structure                                     Page 59
+
+
+6.1.5  FAT$L_EFBLK - 4 Bytes            End of File Block
+
+
+          This 32 bit number is the VBN  at  which  the  end  of  file
+          position  is  located.   This  value  is  likewise stored in
+          swapped format.
+
+
+
+6.1.6  FAT$W_FFBYTE - 2 Bytes           First Free Byte
+
+
+          This word is a count of the number of bytes in  use  in  the
+          virtual  block  containing  the end of file; i.e., it is the
+          offset  to  the  first  byte  of  the  file  available   for
+          appending.   Note  that an end of file that falls on a block
+          boundary may be represented in either of two ways.   If  the
+          file  contains precisely n blocks, FAT$L_EFBLK may contain n
+                                                  __          and  FAT$W_FFBYTE  will  contain  512,  or  FAT$L_EFBLK  may
+          contain  n+1 and FAT$W_FFBYTE will contain 0.  The preferred
+          method is to set FAT$W_FFBYTE to zero.
+
+
+
+6.1.7  FAT$B_BKTSIZE - 1 Byte           File Bucket Size
+
+          This  byte  contains  the  number  of  virtual  blocks  that
+          constitute   one  storage  bucket  for  non-sequential  file
+          formats.  It is not used for sequential file formats.
+
+
+
+6.1.8  FAT$B_VFCSIZE - 1 Byte           Fixed Control Area Size
+
+          This byte contains the number of bytes at the start of  each
+          variable  length  record  that constitute the record's fixed
+          control area.
+
+
+
+6.1.9  FAT$W_MAXREC - 2 Bytes           Maximum Record Size
+
+          This word contains the maximum  size  in  bytes  of  records
+          permitted  in  the file.  For fixed length record files, the
+          contents of FAT$W_MAXREC and FAT$W_RSIZE are equal.
+
+
+
+6.1.10  FAT$W_DEFEXT - 2 Bytes          Default Extend Size
+
+          This field specifies the number of blocks by which to extend
+          the  file when more space is needed, and no extend quantitiy
+          has been supplied by the application.
+Files-11 On-Disk Structure                                     Page 60
+
+
+6.1.11  FAT$W_GBC - 2 Bytes             Global Buffer Count
+
+          This word specifies the number of buffers to be allocated to
+          a global buffer pool for managing the file, if not specified
+          by the application.
+
+
+
+6.1.12  8 Bytes                         (Not used)
+
+6.1.13  FAT$W_VERSIONS - 2 Bytes        Directory   Default    Version
+        Limit
+
+          This word is  only  used  in  the  record  attributes  of  a
+          directory  file.   It  specifies  the  version  limit  to be
+          assigned to new files  created  in  the  directory  when  no
+          version  limit  is siven by the user.  A value of zero means
+          the version limit is set to 32767, the maximum possible.
+
+
+
+6.1.14  FAT$C_LENGTH - 32 Bytes         Size of Attribute Block
+
+
+          This symbol represents the total number of bytes in the file
+          attribute block.
+
+
+
+6.2  File Attributes Layout
+
+                |-------------------|-------------------|
+FAT$B_RATTRIB   |   Record Attr.    |    Record Type    |   FAT$B_RTYPE
+                |-------------------|-------------------|
+                |          Record Size (Bytes)          |   FAT$W_RSIZE
+                |---------------------------------------|
+                |              Highest VBN              |   FAT$L_HIBLK
+                |--                                   --|
+                |               Allocated               |    
+                |---------------------------------------|
+                |              End of File              |   FAT$L_EFBLK
+                |--                                   --|
+                |                  VBN                  |    
+                |---------------------------------------|
+                |            First Free Byte            |   FAT$W_FFBYTE
+                |-------------------|-------------------|
+FAT$B_VFCSIZE   | Fixed Ctrl. Size  |    Bucket Size    |   FAT$B_BKTSIZE
+                |-------------------|-------------------|
+                |          Maximum Record Size          |   FAT$W_MAXREC
+                |---------------------------------------|
+                |          Default Extend Size          |   FAT$W_DEFEXT
+                |---------------------------------------|
+                |          Global Buffer Count          |   FAT$W_GBC
+                |---------------------------------------|
+                |                                       |
+Files-11 On-Disk Structure                                     Page 61
+
+
+                |                                       |
+                |                                       |
+                |               (Not used)              |
+                |                                       |
+                |                                       |
+                |                                       |
+                |---------------------------------------|
+                |    Directory Default Version Limit    |   FAT$W_VERSIONS
+                |---------------------------------------|   FAT$C_LENGTH
+
+
+
+6.3  Attribute Standardization
+
+To assure a certain consistency of  file  record  structures,  certain
+fields  in  the  record  attributes  area  are  standardized, and must
+contain well defined values regardless of the record structure or file
+organization in use.
+
+     1.  The record type byte (FAT$B_RTYPE) must contain a  code  that
+         identifies  the  file organization and record structure.  All
+         codes must be registered with this specification.
+
+     2.  The record attribute bits should be used as  described  above
+         when  applicable.   New  attributes ahould be registered with
+         this specification.
+
+     3.  The high VBN field (FAT$L_HIBLK) must contain the  number  of
+         blocks  allocated  to the file.  File systems may modify this
+         field during some operations on the file.
+
+     4.  The end of file mark (FAT$L_EFBLK  and  FAT$W_FFBYTE)  should
+         describe the end of data in the file when applicable.
+
+
+
+
+6.4  Record Structure
+
+This section describes how records are packed in the virtual blocks of
+a disk file.  In general, a file is treated as a sequentially numbered
+array of bytes.  Records are numbered consecutively starting with 1.
+
+
+
+6.4.1  Fixed Length Records
+
+In a file consisting of fixed length records, the records  are  simply
+packed  end  to  end  with  no additional control information.  If the
+record length is odd, each record is padded with a single  null.   For
+direct access, the address of a record is computed as follows:
+
+Let:      n = record number
+          k = record size (in bytes)
+          m = byte address of record in file
+Files-11 On-Disk Structure                                     Page 62
+
+
+          q = number of records per block
+          j = VBN containing the start of the record
+          i = byte offset within VBN j
+
+Then      h = ((k+1)/2)*2 (rounded up record length)
+          m = (n-1)*h
+          j = m/512+1 (truncated)
+          i = m mod 512
+
+          Note that m is potentially as large as 41 bits (unsigned).
+
+The previous discussion assumes that records  cross  block  boundaries
+(that  is,  FAT$V_NOSPAN  is  not set).  If records do not cross block
+boundaries, they are limited to 512 bytes, and the following equations
+apply (the variables are defined as above):
+
+          h = ((k+1)/2)*2 (rounded up record length)
+          q = 512/h (truncated)
+          j = (n-1)/q+1 (truncated)
+          i = ((n-1) mod q)*h
+
+
+
+6.4.2  Variable Length Records
+
+In a sequential file consisting of variable  length  records,  records
+may  be up to 32767 bytes in length.  Each record is preceded by a two
+byte binary count of the bytes in  the  record  (the  count  does  not
+include  itself).   For  example,  a  null  record is represented by a
+single zero word.  The byte count is always word aligned; i.e.,  if  a
+record ends on an odd byte boundary, it is padded with a single null.
+
+If records do not cross block boundaries (FAT$V_NOSPAN is  set),  they
+are  limited  to a size of 510 bytes.  A byte count of -1 is used as a
+flag to signal that there are no more records in a  particular  block.
+The  remainder of that block is then dead space and the next record in
+the file starts at the beginning of the next block.  The contents of a
+block after the end marker are undefined.
+
+
+
+6.4.3  Variable Length Records with Fixed Control Area
+
+The format of a VFC file is identical to a variable length record file
+except  that  a  fixed control area field is located immediately after
+the byte count field of each record.   This  field  may  be  used  for
+various  purposes by different applications.  For example, editors may
+use it to store line numbers, or it may hold  an  audit  tag  for  the
+record,  etc.   The  control  area is not returned as part of the data
+when a record is read, but is available  separately.   Note  that  the
+record  byte  count field counts the fixed control area as well as the
+data of the record.
+Files-11 On-Disk Structure                                     Page 63
+
+
+6.4.3.1  Format of Two Byte Print Control Field in FAT$C_VFC Records
+
+If the FAT$V_PRINTCC bit is set in the record attributes  then  a  two
+byte  control  area  is  used to contain carriage control data for the
+record.  Byte 0 is print control information to act  upon  before  the
+record data is output to a unit record device; byte 1 is print control
+information to act upon after the record data has  been  output  to  a
+unit record device.
+
+The format of each byte is as follows:
+
+Bit 7       Bits 6-0     Meaning
+
+0           0            No carriage control
+0           count(1-127) "count" new lines (CR/LF)
+
+Bit 7       Bit 6  Bit 5  Bits 4-0       Meaning
+
+1           0      0      ASCII C0 set   ASCII char to
+                                         output (CR,FF etc.)
+1           0      1      ASCII C1 set   ASCII char (8 bit code)
+                                         to output
+1           1      0      code (0-63)    Device specific code
+1           1      1      -              Reserved
+
+
+
+6.4.4  Stream Format Records
+
+In a stream format file, the data bytes  of  the  records  are  simply
+packed  into  consecutive bytes of the file's virtual blocks.  Certain
+characters  are  interpreted  as  record  terminators;  the   set   of
+terminators varies with the different stream formats.
+
+The carriage control attributes play  a  somewhat  different  role  in
+stream  format  files  than  they  do  in record files.  When a stream
+format file is  read  or  written,  the  carriage  control  attributes
+determine  whether  the  record terminator character is visible to the
+application processing the file.  Each stream format has some  set  of
+terminator  characters  or  character  sequences.   Of  these,  one is
+                   _______ __________referred to as the default terminator; it is considered the  principal
+terminator for that file format.
+
+Of  the  three  carriage  control  attributes,   FAT$V_FORTRANCC   and
+FAT$V_IMPLIEDCC  are legal for stream files; FAT$V_PRINTCC is not.  If
+either of the two legal carriage control attributes  is  set  for  the
+file, then terminators receive the following treatment:
+
+On input,  if  the  record  ends  with  the  default  terminator,  the
+terminator  is not presented to the application as part of the record.
+If the record ends with a terminator other than the default, than  the
+terminator is considered part of the record.
+
+Conversely, on output, if the record presented for output does not end
+with  a  recognized  terminator, the default terminator is appended to
+Files-11 On-Disk Structure                                     Page 64
+
+
+the record; if  the  record  does  end  with  a  terminator,  then  no
+terminator is appended.
+
+If no carriage control is set  for  the  file,  then  terminators  are
+always  considered  part of the record on input, and none are added on
+output.
+
+The following sections describe the terminator sets  for  the  various
+stream formats.
+
+
+
+6.4.4.1  Undefined Records (Binary Stream)
+
+No characters are considered terminators.  When such a file  is  read,
+the  application  always receives the number of bytes specified as the
+size of its input record buffer.  The carriage control attributes  are
+irrelevant for this file format.
+
+
+
+6.4.4.2  General Stream Format
+
+The terminator set includes the sequence carriage return - line  feed,
+and  the  characters  carriage  return,  line feed, vertical tab, form
+feed, and escape.  The default terminator  is  the  sequence  carriage
+return  - line feed.  This is the format used by the stream support in
+most DEC operating systems.
+
+
+
+6.4.4.3  Line Feed Stream Format
+
+Line feed is the only and default terminator.  This is the format used
+in UNIX text files.
+
+
+
+6.4.4.4  Carriage Return Stream Format
+
+Carriage return is the only  and  default  terminator.   This  is  the
+format  used in APL text files, and the text file format of some other
+manufacturers' operating systems.
+
+
+
+7  Simple Subset
+
+This section describes a minimal subset of Files-11 structure level  2
+which  is  suitable  for data interchange and be read on small systems
+with a minimum of software.  The subset is referred to as the Files-11
+level 0 subset.  The subset is achieved by the omission of a number of
+Files-11's features and a set of format rules that  allow  simplifying
+assumptions to be made by the software reading the volume.
+Files-11 On-Disk Structure                                     Page 65
+
+
+Level 0 has been designed so that it  can  be  produced  by  a  fairly
+conventional  file  system,  using  restricted operation.  It contains
+sufficient flexibility, however, that it may  also  be  produced  with
+unconventional  storage  allocation  techniques  (i.e.,  using special
+purpose software that itself incorporates simplifying assumptions).
+
+Storage management facilities  are  optional;  further,  some  of  the
+format rules preclude dynamic storage allocation.  Because the primary
+use is in data interchange, all ownership and protection features  are
+likewise  absent.   Disks containing level 0 structures are assumed to
+be good.  Further, the software reading them may assume that the  file
+structure is correct, once having validated the structure level.  This
+eliminates all of the consistency  checks  normally  present  in  full
+Files-11 implementations, at a considerable savings in code size.
+
+Notwithstanding the simplifications, level 0 Files-11 disks are  still
+completely valid Files-11 structures, and can be read by full Files-11
+implementations with all consistency checks enforced.
+
+Subset level 0 is identified by a structure level value  in  the  home
+block  and file header of 514 (representing a structure level of 2 and
+a structure version of 2).  The following  structural  simplifications
+are made in the level 0 subset:
+
+     1.  No  multi-header  files  (except  to  represent  multi-volume
+         files)
+
+     2.  Contiguous files only (except the index file)
+
+     3.  Only one version per file
+
+     4.  The index file consists of two contiguous parts.
+
+     5.  Only two reserved files are actually used:   The  index  file
+         and the MFD.  All other reserved headers are optional.
+
+     6.  The header and ident areas of the file header  are  of  fixed
+         length, so that the ident and map area may be dead-reckoned.
+
+     7.  The map area  contains  exactly  one  format  3  map  pointer
+         (except for the index file).
+
+     8.  There is one file record format  for  text  files  meant  for
+         gerenal  interchange:   general  stream  format.   Other file
+         formats may be present at the option of the user.
+
+     9.  Once the format has been identified as subset  level  0  from
+         the structure level in the home block, the implementation may
+         assume that the file structure is valid and is not obliged to
+         do  consistency checking.  Checking the checksums of the home
+         block is optional.
+
+Use of level 0 (by its recipient, not the system  creating  the  disk)
+implies the following functional restrictions:
+Files-11 On-Disk Structure                                     Page 66
+
+
+     1.  Access to the disk is read-only.
+
+     2.  No protection or accounting features
+
+     3.  Only one version per file
+
+     4.  Only two reserved files are actually used:   The  index  file
+         and the MFD.  All other reserved headers are optional.
+
+     5.  Only general stream files are required  by  level  0.   Other
+         file record formats are optional.
+
+The following pictures give the detailed breakdown of the contents and
+use  of  fields  in  the  various Files-11 structures.  The fields are
+identified by symbolic field name only; for further explanation, refer
+to  the  main  body of this specification.  The contents of the fields
+are identified as follows:
+
+Zero             The field is not used in the level 0 subset and  must
+                 contain zero.
+
+Ignored          The field is not used in the level 0 subset.  It  may
+                 contain  zero  or  its normal value as defined by the
+                 main body of this specification.
+
+(numeric value)  The field always contains the specified value.
+
+Valid            The field contains its normal value as defined by the
+                 main  body  of this specification, but is not used or
+                 verified by the level 0 implementation.
+
+Valid, used      The field contains its normal value as defined by the
+                 main  body  of  this  specification,  and  is used or
+                 verified by the level 0 implementation.
+
+
+
+7.1  File ID Layout, Level 0 Subset
+
+                |---------------------------------------|
+                |              Valid, used              |  FID$W_NUM
+                |---------------------------------------|
+                |                 Valid                 |  FID$W_SEQ
+                |-------------------|-------------------|
+FID$B_NMX       |    Valid, used    |    Valid, used    |  FID$B_RVN
+                |-------------------|-------------------|
+
+
+
+7.2  Index File Structure
+
+The index file of a level 0 disk has the same format and structure  as
+a  normal  index  file,  as  described in section 5.1.8.  However, its
+placement is constrained.  The index file  consists  of  two  extents.
+The  first extent contains clusters 1 through 4 (i.e., the boot block,
+Files-11 On-Disk Structure                                     Page 67
+
+
+home blocks, and backup index file header), and is located starting at
+LBN  0.   The  second extent of the index file contains the index file
+bitmap and all file headers, and may be located anywhere on the disk.
+
+
+
+7.3  File Header Layout, Level 0 Subset
+
+Header Area
+
+                |-------------------|-------------------|
+FH2$B_MPOFFSET  |        104        |        44         |   FH2$B_IDOFFSET
+                |-------------------|-------------------|
+FH2$B_RSOFFSET  |        255        |        255        |   FH2$B_ACOFFSET
+                |-------------------|-------------------|
+                |                 Valid                 |   FH2$W_SEG_NUM
+                |---------------------------------------|
+                |                  514                  |   FH2$W_STRUCLEV
+                |---------------------------------------|   FH2$W_FID
+                |                                       |   FH2$W_FID_NUM
+                |--                                   --|
+                |                 Valid                 |   FH2$W_FID_SEQ
+                |--                                   --|
+FH2$B_FID_NMX   |                                       |   FH2$B_FID_RVN
+                |---------------------------------------|   FH2$W_EXT_FID
+                |                                       |   FH2$W_EX_FIDNUM
+                |--                                   --|
+                |              Valid, used              |   FH2$W_EX_FIDSEQ
+                |--                                   --|
+FH2$B_EX_FIDNMX |                                       |   FH2$B_EX_FIDRVN
+                |---------------------------------------|
+                |                                       |   FH2$W_RECATTR
+                |                                       |
+                |                                       |
+                |              Valid, used              |    
+                |                                       |
+                |                                       |
+                |                                       |
+                |---------------------------------------|
+                |                                       |   FH2$L_FILECHAR
+                |--               Valid               --|
+                |                                       |
+                |---------------------------------------|
+                |                Ignored                |   FH2$W_RECPROT
+                |-------------------|-------------------|
+FH2$B_ACC_MODE  |      Ignored      |         4         |   FH2$B_MAP_INUSE
+                |-------------------|-------------------|
+                |                                       |   FH2$L_FILEOWNER
+                |--              Ignored              --|
+                |                                       |
+                |---------------------------------------|
+                |                Ignored                |   FH2$W_FILEPROT
+                |---------------------------------------|   FH2$W_BACKLINK
+                |                                       |   FH2$W_BK_FIDNUM
+                |--                                   --|
+Files-11 On-Disk Structure                                     Page 68
+
+
+                |                 Valid                 |   FH2$W_BK_FIDSEQ
+                |--                                   --|
+FH2$B_BK_FIDNMX |                                       |   FH2$B_BK_FIDRVN
+                |---------------------------------------|
+                |                Ignored                |   FH2$W_JOURNAL
+                |---------------------------------------|
+                |              (not used)               |
+                |---------------------------------------|
+                |                                       |   FH2$L_HIGHWATER
+                |--               Valid               --|
+                |                                       |
+                |---------------------------------------|
+                |                                       |
+                |--                                   --|
+                |                                       |
+                |--            (not used)             --|
+                |                                       |
+                |--                                   --|
+                |                                       |
+                |---------------------------------------|
+
+
+Ident Area
+
+                |---------------------------------------|
+                |                                       |   FI2$T_FILENAME
+                |--                                   --|
+                |                                       |
+                |--                                   --|
+                |                 Valid                 |    
+                |--                                   --|
+                |                                       |
+                |--                                   --|
+                |                                       |
+                |---------------------------------------|
+                |                 Valid                 |   FI2$W_REVISION
+                |---------------------------------------|
+                |                                       |   FI2$Q_CREDATE
+                |--                                   --|
+                |                                       |
+                |--               Valid               --|
+                |                                       |
+                |--                                   --|
+                |                                       |
+                |---------------------------------------|
+                |                                       |   FI2$Q_REVDATE
+                |--                                   --|
+                |                                       |
+                |--               Valid               --|
+                |                                       |
+                |--                                   --|
+                |                                       |
+                |---------------------------------------|
+                |                                       |   FI2$Q_EXPDATE
+                |--                                   --|
+Files-11 On-Disk Structure                                     Page 69
+
+
+                |                                       |
+                |--               Valid               --|
+                |                                       |
+                |--                                   --|
+                |                                       |
+                |---------------------------------------|   
+                |                                       |   FI2$Q_BAKDATE
+                |--                                   --|
+                |                                       |
+                |--              Ignored              --|
+                |                                       |
+                |--                                   --|
+                |                                       |
+                |---------------------------------------|
+                |                                       |   FI2$T_FILENAMEXT
+                |                                       |
+                |                                       |
+                |                 Valid                 |
+                |                                       |
+                |                                       |
+                |                                       |
+                |---------------------------------------|   FI2$C_LENGTH
+
+
+
+Map, ACL, and Reserved Areas
+
+                |----|----------------------------------|
+FM2$V_FORMAT    | 11 |          Valid, used             |  FM2$V_COUNT2
+                |----|----------------------------------|
+                |              Valid, used              |  FM2$W_LOWCOUNT
+                |---------------------------------------|
+                |                                       |  FM2$L_LBN3
+                |--            Valid, used            --|
+                |                                       |
+                |---------------------------------------|
+                |                                       |
+                |                                       |
+                |                 Zero                  |
+                |                                       |
+                |                                       |
+                |---------------------------------------|
+                |                 Valid                 |   FH2$W_CHECKSUM
+                |---------------------------------------|
+
+
+Note that the access control list and reserved areas are null.
+
+
+
+7.4  Directory Record Layout, Level 0 Subset
+
+                |---------------------------------------|
+                |              Valid, used              |   DIR$W_SIZE
+                |---------------------------------------|
+Files-11 On-Disk Structure                                     Page 70
+
+
+                |                Ignored                |
+                |-------------------|-------------------|
+DIR$B_NAMECOUNT |    Valid, used    |         0         |   DIR$B_FLAGS
+                |-------------------|-------------------|
+                |                                       |   DIR$T_NAME
+                |                                       |
+                |                                       |
+                |              Valid, used              |
+                |                                       |
+                |                                       |
+                |                                       |
+                |---------------------------------------|
+                |              Valid, used              |   DIR$W_VERSION
+                |---------------------------------------|   DIR$W_FID
+                |                                       |   DIR$W_FID_NUM
+                |--                                   --|
+                |              Valid, used              |   DIR$W_FID_SEQ
+                |--                                   --|
+DIR$B_FID_NMX   |                                       |   DIR$B_FID_RVN
+                |---------------------------------------|
+
+
+
+7.5  Home Block Layout, Level 0 Subset
+
+                |---------------------------------------|
+                |                                       |   HM2$L_HOMELBN
+                |--               Valid               --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$L_ALHOMELBN
+                |--                 2                 --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$L_ALTIDXLBN
+                |--                 3                 --|
+                |                                       |    
+                |---------------------------------------|
+                |                  513                  |   HM2$W_STRUCLEV
+                |---------------------------------------|
+                |                 Valid                 |   HM2$W_CLUSTER
+                |---------------------------------------|
+                |                 Valid                 |   HM2$W_HOMEVBN
+                |---------------------------------------|
+                |                 Valid                 |   HM2$W_ALHOMEVBN
+                |---------------------------------------|
+                |                 Valid                 |   HM2$W_ALTIDXVBN
+                |---------------------------------------|
+                |                 Valid                 |   HM2$W_IBMAPVBN
+                |---------------------------------------|
+                |                                       |   HM2$L_IBMAPLBN
+                |--            Valid, used            --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$L_MAXFILES
+Files-11 On-Disk Structure                                     Page 71
+
+
+                |--               Valid               --|
+                |                                       |   
+                |---------------------------------------|
+                |              Valid, used              |   HM2$W_IBMAPSIZE
+                |---------------------------------------|
+                |                 Valid                 |   HM2$W_RESFILES
+                |---------------------------------------|
+                |                Ignored                |   HM2$W_DEVTYPE
+                |---------------------------------------|
+                |              Valid, used              |   HM2$W_RVN
+                |---------------------------------------|
+                |              Valid, used              |   HM2$W_SETCOUNT
+                |---------------------------------------|
+                |                Ignored                |   HM2$W_VOLCHAR
+                |---------------------------------------|
+                |                                       |   HM2$L_VOLOWNER
+                |--              Ignored              --|
+                |                                       |   
+                |---------------------------------------|
+                |                                       |
+                |--            (not used)             --|
+                |                                       |   
+                |---------------------------------------|
+                |                Ignored                |   HM2$W_PROTECT
+                |---------------------------------------|
+                |                Ignored                |   HM2$W_FILEPROT
+                |---------------------------------------|
+                |              (not used)               |
+                |---------------------------------------|
+                |                 Valid                 |   HM2$W_CHECKSUM1
+                |---------------------------------------|
+                |                                       |   HM2$Q_CREDATE
+                |--                                   --|
+                |                                       |   
+                |--               Valid               --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |-------------------|-------------------|
+HM2$B_LRU_LIM   |      Ignored      |      Ignored      |   HM2$B_WINDOW
+                |-------------------|-------------------|
+                |                Ignored                |   HM2$W_EXTEND
+                |---------------------------------------|
+                |                                       |   HM2$Q_RETAINMIN
+                |--                                   --|
+                |                                       |   
+                |--              Ignored              --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$Q_RETAINMAX
+                |--                                   --|
+                |                                       |   
+                |--              Ignored              --|
+Files-11 On-Disk Structure                                     Page 72
+
+
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$Q_REVDATE
+                |--                                   --|
+                |                                       |   
+                |--              Ignored              --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$R_MIN_CLASS
+                |--                                   --|
+                |                                       |   
+                |--                                   --|
+                |                Ignored                |   
+                |--                                   --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$R_MAX_CLASS
+                |--                                   --|
+                |                                       |   
+                |--                                   --|
+                |                Ignored                |   
+                |--                                   --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |    
+                |                                       |    
+                |                                       |    
+                |                                       |    
+                |              (not used)               |
+                |                                       |    
+                |                                       |    
+                |                                       |    
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$L_SERIALNUM
+                |--              Ignored              --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$T_STRUCNAME
+                |--                                   --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |--               Valid               --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+Files-11 On-Disk Structure                                     Page 73
+
+
+                |--                                   --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$T_VOLNAME
+                |--                                   --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |--               Valid               --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$T_OWNERNAME
+                |--                                   --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |--               Valid               --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   HM2$T_FORMAT
+                |--                                   --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |--            FILES11B_L0            --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |--                                   --|
+                |                                       |    
+                |---------------------------------------|
+                |              (not used)               |
+                |---------------------------------------|
+                |                 Valid                 |   HM2$W_CHECKSUM2
+                |---------------------------------------|
+
+
+
+7.6  File Attributes Layout, Level 0 Subset
+
+                |-------------------|-------------------|
+FAT$B_RATTRIB   |       Valid       |    Valid, used    |   FAT$B_RTYPE
+                |-------------------|-------------------|
+                |                 Valid                 |   FAT$W_RSIZE
+                |---------------------------------------|
+                |                                       |   FAT$L_HIBLK
+                |--               Valid               --|
+Files-11 On-Disk Structure                                     Page 74
+
+
+                |                                       |    
+                |---------------------------------------|
+                |                                       |   FAT$L_EFBLK
+                |--            Valid, used            --|
+                |                                       |    
+                |---------------------------------------|
+                |--            Valid, used            --|   FAT$W_FFBYTE
+                |-------------------|-------------------|
+FAT$B_VFCSIZE   |       Valid       |       Valid       |   FAT$B_BKTSIZE
+                |-------------------|-------------------|
+                |                 Valid                 |   FAT$W_MAXREC
+                |---------------------------------------|
+                |                 Valid                 |   FAT$W_DEFEXT
+                |---------------------------------------|
+                |                 Valid                 |   FAT$W_GBC
+                |---------------------------------------|
+                |                                       |
+                |                                       |
+                |                                       |
+                |               (Not used)              |
+                |                                       |
+                |                                       |
+                |                                       |
+                |---------------------------------------|
+                |                Ignored                |   FAT$W_VERSIONS
+                |---------------------------------------|   FAT$C_LENGTH
+
+
+
+[End of ODS2.RNO]

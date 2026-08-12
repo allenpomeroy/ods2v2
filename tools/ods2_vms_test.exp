@@ -1,0 +1,95 @@
+#!/usr/bin/expect -f
+
+# MIT License
+#
+# Copyright (c) 2026 Allen Pomeroy
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+#
+# ods2_vms_test.exp - Drives the VMS console over telnet to run a standard
+# test sequence (mount, list, ANALYZE/DISK, dismount) and captures the
+# output to a file, replacing the manual copy-paste round trip.
+#
+# SETUP (one-time, on the vms1/SIMH side):
+#   In your SIMH startup (.ini file), or typed at the sim> prompt BEFORE
+#   "boot"/"cont", add:
+#       set console telnet=9999
+#   Pick any unused port; 9999 is just an example. This does NOT disable
+#   the normal console window - SIMH mirrors output to both.
+#
+# USAGE:
+#   ./ods2_vms_test.exp <telnet_host> <telnet_port> <output_file>
+#
+#   Example:
+#   ./ods2_vms_test.exp localhost 9999 /tmp/vms_test_run.txt
+#
+# NOTE: this assumes VMS is already booted and sitting at a "$" DCL
+# prompt when the script connects - it does not itself boot the system,
+# since boot timing varies and is better left under your control.
+
+set host  [lindex $argv 0]
+set port  [lindex $argv 1]
+set outfile [lindex $argv 2]
+
+if {$host == "" || $port == "" || $outfile == ""} {
+    puts "Usage: ods2_vms_test.exp <host> <port> <output_file>"
+    exit 1
+}
+
+set timeout 30
+log_file -a $outfile
+
+spawn telnet $host $port
+expect {
+    timeout { puts "TIMEOUT connecting to $host:$port"; exit 1 }
+    "Connected"
+}
+
+# Wake up the console and wait for the DCL prompt. Send a blank line
+# first in case output is mid-line from a previous session.
+send "\r"
+expect {
+    timeout { puts "TIMEOUT waiting for initial DCL prompt"; exit 1 }
+    -re {\$\s*$}
+}
+
+proc dcl {cmd} {
+    global timeout
+    send "$cmd\r"
+    expect {
+        timeout { puts "TIMEOUT after command: $cmd"; exit 1 }
+        -re {\$\s*$}
+    }
+}
+
+# --- Standard test sequence ---
+dcl "MOUNT DUA2: TRANSFER /SYSTEM"
+dcl "DIRECTORY DUA2:\[*...\]*.*"
+dcl "ANALYZE/DISK DUA2: /OUTPUT=ODS2_CHECK.TXT"
+dcl "TYPE ODS2_CHECK.TXT"
+dcl "DISMOUNT DUA2:"
+
+# Detach from telnet without killing the VMS session itself.
+send "\035"
+expect "telnet>"
+send "quit\r"
+expect eof
+
+puts "\n--- Done. Full transcript in $outfile ---"

@@ -1,25 +1,30 @@
 # ods2v2
 
-A from-scratch, clean-room implementation of Files-11 (ODS-2), the
-on-disk filesystem used by VAX/VMS and OpenVMS. Reads and writes real
-ODS-2 disk images - the same format real VMS's own `MOUNT`,
-`INITIALIZE`, `COPY`, and `DIRECTORY` commands use - with no VMS
-installation, SIMH emulator, or license required to use it.
+This is a from-scratch implementation of DEC Files-11 (ODS-2) utility
+to copy local files from a Linux (likely a Mac too) system to an
+ODS-2 disk volume that is usable by SIMH simulator running a
+VAX/VMS (vax8600) OpenVMS 7.1 system.
+
+This utility can run a minimal set of VMS DCL type commands on the
+disk file, with the intent of transferring files into or out of the
+VMS system.  Reads and writes real ODS-2 disk images - the same format
+real VMS's own `MOUNT`, `INITIALIZE`, `COPY`, and `DIRECTORY` commands
+use.  No VMS installation, SIMH emulator, or license required to use it.
 
 Built directly from the Files-11 On-Disk Structure Specification, not
 from copying an existing implementation, and validated repeatedly
 against real OpenVMS 7.1 (via SIMH) throughout development with
-real `MOUNT`/`DIR`/`TYPE`/`COPY` and `ANALYZE/DISK` commands on a
+real  MOUNT / DIR / TYPE / COPY and ANALYZE/DISK commands on a
 vax8600 running OpenVMS 7.1 in simh. Every significant bug this
-project found (a word-swapped 32-bit field, an inverted bitmap convention,
-directory records needing to be storage-sorted) was found with 
-analysis on an OpenVMS system.
+project found (a word-swapped 32-bit field, an inverted bitmap
+convention, directory records needing to be storage-sorted) was found
+with analysis on an OpenVMS system.
 
 ## Quick start
 
 ```bash
 tar xzf ods2v2.tgz && cd ods2v2  # expand and cd into ods2v2 cwd
-make clean && make               # only builds ods2
+make clean && make ods2          # only builds ods2
 make starter-volume              # creates an empty ODS2 RA92 volume
                                  # by decompressing a real VMS
                                  # INITIALIZEd disk file: transfer.dsk
@@ -37,9 +42,10 @@ make starter-volume              # creates an empty ODS2 RA92 volume
 ./ods2 transfer.dsk DIR          # starts ods2v2 and executes a DIR command
 ```
 
-No external dependencies beyond a C compiler and `make` - not even for
-the interactive shell's command history (see [Dependencies](#dependencies)
-below).
+No external dependencies beyond a C compiler and standard C dev tools.
+Development was on Rocky Linux 10.2 (same system as the simh vax8600 is
+running on). There is external code included for the interactive shell
+command history (see Dependencies below).
 
 ## Using `ods2`
 
@@ -68,13 +74,17 @@ implements basic command recall to ease repetitive command sequences.
 | `HELP` | |
 | `EXIT` / `QUIT` | |
 
+You can probably deduce I was trying to get some freeware networking
+running (such as CMU066IP) and developed this tool to help with the
+initial transfer of savesets onto the OpenVMS system.
+
 Paths follow real VMS conventions: `[.SUBDIR]` and bare filenames with
 no brackets are relative to the current default directory (see `SET
 DEFAULT`); `[-]` means "up one level" (`[-.-]` for more); other
 bracketed paths are absolute from root. Names are automatically
 uppercased on creation, matching real VMS storage.
 
-### A working example
+### A simple example
 
 ```
 $ ./ods2 transfer.dsk
@@ -111,13 +121,15 @@ Raw on-disk structure inspection:
 `read_file_header`
 `read_home_block`
 
-Still fully functional, but not needed for normal use - `ods2` already covers
-everything they do.
+Fully functional, but not needed for normal use - `ods2` already covers
+everything these commands do.
 
 Build them with:
 
 ```bash
 make dev-tools
+or
+make all
 ```
 
 ## Project structure
@@ -140,8 +152,8 @@ with `-fsanitize=address,undefined` on by default for development
 builds (`make release` builds without them once things are stable).
 Most tests run entirely offline against a synthetic disk
 image assembled from real, VMS-written byte fragments captured during
-development with VMS generated volumes so there was genuine on-disk bytes in
-every structural test.
+development with VMS generated volumes so there was genuine on-disk bytes
+in every structural test.
 
 ## Known limitations
 
@@ -149,7 +161,7 @@ every structural test.
   extents in a single header (extension headers) aren't yet
   implemented - very large or badly fragmented files/directories
   would need this eventually.
-- No `INITIALIZE` (formatting a *new* volume from scratch) - see
+- No INITIALIZE command (formatting a *new* volume from scratch) - see
   `samples/README.md` for why that's a deliberate choice (it's complicated)
   and how to get a real, ready-to-use volume instead.
 - Files are capped around 9.5MB (a consequence of the extension-header

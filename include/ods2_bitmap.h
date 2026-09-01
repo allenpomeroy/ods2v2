@@ -49,6 +49,19 @@
 bool ods2_bitmap_find_free(const uint8_t *bitmap, size_t total_bits,
                             size_t count, size_t *start_bit, size_t *found_count);
 
+/* Best-effort counterpart to ods2_bitmap_find_free(): finds the
+ * LARGEST contiguous run of free (set) bits, capped at `max_count`,
+ * succeeding as long as AT LEAST ONE free bit exists anywhere - unlike
+ * ods2_bitmap_find_free(), which requires a run of at least `count`
+ * (here, `max_count`) or fails outright. Used as a fallback by
+ * ods2_allocate_blocks() when no single run large enough for a whole
+ * request exists, so a large allocation can still proceed via more
+ * (but still as few as possible) smaller extents on a fragmented
+ * volume, rather than failing the whole request outright. Returns
+ * false only if there is truly no free bit anywhere in the bitmap. */
+bool ods2_bitmap_find_largest_free(const uint8_t *bitmap, size_t total_bits,
+                                    size_t max_count, size_t *start_bit, size_t *found_count);
+
 /* Marks `count` bits starting at `start_bit` as either free (set,
    `used=false`) or allocated (clear, `used=true`). Returns false if
    the range would run past total_bits (caller error - never silently

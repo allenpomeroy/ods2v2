@@ -93,14 +93,26 @@ int main(int argc, char **argv)
         {
             uint32_t hiblk_fixed = ods2_word_swap32(core->recattr.hiblk);
             uint32_t efblk_fixed = ods2_word_swap32(core->recattr.efblk);
+            bool is_extension_seg = (core->seg_num != 0);
 
+            /* HIBLK/EFBLK describe the FILE AS A WHOLE and are only
+               meaningful compared against a chain walk that starts
+               from the PRIMARY header (seg_num==0). Starting the walk
+               from an extension header instead (which is exactly what
+               happens here, since this loop iterates every raw file
+               number) only ever sees that header's own remaining
+               extents, not the whole file's - a "mismatch" reported
+               for a seg_num!=0 header is expected and not a real
+               problem; skip it from the mismatch count and say so. */
             printf("%-4u %-14u %-10u %-14llu %-10s %s\n",
                    n, hiblk_fixed, efblk_fixed,
                    (unsigned long long) extent_sum,
-                   (extent_sum == hiblk_fixed) ? "YES" : "NO",
-                   vr.ok ? "checksum OK" : vr.problem);
+                   is_extension_seg ? "n/a" : ((extent_sum == hiblk_fixed) ? "YES" : "NO"),
+                   is_extension_seg
+                       ? "extension header (seg_num > 0) - HIBLK belongs to its primary, not this segment"
+                       : (vr.ok ? "checksum OK" : vr.problem));
 
-            if (extent_sum != hiblk_fixed) mismatches++;
+            if (!is_extension_seg && extent_sum != hiblk_fixed) mismatches++;
         }
     }
 
@@ -110,3 +122,4 @@ int main(int argc, char **argv)
     ods2_dismount(&vol);
     return 0;
 }
+

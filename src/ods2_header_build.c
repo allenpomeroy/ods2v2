@@ -40,34 +40,49 @@
    BAD_DIRHEADER finding on a real, created-with-this-code directory
    pointed at exactly this difference from every real header examined.
    Populating it properly, matching real VMS's fixed-size convention
-   rather than sizing it to the actual name length. */
-#define ODS2_HEADER_IDOFFSET_BYTES 80
-#define ODS2_HEADER_IDENT_BYTES 120
-#define ODS2_HEADER_MPOFFSET_BYTES (ODS2_HEADER_IDOFFSET_BYTES + ODS2_HEADER_IDENT_BYTES)
+   rather than sizing it to the actual name length.
+
+   Extension headers (spec->is_extension) deliberately DON'T follow
+   this layout: spec 3.5.3 explicitly permits (and this code always
+   takes advantage of) truncating the Ident Area to zero length in an
+   extension header, i.e. idoffset==mpoffset, starting the Map Area
+   right after the fixed Header Area at byte 80 instead of byte 200.
+   That recovers the full 120 bytes the Ident Area would otherwise
+   have used, for another ~30 Format 1 retrieval pointers - see
+   ODS2_EXT_HEADER_MPOFFSET_BYTES / ODS2_EXT_HEADER_MAX_EXTENTS in
+   ods2_header_build.h. Primary headers are unaffected and keep the
+   full-size Ident Area exactly as before. */
 
 bool ods2_build_file_header(uint8_t *header_out, const ods2_header_spec_t *spec)
 {
     ods2_head_core_t *core;
-    size_t map_offset_bytes = ODS2_HEADER_MPOFFSET_BYTES;
-    size_t map_bytes = (size_t) spec->extent_count * 4; /* Format 1: 2 words = 4 bytes each */
+    /* idoffset is always byte 80 (the fixed Header Area's real size) -
+       only mpoffset moves, so an extension header's Ident Area has
+       zero length (idoffset==mpoffset) rather than not existing at a
+       different offset. */
+    size_t idoffset_bytes = ODS2_HEADER_IDOFFSET_BYTES;
+    size_t map_offset_bytes = spec->is_extension ? ODS2_EXT_HEADER_MPOFFSET_BYTES
+                                                  : ODS2_HEADER_MPOFFSET_BYTES;
+    size_t map_bytes = 0; /* accumulated below - each extent's actual
+                              encoded size varies (4/6/8 bytes,
+                              whichever format it needs), so this can't
+                              be precomputed as extent_count * 4 the
+                              way it could when only Format 1 existed */
     int i;
     uint16_t checksum;
-
-    if (map_offset_bytes + map_bytes > 510) {
-        return false; /* wouldn't leave room for the checksum word */
-    }
 
     memset(header_out, 0, 512);
     core = (ods2_head_core_t *) header_out;
 
-    core->idoffset = ODS2_HEADER_IDOFFSET_BYTES / 2;
+    core->idoffset = (uint8_t) (idoffset_bytes / 2);
     core->mpoffset = (uint8_t) (map_offset_bytes / 2);
     core->acoffset = 0xff; /* no ACL area */
     core->rsoffset = 0xff; /* no reserved area */
-    core->seg_num = 0;
+    core->seg_num = spec->seg_num;
     core->struclev = 0x0201; /* level 2, version 1 - confirmed convention */
     core->fid = spec->fid;
-    /* ext_fid stays zero (memset above) - no extension header. */
+    core->ext_fid = spec->ext_fid; /* zero (no further extension header)
+                                       unless the caller set one */
     core->recattr.rtype = spec->rtype;
     core->recattr.rattrib = spec->rattrib;
     core->recattr.rsize = spec->rsize;
@@ -76,7 +91,9 @@ bool ods2_build_file_header(uint8_t *header_out, const ods2_header_spec_t *spec)
     core->recattr.ffbyte = spec->ffbyte;
     core->recattr.maxrec = spec->maxrec;
     core->filechar = spec->filechar;
-    core->map_inuse = (uint8_t) (map_bytes / 2);
+    /* core->map_inuse is set below, once the encode loop has computed
+       the actual accumulated map_bytes (each extent's real byte size
+       varies by format, so this can't be known up front). */
     /* FH2$L_FILEOWNER, FH2$W_FILEPROT, FH2$W_RECPROT: confirmed via
        ods2_dump_header against real, VMS-written headers that real
        files always carry non-zero values here - fileowner_uic=(4,1),
@@ -100,8 +117,10 @@ bool ods2_build_file_header(uint8_t *header_out, const ods2_header_spec_t *spec)
          FI2$Q_BAKDATE      8 bytes  - binary VMS timestamp
          FI2$T_FILENAMEXT  66 bytes  - name continuation
        Total 120 bytes - found while chasing ANALYZE/DISK's BADDIRENT/
-       BAD_DIRHEADER findings */
-    {
+       BAD_DIRHEADER findings. Skipped entirely for extension headers -
+       there's no Ident Area to write into (idoffset==mpoffset above),
+       and spec->ident_name is documented as ignored in that case. */
+    if (!spec->is_extension) {
         uint8_t *ident = header_out + ODS2_HEADER_IDOFFSET_BYTES;
         size_t name_len;
         uint64_t vms_now;
@@ -150,12 +169,20 @@ bool ods2_build_file_header(uint8_t *header_out, const ods2_header_spec_t *spec)
     }
 
     for (i = 0; i < spec->extent_count; i++) {
-        uint8_t *dest = header_out + map_offset_bytes + (size_t) i * 4;
-        if (!ods2_encode_retrieval_pointer_format1(dest, spec->extents[i].lbn,
-                                                     spec->extents[i].block_count)) {
-            return false;
+        uint8_t encoded[8];
+        size_t bytes_written;
+
+        if (!ods2_encode_retrieval_pointer(encoded, spec->extents[i].lbn,
+                                            spec->extents[i].block_count, &bytes_written)) {
+            return false; /* extent's LBN/block_count don't fit even Format 3 */
         }
+        if (map_offset_bytes + map_bytes + bytes_written > 510) {
+            return false; /* wouldn't leave room for the checksum word */
+        }
+        memcpy(header_out + map_offset_bytes + map_bytes, encoded, bytes_written);
+        map_bytes += bytes_written;
     }
+    core->map_inuse = (uint8_t) (map_bytes / 2);
 
     /* FH2$W_CHECKSUM occupies the last word of the block, covering
        the 255 words before it - same algorithm/coverage as every

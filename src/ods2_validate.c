@@ -117,9 +117,27 @@ ods2_validate_result_t ods2_validate_head(const uint8_t *raw_header)
             for (i = 0; i < (size_t) n; i++) {
                 total_blocks += extents[i].block_count;
             }
-            if (total_blocks != ods2_word_swap32(core->recattr.hiblk)) {
-                return fail("FAT$L_HIBLK does not match the sum of this header's "
-                            "own retrieval pointer extents");
+            /* FAT$L_HIBLK describes the file's TOTAL allocation across
+               its WHOLE header chain (spec 3.3), not just this one
+               header's own retrieval pointers - so this specific
+               check is only meaningful for a header that's provably
+               NOT part of a multi-header chain: no further extension
+               header (ext_fid==0) and not itself an extension header
+               (seg_num==0). A genuinely single-header file/directory
+               is still checked exactly as before; a header that's
+               part of a chain is skipped here rather than produce a
+               spurious mismatch (this function only ever sees one
+               raw header buffer, with no way to read the rest of the
+               chain itself - a caller with a mounted volume can get
+               the real, whole-file answer via
+               ods2_decode_all_extents() instead, e.g. as
+               ods2_check_headers does). */
+            {
+                bool part_of_chain = (core->ext_fid.fid_num != 0) || (core->seg_num != 0);
+                if (!part_of_chain && total_blocks != ods2_word_swap32(core->recattr.hiblk)) {
+                    return fail("FAT$L_HIBLK does not match the sum of this header's "
+                                "own retrieval pointer extents");
+                }
             }
         }
     }

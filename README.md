@@ -168,15 +168,178 @@ in every structural test.
 
 ## Known limitations
 
-- Files/directories needing more than roughly 77 retrieval-pointer
-  extents in a single header (extension headers) aren't yet
-  implemented - very large or badly fragmented files/directories
-  would need this eventually.
 - No INITIALIZE command (formatting a *new* volume from scratch) - see
   `samples/README.md` for why that's a deliberate choice (it's complicated)
   and how to get a real, ready-to-use volume instead.
-- Files are capped around 9.5MB (a consequence of the extension-header
-  limitation above).
+
+## Chained extension headers & Format 2/3 retrieval pointers
+
+Originally, any file needing more retrieval-pointer extents than a
+single header's Map Area could hold (roughly 77 Format 1 extents, or
+~9.5MB on this project's test volume) just failed outright:
+
+```
+%ODS2-E-COPYERR, content far too large for a single header's map area
+(needs a second, extension header - not yet implemented)
+```
+
+Since this utility's purpose is to enable transfer of large file
+volumes into an OpenVMS system to help build functionality that
+is needed, this version supports Format 2 and 3 extents now.
+It is now possible to copy CD image files (600-700MB) into a
+ODS-2 filesystem.
+
+Two things had to be added to extend the functionality:
+
+### 1. Chained extension headers (spec 3.3)
+
+A file whose retrieval pointers don't fit in one header can span a
+*chain* of headers, each with its own file number, linked via
+`FH2$W_EXT_FID`. I already had the read side
+(`ods2_decode_all_extents()`) already wired to walk that chain
+correctly, since it has to handle any real VMS-written file the
+same way. Only the write side (`ods2_create_file()`, and the
+equivalent directory-growth path in `ods2_insert_into_directory()`)
+were still on my original Format 1 code.
+
+Two spec facts needed to update the design:
+
+- **Extension headers truncate their own Ident Area to zero length**
+  (spec 3.5.3: "customarily truncated in extension headers"). That
+  frees the 120 bytes the Ident Area would otherwise take, giving an
+  extension header ~107 extents of Map Area instead of a primary
+  header's ~77.
+- **An extension header's `FH2$W_BACKLINK` is the file's *primary*
+  header's FID, not the parent directory's** (spec 3.5.2.16). Every
+  other header field (backlink included) works exactly like a normal
+  file's.
+
+`ods2_create_file()` now allocates as many header segments as needed
+(pre-allocating every segment's file number up front, since each
+segment's `ext_fid` has to name the *next* one), up to
+`ODS2_MAX_HEADER_SEGMENTS` (64, shared with the read side so nothing
+either side produces exceeds what the other can follow).
+`ods2_delete()` was updated to match: it now walks the whole chain to
+free every segment's file number, not just the primary's - otherwise a
+multi-header file's extension headers would leak (permanently marked
+"in use" in the index bitmap) on delete.
+
+### 2. Format 2/3 retrieval pointer encoding (spec 3.5.4.3/3.5.4.4)
+
+Chaining headers alone wasn't enough. Format 1 retrieval pointers cap
+every extent at 256 blocks (an 8-bit count field) regardless of how
+contiguous the underlying free space actually is - a structural limit
+of the *encoding*, not a reflection of real fragmentation. A 700MB
+image needs 5,000+ Format 1 extents even on an empty volume with one
+giant free run, which chews through header-chain file numbers fast:
+INDEXF.SYS's own header-storage region is a fixed size set at
+`INITIALIZE` time, and a single large file eating 50+ file numbers for
+its own extension headers can exhaust it on a modestly-sized volume.
+
+The ODS2 disk spec already defines Format 2 (14-bit count, up to 16,384
+blocks/extent) and Format 3 (30-bit count, up to ~2^30 blocks/extent);
+the decoder already handled all three formats, but only Format 1 had
+an encoder. `ods2_encode_retrieval_pointer()` now picks the smallest
+of the three that actually fits a given extent, so ordinary small
+extents stay exactly as compact as before (unchanged 4-byte Format 1)
+while a large contiguous allocation compresses into one 6- or 8-byte
+pointer instead of dozens of 4-byte ones.
+
+That only pays off if the allocator actually *tries* for large
+contiguous runs, so `ods2_create_file()`'s allocation loop no longer
+artificially chunks every request down to ≤256 blocks - it requests
+the full remaining amount each time. On a genuinely fragmented volume
+that could fail outright with no fallback, so `ods2_allocate_blocks()`
+gained a best-effort path (`ods2_bitmap_find_largest_free()`): if no
+single run is big enough for the whole request, it takes the largest
+run actually available instead of failing, and the loop continues with
+more (but still as few as possible) extents for the remainder.
+
+Net effect: a 100MB file that used to need ~8 header segments
+(and failed outright on a volume without that much header-storage
+headroom) now needs exactly 1 header and 1 extent - Format 3 encodes
+the whole contiguous allocation as a single retrieval pointer.
+
+### Testing the Format 2/3 
+
+Make the dev-tools
+
+```
+$ make dev-tools
+```
+
+Make large files to test (or use real large files)
+
+```
+dd if=/dev/urandom of=../data/t1.bin bs=1M count=11   # ~11MB
+dd if=/dev/urandom of=../data/t2.bin bs=1M count=30   # ~30MB
+dd if=/dev/urandom of=../data/t3.bin bs=1M count=100  # ~100MB
+```
+
+Copy large files into ODS2 volume
+
+```
+$ ./ods2 transfer.dsk
+ods2v2 - type HELP for commands, EXIT to leave
+ODS2> 
+ODS2> dir
+
+Directory [000000]
+
+000000.DIR          ;1
+BACKUP.SYS          ;1
+BADBLK.SYS          ;1
+BADLOG.SYS          ;1
+BITMAP.SYS          ;1
+CONTIN.SYS          ;1
+CORIMG.SYS          ;1
+INDEXF.SYS          ;1
+SECURITY.SYS        ;1
+VOLSET.SYS          ;1
+
+Total of 10 files.
+ODS2> 
+ODS2> create/dir [test1]
+%ODS2-I-CREATED, created [TEST1]
+ODS2> set def [test1]
+%ODS2-I-DEFSET, default set to [TEST1]
+ODS2> copy ../data/t3.bin t3.bin
+%ODS2-I-COPIED, 104857600 bytes to t3.bin;1
+ODS2> exit
+```
+
+Validate they extract and are identical
+
+```
+$ ./ods2_cat transfer.dsk TEST1 T3.BIN | cmp - ../data/t3.bin && echo IDENTICAL
+IDENTICAL
+```
+
+### What this doesn't fix
+
+The header-storage region itself (INDEXF.SYS's own allocation, set at
+`INITIALIZE` time) is still a fixed size - a *sufficiently* large or
+fragmented copy job can still exhaust it, just far less easily than
+before. There's still no rollback if an allocation succeeds but a
+later step in the same operation fails partway through (a pre-existing
+property of this codebase, not something introduced here) - blocks and
+file numbers already committed to disk at that point aren't
+automatically freed again.
+
+### Testing
+
+Verified end-to-end against a real ODS-2 disk image (the RA92-geometry
+synthetic test volume, same shape as `transfer.dsk`), not just the unit
+test suite: files at several size tiers (11MB, 30MB, 100MB) were copied
+in via the actual `ods2` CLI, read back via `ods2_cat`, and confirmed
+byte-for-byte identical via checksum. Header chains were dumped and
+checked directly against spec (correct `seg_num`, `ext_fid` linkage,
+and `backlink` pointing at the primary FID on extension headers). The
+existing `ods2_check_headers`/`ods2_validate_head` diagnostics had a
+couple of false-positive checks that assumed every file fit in one
+header (comparing a single header's own `HIBLK` against just its own
+extents) - both were updated to recognize a chained header instead of
+reporting a spurious mismatch.
 
 ## Dependencies
 
@@ -225,4 +388,3 @@ That ods2 code had these references in it:
  underlying routines - for example TYPE is implemented without
  a NAM block meaning that it cannot support wildcards...
  (sorry! - could be easily fixed though!)
-

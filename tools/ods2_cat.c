@@ -34,11 +34,6 @@
 #include <stdlib.h>
 #include "ods2_volume.h"
 
-/* 64MB cap - generous for a hobbyist-scale ODS-2 volume's individual
-   files, and avoids an unbounded allocation for a corrupted/malicious
-   header claiming an absurd efblk. */
-#define MAX_FILE_SIZE (64u * 1024u * 1024u)
-
 int main(int argc, char **argv)
 {
     ods2_volume_t vol;
@@ -46,6 +41,7 @@ int main(int argc, char **argv)
     ods2_fid_t dir_fid, file_fid;
     uint8_t dir_header[512], file_header[512];
     uint8_t *buf;
+    size_t buf_size;
     size_t bytes_read = 0;
 
     if (argc != 4) {
@@ -89,14 +85,19 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    buf = malloc(MAX_FILE_SIZE);
+    /* Size the buffer exactly to this file's own stated content
+       length (from EFBLK/FFBYTE, already in the header we just read)
+       rather than a fixed cap - a multi-header file can be far larger
+       than a hobbyist-scale hard-coded ceiling would allow. */
+    buf_size = ods2_file_content_length(file_header);
+    buf = malloc(buf_size > 0 ? buf_size : 1);
     if (buf == NULL) {
         fprintf(stderr, "could not allocate read buffer\n");
         ods2_dismount(&vol);
         return 1;
     }
 
-    r = ods2_read_file(&vol, file_header, buf, MAX_FILE_SIZE, &bytes_read);
+    r = ods2_read_file(&vol, file_header, buf, buf_size, &bytes_read);
     if (!r.ok) {
         fprintf(stderr, "could not read file content: %s\n", r.problem);
         free(buf);
@@ -110,3 +111,4 @@ int main(int argc, char **argv)
     ods2_dismount(&vol);
     return 0;
 }
+

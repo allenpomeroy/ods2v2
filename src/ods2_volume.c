@@ -168,6 +168,15 @@ ods2_result_t ods2_write_block(ods2_volume_t *vol, uint32_t lbn, const uint8_t *
     return ok();
 }
 
+ods2_result_t ods2_read_block(ods2_volume_t *vol, uint32_t lbn, uint8_t *block_out)
+{
+    if (fseek(vol->fp, (long) lbn * 512, SEEK_SET) != 0 ||
+        fread(block_out, 1, 512, vol->fp) != 512) {
+        return fail("could not read block");
+    }
+    return ok();
+}
+
 void ods2_dismount(ods2_volume_t *vol)
 {
     if (vol->fp != NULL) {
@@ -309,8 +318,22 @@ ods2_result_t ods2_allocate_blocks(ods2_volume_t *vol, unsigned blocks_needed,
 
     if (!ods2_bitmap_find_free(bitmap_data, total_bits, clusters_needed,
                                 &start_cluster, &found_clusters)) {
-        free(bitmap_data);
-        return fail("no free space found on volume for this allocation");
+        /* No single run large enough for the WHOLE request - fall
+           back to the largest contiguous run actually available, so
+           a big allocation can still proceed via more (but still as
+           few as possible) extents instead of failing outright. This
+           matters a lot more now that ods2_create_file() requests
+           large chunks up front (relying on Format 2/3 retrieval
+           pointers to encode them compactly) rather than deliberately
+           small ones - a genuinely fragmented volume still needs to
+           gracefully fall back to many smaller extents. Only a
+           genuinely full volume (no free cluster anywhere) still
+           fails here. */
+        if (!ods2_bitmap_find_largest_free(bitmap_data, total_bits, clusters_needed,
+                                            &start_cluster, &found_clusters)) {
+            free(bitmap_data);
+            return fail("no free space found on volume for this allocation");
+        }
     }
     if (!ods2_bitmap_mark(bitmap_data, total_bits, start_cluster, clusters_needed, true)) {
         free(bitmap_data);
@@ -348,10 +371,10 @@ ods2_result_t ods2_allocate_blocks(ods2_volume_t *vol, unsigned blocks_needed,
    continuation header via FH2$W_EXT_FID; that header's own ext_fid
    may point further still). Without this, any file needing more than
    one header would silently appear truncated. A generous but finite
-   segment limit guards against a corrupted or circular ext_fid chain
-   looping forever. */
-#define ODS2_MAX_HEADER_SEGMENTS 64
-
+   segment limit (ODS2_MAX_HEADER_SEGMENTS, ods2_volume.h - shared with
+   the write side so nothing either side produces exceeds what the
+   other can follow) guards against a corrupted or circular ext_fid
+   chain looping forever. */
 ods2_result_t ods2_decode_all_extents(ods2_volume_t *vol, const uint8_t *header,
                                        ods2_extent_t *extents_out, size_t max_extents,
                                        int *count_out)
@@ -430,6 +453,18 @@ ods2_result_t ods2_list_directory(ods2_volume_t *vol, const uint8_t *dir_header,
     return ok();
 }
 
+size_t ods2_file_content_length(const uint8_t *header)
+{
+    const ods2_head_core_t *core = (const ods2_head_core_t *) header;
+    uint32_t efblk = ods2_word_swap32(core->recattr.efblk);
+    uint16_t ffbyte = core->recattr.ffbyte;
+
+    if (efblk == 0) return 0; /* empty file */
+    /* Same rule ods2_read_file() applies to its own last block below:
+       ffbyte==0 means the whole last block is valid data. */
+    return (size_t) (efblk - 1) * 512 + ((ffbyte == 0) ? 512 : ffbyte);
+}
+
 ods2_result_t ods2_read_file(ods2_volume_t *vol, const uint8_t *header,
                               uint8_t *buf_out, size_t buf_size, size_t *bytes_read_out)
 {
@@ -437,7 +472,11 @@ ods2_result_t ods2_read_file(ods2_volume_t *vol, const uint8_t *header,
     uint32_t efblk = ods2_word_swap32(core->recattr.efblk);
     uint16_t ffbyte = core->recattr.ffbyte;
     size_t written = 0;
-    unsigned vbn;
+    ods2_extent_t extents[ODS2_MAX_EXTENTS];
+    int extent_count;
+    int ext_i;
+    unsigned vbn_done = 0;
+    ods2_result_t r;
 
     if (efblk == 0) {
         /* Empty file. */
@@ -445,27 +484,50 @@ ods2_result_t ods2_read_file(ods2_volume_t *vol, const uint8_t *header,
         return ok();
     }
 
-    for (vbn = 1; vbn <= efblk; vbn++) {
-        uint8_t block[512];
-        size_t this_block_bytes;
-        ods2_result_t r = ods2_read_file_block(vol, header, vbn, block);
-        if (!r.ok) return r;
+    /* Decode the whole extent chain (walking any extension headers,
+       spec 3.3) exactly once, then read directly against it - rather
+       than calling ods2_read_file_block() per VBN, which re-decodes
+       (and, once extension headers are involved, re-reads every one
+       of them from disk) on every single call. For a file with
+       thousands of extents across dozens of extension headers (a
+       several-hundred-MB CD image is a realistic case now that
+       multi-header files are possible), that per-VBN approach would
+       mean millions of redundant disk reads. */
+    r = ods2_decode_all_extents(vol, header, extents, ODS2_MAX_EXTENTS, &extent_count);
+    if (!r.ok) return r;
 
-        if (vbn < efblk) {
-            this_block_bytes = 512;
-        } else {
-            /* Last block: ffbyte==0 means the whole block is valid
-               data (e.g. fixed-512-byte-record files, confirmed
-               against INDEXF.SYS's own real header), otherwise only
-               the first ffbyte bytes are. */
-            this_block_bytes = (ffbyte == 0) ? 512 : ffbyte;
-        }
+    for (ext_i = 0; ext_i < extent_count && vbn_done < efblk; ext_i++) {
+        unsigned b;
+        for (b = 0; b < extents[ext_i].block_count && vbn_done < efblk; b++) {
+            uint8_t block[512];
+            size_t this_block_bytes;
+            unsigned vbn = vbn_done + 1; /* 1-based, matches the loop this replaces */
 
-        if (written + this_block_bytes > buf_size) {
-            return fail("output buffer too small for file content");
+            r = ods2_read_block(vol, extents[ext_i].lbn + b, block);
+            if (!r.ok) return r;
+
+            if (vbn < efblk) {
+                this_block_bytes = 512;
+            } else {
+                /* Last block: ffbyte==0 means the whole block is valid
+                   data (e.g. fixed-512-byte-record files, confirmed
+                   against INDEXF.SYS's own real header), otherwise only
+                   the first ffbyte bytes are. */
+                this_block_bytes = (ffbyte == 0) ? 512 : ffbyte;
+            }
+
+            if (written + this_block_bytes > buf_size) {
+                return fail("output buffer too small for file content");
+            }
+            memcpy(buf_out + written, block, this_block_bytes);
+            written += this_block_bytes;
+            vbn_done++;
         }
-        memcpy(buf_out + written, block, this_block_bytes);
-        written += this_block_bytes;
+    }
+
+    if (vbn_done < efblk) {
+        return fail("file's extents don't cover its own stated EFBLK "
+                     "(truncated or corrupted retrieval pointers)");
     }
 
     *bytes_read_out = written;
@@ -771,11 +833,9 @@ ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,
     ods2_extent_t extents[ODS2_MAX_EXTENTS];
     int extent_count = 0;
     unsigned total_allocated = 0;
-    unsigned safe_chunk;
     ods2_header_spec_t spec;
-    uint8_t new_header[512];
+    ods2_fid_t primary_fid;
     ods2_result_t r;
-    unsigned vbn;
     char upper_name[256];
 
     if (!vol->writable) {
@@ -799,23 +859,29 @@ ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,
     blocks_needed = (unsigned) ((content_len + 511) / 512);
     if (blocks_needed == 0) blocks_needed = 1; /* a zero-length file still needs one block for EFBLK=1... */
 
-    /* Request chunks small enough that cluster-rounding can never
-       push a single extent's actual allocation past Format 1's
-       256-block limit: rounding up to the next cluster multiple adds
-       at most (cluster-1) extra blocks, so requesting no more than
-       257-cluster per chunk guarantees the allocated result stays
-       <= 256 even in the worst case. */
-    safe_chunk = 257u - vol->home.cluster;
-    if (safe_chunk > 256) safe_chunk = 256; /* cluster==1 edge case */
-
-    /* Each extent is one Format 1 pointer (4 bytes) in the fixed
-       200-byte-offset map area, which has 510-200=310 bytes of room -
-       up to 77 extents in a single header (a second, extension
-       header would be needed beyond that - not yet implemented). */
-    if ((blocks_needed + safe_chunk - 1) / safe_chunk > 77) {
-        return fail("content far too large for a single header's map area "
-                    "(needs a second, extension header - not yet implemented)");
-    }
+    /* Unlike the original Format-1-only version of this code, we no
+       longer force every allocation into small, uniformly-sized
+       chunks just to guarantee Format 1 encoding - the allocation
+       loop below requests the full remaining amount every time and
+       lets ods2_encode_retrieval_pointer() pick whichever retrieval
+       pointer format (1, 2, or 3 - spec 3.5.4) actually fits each
+       extent ods2_allocate_blocks() hands back. On a volume with
+       enough contiguous free space, that means a large file can end
+       up as a single extent instead of hundreds of small ones -
+       exactly the scenario chained extension headers alone couldn't
+       fix (see ods2_header_build.h), since Format 1 was always capped
+       at 256 blocks per extent no matter how contiguous the free
+       space actually was.
+       Because the number of extents a given file will actually need
+       now depends on how fragmented the volume's free space happens
+       to be - not a fixed, predictable chunk size - there's no cheap
+       way to reliably predict it up front the way the old safe_chunk
+       arithmetic could. The allocation loop's own bounds
+       (ODS2_MAX_EXTENTS below, and ODS2_MAX_HEADER_SEGMENTS in the
+       header-splitting step further down) are what actually enforce
+       the limit; a file that's too fragmented to fit even the maximum
+       chain length fails there, with a clear message, rather than
+       being rejected on a guess before allocation is even attempted. */
 
     r = ods2_find_free_file_number(vol, 1, 4096, &file_number, &seq_num);
     if (!r.ok) return r;
@@ -832,20 +898,14 @@ ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,
     while (blocks_remaining > 0) {
         uint32_t chunk_lbn;
         unsigned chunk_allocated;
-        unsigned chunk_request = (blocks_remaining < safe_chunk) ? blocks_remaining : safe_chunk;
 
         if (extent_count >= ODS2_MAX_EXTENTS) {
-            return fail("internal error: exceeded extent buffer capacity "
-                        "(should be unreachable given the 77-extent check above)");
+            return fail("content too fragmented to fit even across the maximum "
+                        "chain of extension headers (ODS2_MAX_HEADER_SEGMENTS)");
         }
 
-        r = ods2_allocate_blocks(vol, chunk_request, &chunk_lbn, &chunk_allocated);
+        r = ods2_allocate_blocks(vol, blocks_remaining, &chunk_lbn, &chunk_allocated);
         if (!r.ok) return r;
-        if (chunk_allocated > 256) {
-            return fail("internal error: cluster rounding produced an extent "
-                        "over 256 blocks despite the safe_chunk guard "
-                        "(should be unreachable)");
-        }
 
         extents[extent_count].lbn = chunk_lbn;
         extents[extent_count].block_count = chunk_allocated;
@@ -856,59 +916,341 @@ ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,
                                                                     : blocks_remaining - chunk_allocated;
     }
 
-    memset(&spec, 0, sizeof(spec));
-    spec.fid.fid_num = (uint16_t) file_number;
-    spec.fid.fid_seq = seq_num;
-    spec.backlink = parent_core->fid;
-    spec.filechar = (extent_count == 1) ? 0x0080 : 0; /* FH2$M_CONTIG only when truly one piece */
-    spec.rtype = rtype;
-    spec.rattrib = 0;
-    spec.rsize = 512;
-    spec.maxrec = 512;
-    spec.extents = extents;
-    spec.extent_count = extent_count;
-    spec.hiblk = total_allocated;
-    spec.efblk = blocks_needed;
-    spec.ffbyte = (uint16_t) (content_len % 512); /* 0 correctly means "whole last block used" */
-
+    /* Determine each extent's actual encoded size - 4, 6, or 8 bytes,
+       depending on which retrieval pointer format it needs (spec
+       3.5.4; see ods2_encode_retrieval_pointer()) - then split the
+       extents across as many header segments as needed by CUMULATIVE
+       BYTES, not a fixed per-header extent COUNT. That distinction
+       matters now: with Format 1 alone every extent was always
+       exactly 4 bytes, so "extents per header" was a fixed number
+       (ODS2_HEADER_MAX_EXTENTS/ODS2_EXT_HEADER_MAX_EXTENTS); with
+       Format 2/3 in the mix, different extents in the same file can
+       have different encoded sizes, so how many fit in a given
+       header's Map Area depends on which ones they actually are. The
+       primary header has 310 bytes of Map Area (510-200); each
+       extension header has 430 (510-80, truncated Ident Area - spec
+       3.5.3). */
     {
-        char ident[260]; /* name is already bounded (<256 chars, checked
-                             above) plus ";1" and a nul - always large
-                             enough, sized generously to also silence a
-                             spurious compiler truncation warning */
-        snprintf(ident, sizeof(ident), "%s;1", name);
-        spec.ident_name = ident;
+        size_t extent_bytes[ODS2_MAX_EXTENTS];
+        int i2;
+        int segment_count = 0;
+        ods2_fid_t segment_fid[ODS2_MAX_HEADER_SEGMENTS];
+        unsigned segment_file_number[ODS2_MAX_HEADER_SEGMENTS];
+        int segment_extent_start[ODS2_MAX_HEADER_SEGMENTS];
+        int segment_extent_count[ODS2_MAX_HEADER_SEGMENTS];
+        int seg;
+        int next_extent = 0;
 
-        if (!ods2_build_file_header(new_header, &spec)) {
-            return fail("could not construct new file's header");
+        for (i2 = 0; i2 < extent_count; i2++) {
+            uint8_t scratch[8];
+            size_t bytes_written;
+            if (!ods2_encode_retrieval_pointer(scratch, extents[i2].lbn,
+                                                extents[i2].block_count, &bytes_written)) {
+                return fail("internal error: an allocated extent doesn't fit "
+                            "even a Format 3 retrieval pointer (should be unreachable)");
+            }
+            extent_bytes[i2] = bytes_written;
         }
+
+        while (next_extent < extent_count) {
+            size_t capacity = (segment_count == 0)
+                                   ? (510 - ODS2_HEADER_MPOFFSET_BYTES)
+                                   : (510 - ODS2_EXT_HEADER_MPOFFSET_BYTES);
+            size_t used = 0;
+            int start = next_extent;
+            int count = 0;
+
+            if (segment_count >= ODS2_MAX_HEADER_SEGMENTS) {
+                return fail("content too fragmented to fit even across the "
+                            "maximum chain of extension headers");
+            }
+
+            while (next_extent < extent_count && used + extent_bytes[next_extent] <= capacity) {
+                used += extent_bytes[next_extent];
+                next_extent++;
+                count++;
+            }
+            if (count == 0) {
+                /* A single extent's own encoding is bigger than an
+                   entire header's Map Area could ever hold -
+                   genuinely unreachable given Format 3 tops out at 8
+                   bytes and even the smaller (extension) header's
+                   capacity is 430 bytes, but guarded rather than
+                   looping forever. */
+                return fail("internal error: a single extent's retrieval "
+                            "pointer is larger than an entire header's map "
+                            "area (should be unreachable)");
+            }
+
+            if (segment_count == 0) {
+                segment_file_number[0] = file_number;
+                segment_fid[0].fid_num = (uint16_t) file_number;
+                segment_fid[0].fid_seq = seq_num;
+                segment_fid[0].fid_rvn = 0;
+                segment_fid[0].fid_nmx = 0;
+            } else {
+                unsigned ext_file_number;
+                uint16_t ext_seq_num;
+
+                /* Search from just above the previously allocated
+                   slot: a slot claimed above is only reflected in the
+                   index bitmap so far (its on-disk header content is
+                   still written later, below), so a plain
+                   from-file-number-1 search would keep finding that
+                   same slot again. */
+                r = ods2_find_free_file_number(
+                    vol, segment_file_number[segment_count - 1] + 1, 4096,
+                    &ext_file_number, &ext_seq_num);
+                if (!r.ok) return r;
+                r = mark_index_bitmap(vol, ext_file_number, true);
+                if (!r.ok) return r;
+
+                segment_file_number[segment_count] = ext_file_number;
+                segment_fid[segment_count].fid_num = (uint16_t) ext_file_number;
+                segment_fid[segment_count].fid_seq = ext_seq_num;
+                segment_fid[segment_count].fid_rvn = 0;
+                segment_fid[segment_count].fid_nmx = 0;
+            }
+
+            segment_extent_start[segment_count] = start;
+            segment_extent_count[segment_count] = count;
+            segment_count++;
+        }
+
+        /* Build and write every segment now that every segment's FID
+           is known (each needs the NEXT segment's FID for its own
+           ext_fid, so this couldn't be done in the loop above). */
+        for (seg = 0; seg < segment_count; seg++) {
+            uint8_t seg_header[512];
+            bool is_extension = (seg != 0);
+
+            memset(&spec, 0, sizeof(spec));
+            spec.fid = segment_fid[seg];
+            /* Spec 3.5.2.16: an extension header's backlink is the
+               file's PRIMARY header's FID, not the parent directory's -
+               only segment 0 points at the parent. */
+            spec.backlink = is_extension ? segment_fid[0] : parent_core->fid;
+            spec.ext_fid = (seg + 1 < segment_count) ? segment_fid[seg + 1] : (ods2_fid_t) { 0 };
+            spec.seg_num = (uint16_t) seg;
+            spec.is_extension = is_extension;
+            /* FH2$M_CONTIG only makes sense on the primary header,
+               and only when the whole file is truly one piece. */
+            spec.filechar = (!is_extension && extent_count == 1) ? 0x0080 : 0;
+            spec.rtype = rtype;
+            spec.rattrib = 0;
+            spec.rsize = 512;
+            spec.maxrec = 512;
+            spec.extents = extents + segment_extent_start[seg];
+            spec.extent_count = segment_extent_count[seg];
+            /* HIBLK/EFBLK/FFBYTE describe the file as a whole and are
+               only meaningful read from the primary header - real VMS
+               headers examined earlier in this project leave them
+               populated on extension headers too, so mirror that
+               rather than leaving them zero. */
+            spec.hiblk = total_allocated;
+            spec.efblk = blocks_needed;
+            spec.ffbyte = (uint16_t) (content_len % 512); /* 0 = "whole last block used" */
+
+            if (!is_extension) {
+                char ident[260]; /* name is already bounded (<256 chars,
+                                     checked above) plus ";1" and a nul -
+                                     always large enough, sized generously
+                                     to also silence a spurious compiler
+                                     truncation warning */
+                snprintf(ident, sizeof(ident), "%s;1", name);
+                spec.ident_name = ident;
+
+                if (!ods2_build_file_header(seg_header, &spec)) {
+                    return fail("could not construct new file's primary header");
+                }
+            } else {
+                if (!ods2_build_file_header(seg_header, &spec)) {
+                    return fail("could not construct new file's extension header");
+                }
+            }
+
+            r = ods2_write_header(vol, segment_file_number[seg], seg_header);
+            if (!r.ok) return r;
+        }
+
+        primary_fid = segment_fid[0];
     }
 
-    r = ods2_write_header(vol, file_number, new_header);
-    if (!r.ok) return r;
+    /* Write content directly against the extents we already
+       allocated, rather than going through ods2_write_file_block()
+       per VBN - that call re-decodes the header (and, once a file
+       spans extension headers, re-reads every one of them from disk)
+       on every single invocation. For a file with thousands of
+       extents across dozens of extension headers (a several-hundred-
+       MB CD image is a realistic case now that multi-header files are
+       possible), that would mean millions of redundant disk reads.
+       We already know exactly which LBN each VBN belongs to from the
+       allocation loop above, so write straight to it. */
+    {
+        /* Counts VBNs written, NOT bytes - a zero-length file still
+           has blocks_needed==1 (forced above) and must get that one
+           all-zero block written, matching the original per-VBN loop
+           this replaces (which ran unconditionally for vbn in
+           1..blocks_needed regardless of content_len). Gating on
+           content_len instead would silently skip that write and
+           leave a freshly-allocated, not-yet-zeroed block's stale
+           on-disk bytes as the "content" of an empty file. */
+        unsigned vbn_written = 0;
+        int ext_i;
+        for (ext_i = 0; ext_i < extent_count && vbn_written < blocks_needed; ext_i++) {
+            unsigned b;
+            for (b = 0; b < extents[ext_i].block_count && vbn_written < blocks_needed; b++) {
+                uint8_t block[512];
+                size_t offset = (size_t) vbn_written * 512;
+                size_t remaining = content_len - offset;
+                size_t this_len = (remaining > 512) ? 512 : remaining;
 
-    for (vbn = 1; vbn <= blocks_needed; vbn++) {
-        uint8_t block[512];
-        size_t offset = (size_t) (vbn - 1) * 512;
-        size_t remaining = content_len - offset;
-        size_t this_len = (remaining > 512) ? 512 : remaining;
-
-        memset(block, 0, sizeof(block));
-        if (this_len > 0) {
-            memcpy(block, content + offset, this_len);
+                memset(block, 0, sizeof(block));
+                if (this_len > 0 && this_len <= remaining) {
+                    memcpy(block, content + offset, this_len);
+                }
+                r = ods2_write_block(vol, extents[ext_i].lbn + b, block);
+                if (!r.ok) return r;
+                vbn_written++;
+            }
         }
-        r = ods2_write_file_block(vol, new_header, vbn, block);
-        if (!r.ok) return r;
     }
 
     /* Insert an entry for the new file into the parent - growing the
        parent's own allocation automatically if none of its existing
-       content blocks have room. */
-    r = ods2_insert_into_directory(vol, parent_core->fid.fid_num, name, 1, spec.fid);
+       content blocks have room. Always the PRIMARY header's FID - a
+       directory entry never points at an extension header (spec
+       3.5.2.8's ext_fid chain, followed from the primary header, is
+       how those get reached instead). */
+    r = ods2_insert_into_directory(vol, parent_core->fid.fid_num, name, 1, primary_fid);
     if (!r.ok) return r;
 
-    *new_fid_out = spec.fid;
+    *new_fid_out = primary_fid;
     return ok();
+}
+
+/* Appends one already-allocated extent (an LBN + block count, as
+ * returned by ods2_allocate_blocks) to the tail of an existing file's
+ * retrieval-pointer chain: into the primary header if it still has
+ * room, into an existing extension header if the primary is full but
+ * an extension already exists with room, or by chaining on a
+ * brand-new extension header (spec 3.3) if even the current tail
+ * header is full. Does NOT touch HIBLK/EFBLK/FFBYTE or the revision
+ * date/count - those live only on the PRIMARY header and are always
+ * the caller's responsibility, since callers vary in what else they
+ * need to update alongside the append (see ods2_insert_into_directory
+ * below, the only current caller). `primary_fid` is the file's own
+ * (primary header's) FID, needed for FH2$W_BACKLINK if a new
+ * extension header ends up being created (spec 3.5.2.16: an
+ * extension header's backlink is the primary header's FID). */
+static ods2_result_t ods2_append_extent_to_chain(ods2_volume_t *vol,
+                                                  unsigned primary_file_number,
+                                                  ods2_fid_t primary_fid,
+                                                  uint32_t new_lbn,
+                                                  unsigned new_block_count)
+{
+    uint8_t seg_header[512];
+    unsigned seg_file_number = primary_file_number;
+    int segment_index = 0;
+    ods2_result_t r;
+
+    r = ods2_read_header(vol, seg_file_number, seg_header);
+    if (!r.ok) return r;
+
+    for (;;) {
+        ods2_head_core_t *core = (ods2_head_core_t *) seg_header;
+        size_t map_area_offset = (size_t) core->mpoffset * 2;
+        size_t current_map_bytes = (size_t) core->map_inuse * 2;
+        uint8_t encoded[8];
+        size_t bytes_written;
+
+        if (!ods2_encode_retrieval_pointer(encoded, new_lbn, new_block_count, &bytes_written)) {
+            return fail("could not encode the new extent (allocation too "
+                        "large even for a Format 3 pointer)");
+        }
+
+        if (map_area_offset + current_map_bytes + bytes_written <= 510) {
+            /* This segment (primary or extension, doesn't matter -
+               the arithmetic is driven entirely by its own mpoffset/
+               map_inuse) has room right here. */
+            uint16_t checksum;
+            memcpy(seg_header + map_area_offset + current_map_bytes, encoded, bytes_written);
+            core->map_inuse = (uint8_t) ((current_map_bytes + bytes_written) / 2);
+            checksum = ods2_checksum(seg_header, 255);
+            seg_header[510] = (uint8_t) (checksum & 0xff);
+            seg_header[511] = (uint8_t) (checksum >> 8);
+            return ods2_write_header(vol, seg_file_number, seg_header);
+        }
+
+        if (core->ext_fid.fid_num != 0) {
+            /* This segment is full, but already has a further
+               extension header - follow the chain and try there. */
+            seg_file_number = core->ext_fid.fid_num;
+            segment_index++;
+            if (segment_index >= ODS2_MAX_HEADER_SEGMENTS) {
+                return fail("extension header chain exceeded maximum segment "
+                            "limit (possibly corrupted or circular ext_fid chain)");
+            }
+            r = ods2_read_header(vol, seg_file_number, seg_header);
+            if (!r.ok) return r;
+            continue;
+        }
+
+        /* The tail of the chain is full and has no further extension
+           header - allocate a brand-new one and link it in (spec
+           3.3: extension headers are linked in ascending order via
+           FH2$W_EXT_FID). */
+        {
+            unsigned new_ext_file_number;
+            uint16_t new_ext_seq;
+            ods2_header_spec_t spec;
+            uint8_t new_ext_header[512];
+            ods2_extent_t one_extent;
+            uint16_t checksum;
+
+            if (segment_index + 1 >= ODS2_MAX_HEADER_SEGMENTS) {
+                return fail("file already has the maximum number of chained "
+                            "extension headers - cannot add another extent");
+            }
+
+            r = ods2_find_free_file_number(vol, primary_file_number + 1, 4096,
+                                            &new_ext_file_number, &new_ext_seq);
+            if (!r.ok) return r;
+            r = mark_index_bitmap(vol, new_ext_file_number, true);
+            if (!r.ok) return r;
+
+            one_extent.lbn = new_lbn;
+            one_extent.block_count = new_block_count;
+
+            memset(&spec, 0, sizeof(spec));
+            spec.fid.fid_num = (uint16_t) new_ext_file_number;
+            spec.fid.fid_seq = new_ext_seq;
+            spec.backlink = primary_fid;
+            spec.seg_num = (uint16_t) (segment_index + 1);
+            spec.is_extension = true;
+            spec.rtype = core->recattr.rtype;
+            spec.rattrib = core->recattr.rattrib;
+            spec.rsize = core->recattr.rsize;
+            spec.maxrec = core->recattr.maxrec;
+            spec.extents = &one_extent;
+            spec.extent_count = 1;
+            /* hiblk/efblk/ffbyte/ident are only meaningful read from
+               the primary header - left zero/NULL here. */
+
+            if (!ods2_build_file_header(new_ext_header, &spec)) {
+                return fail("could not construct new extension header");
+            }
+            r = ods2_write_header(vol, new_ext_file_number, new_ext_header);
+            if (!r.ok) return r;
+
+            /* Link the (now former) tail header to the new one. */
+            core->ext_fid = spec.fid;
+            checksum = ods2_checksum(seg_header, 255);
+            seg_header[510] = (uint8_t) (checksum & 0xff);
+            seg_header[511] = (uint8_t) (checksum >> 8);
+            return ods2_write_header(vol, seg_file_number, seg_header);
+        }
+    }
 }
 
 ods2_result_t ods2_insert_into_directory(ods2_volume_t *vol, unsigned dir_file_number,
@@ -947,39 +1289,38 @@ ods2_result_t ods2_insert_into_directory(ods2_volume_t *vol, unsigned dir_file_n
     }
 
     /* No existing block had room - extend the directory: allocate a
-       new block, add it as an additional extent to the directory's
-       own header (modified in place, not rebuilt from scratch, so
-       the original creation date is preserved - only the revision
-       date/count change, matching what a real revision to an
-       existing file should do), then insert into the fresh block. */
+       new block, append it as an additional extent to the directory's
+       own header chain (growing into/creating an extension header if
+       the primary header's own map area is already full - spec 3.3),
+       then insert into the fresh block. The primary header itself is
+       modified in place, not rebuilt from scratch, so the original
+       creation date is preserved - only the revision date/count
+       change, matching what a real revision to an existing file
+       should do. */
     {
         ods2_head_core_t *core = (ods2_head_core_t *) dir_header;
         uint32_t new_lbn;
         unsigned new_blocks_allocated;
-        size_t map_area_offset = (size_t) core->mpoffset * 2;
-        size_t current_map_bytes = (size_t) core->map_inuse * 2;
-        size_t new_map_bytes = current_map_bytes + 4; /* one more Format 1 extent */
         uint16_t checksum;
         uint8_t new_block[512];
         uint32_t new_hiblk, new_efblk;
         uint64_t vms_now;
-
-        if (map_area_offset + new_map_bytes > 510) {
-            return fail("directory's header has no room for another extent "
-                        "(would need a second extension header - not yet implemented)");
-        }
+        ods2_fid_t primary_fid = core->fid;
 
         r = ods2_allocate_blocks(vol, vol->home.cluster, &new_lbn, &new_blocks_allocated);
         if (!r.ok) return r;
 
-        /* Append the new extent right after the existing map data. */
-        if (!ods2_encode_retrieval_pointer_format1(
-                dir_header + map_area_offset + current_map_bytes,
-                new_lbn, new_blocks_allocated)) {
-            return fail("could not encode the new extent (allocation too large "
-                        "for a single Format 1 pointer)");
-        }
-        core->map_inuse = (uint8_t) (new_map_bytes / 2);
+        r = ods2_append_extent_to_chain(vol, dir_file_number, primary_fid,
+                                         new_lbn, new_blocks_allocated);
+        if (!r.ok) return r;
+
+        /* HIBLK/EFBLK/FFBYTE/revision only ever live on the PRIMARY
+           header - re-read it fresh, since the append above may have
+           just modified it on disk directly (grown its own map data
+           in place, or linked in a brand-new extension header). */
+        r = ods2_read_header(vol, dir_file_number, dir_header);
+        if (!r.ok) return r;
+        core = (ods2_head_core_t *) dir_header;
 
         new_hiblk = ods2_word_swap32(core->recattr.hiblk) + new_blocks_allocated;
         core->recattr.hiblk = ods2_word_swap32(new_hiblk);
@@ -1156,27 +1497,58 @@ ods2_result_t ods2_delete(ods2_volume_t *vol, unsigned dir_file_number, const ch
         if (!r.ok) return r;
     }
 
-    /* Free the file number in the index file's own bitmap. */
-    r = mark_index_bitmap(vol, target_fid.fid_num, false);
-    if (!r.ok) return r;
+    /* Free every header segment's own file-number slot and mark each
+       one deleted, walking the ext_fid chain (spec 3.3) starting from
+       the primary header we already have in memory - not just the
+       primary. Without this, a multi-header file's extension headers
+       would leak on delete: their file numbers would stay marked "in
+       use" in the index bitmap forever, and their header blocks would
+       remain live and readable despite the file itself being gone. */
+    {
+        uint8_t seg_header[512];
+        unsigned seg_file_number = target_fid.fid_num;
+        int segment = 0;
 
-    /* Mark the header itself deleted, per spec 3.5.1's exact rules:
-       FH2$V_MARKDEL set, FID_NUM/NMX/RVN zeroed - but FH2$W_FID_SEQ
-       is explicitly NOT touched, since spec 5.1.7 requires it to
-       survive so the next use of this slot gets seq+1, not a fresh
-       seq of 1 (that rule is only for a slot that was never used at
-       all - "garbage" - which this no longer is). Checksum is set to
-       zero, not recomputed - also an explicit spec rule, not an
-       oversight. */
-    target_core->filechar |= 0x8000u; /* FH2$M_MARKDEL, confirmed value */
-    target_core->fid.fid_num = 0;
-    target_core->fid.fid_nmx = 0;
-    target_core->fid.fid_rvn = 0;
-    target_header[510] = 0;
-    target_header[511] = 0;
+        memcpy(seg_header, target_header, sizeof(seg_header));
 
-    r = ods2_write_header(vol, target_fid.fid_num, target_header);
-    if (!r.ok) return r;
+        for (;;) {
+            ods2_head_core_t *seg_core = (ods2_head_core_t *) seg_header;
+            ods2_fid_t next_ext_fid = seg_core->ext_fid;
+
+            r = mark_index_bitmap(vol, seg_file_number, false);
+            if (!r.ok) return r;
+
+            /* Mark the header itself deleted, per spec 3.5.1's exact
+               rules: FH2$V_MARKDEL set, FID_NUM/NMX/RVN zeroed - but
+               FH2$W_FID_SEQ is explicitly NOT touched, since spec
+               5.1.7 requires it to survive so the next use of this
+               slot gets seq+1, not a fresh seq of 1 (that rule is
+               only for a slot that was never used at all - "garbage" -
+               which this no longer is). Checksum is set to zero, not
+               recomputed - also an explicit spec rule, not an
+               oversight. */
+            seg_core->filechar |= 0x8000u; /* FH2$M_MARKDEL, confirmed value */
+            seg_core->fid.fid_num = 0;
+            seg_core->fid.fid_nmx = 0;
+            seg_core->fid.fid_rvn = 0;
+            seg_header[510] = 0;
+            seg_header[511] = 0;
+
+            r = ods2_write_header(vol, seg_file_number, seg_header);
+            if (!r.ok) return r;
+
+            if (next_ext_fid.fid_num == 0) break; /* no further extension header */
+            segment++;
+            if (segment >= ODS2_MAX_HEADER_SEGMENTS) {
+                return fail("extension header chain exceeded maximum segment "
+                            "limit while deleting (possibly corrupted or "
+                            "circular ext_fid chain)");
+            }
+            seg_file_number = next_ext_fid.fid_num;
+            r = ods2_read_header(vol, seg_file_number, seg_header);
+            if (!r.ok) return r;
+        }
+    }
 
     /* Remove the directory entry from the parent - trying each
        content block until the (sorted) matching record is found. */

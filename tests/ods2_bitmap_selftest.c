@@ -148,6 +148,45 @@ int main(void)
     }
     printf("PASS: marking a range leaves bits outside it undisturbed (no off-by-one)\n");
 
+    /* --- ods2_bitmap_find_largest_free() tests --- */
+
+    /* Test 10: no free bits at all -> not found, same as find_free. */
+    memset(bitmap, 0, sizeof(bitmap));
+    assert(!ods2_bitmap_find_largest_free(bitmap, 128, 5, &start, &found));
+    printf("PASS: all-allocated bitmap reports no free run (find_largest_free)\n");
+
+    /* Test 11: request MORE than the largest available run - unlike
+       find_free (which would fail), find_largest_free succeeds with
+       whatever it actually found. */
+    memset(bitmap, 0, sizeof(bitmap));
+    set_free_range(bitmap, 5, 20); /* 15 free bits */
+    assert(ods2_bitmap_find_largest_free(bitmap, 128, 100, &start, &found));
+    assert(start == 5);
+    assert(found == 15);
+    printf("PASS: requesting more than the largest run returns that run's true "
+           "size instead of failing\n");
+
+    /* Test 12: two runs, one bigger than the other - the LARGER one
+       must win even though it's not the first one scanned. */
+    memset(bitmap, 0, sizeof(bitmap));
+    set_free_range(bitmap, 2, 4);    /* bits 2-3: run of 2 */
+    set_free_range(bitmap, 10, 30);  /* bits 10-29: run of 20 */
+    assert(ods2_bitmap_find_largest_free(bitmap, 128, 100, &start, &found));
+    assert(start == 10);
+    assert(found == 20);
+    printf("PASS: the larger of two runs is correctly preferred\n");
+
+    /* Test 13: when a run at least as large as max_count DOES exist,
+       the result must be capped at exactly max_count, matching
+       find_free's own contract (never report more than asked for). */
+    memset(bitmap, 0, sizeof(bitmap));
+    set_free_range(bitmap, 5, 20); /* 15 free bits */
+    assert(ods2_bitmap_find_largest_free(bitmap, 128, 5, &start, &found));
+    assert(start == 5);
+    assert(found == 5);
+    printf("PASS: a sufficient run is capped at the requested size, not "
+           "over-reported\n");
+
     printf("ods2_bitmap_selftest: all checks passed\n");
     return 0;
 }

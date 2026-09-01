@@ -30,10 +30,9 @@
  *   rtype defaults to 5 (FAB$C_STMLF, stream-LF - typical for text);
  *   pass 1 (FAB$C_FIX) for binary content.
  *
- * Supports multi-extent files up to ~9.5MB (77 extents in a single
- * header's map area, ~254 blocks each on a typical small cluster
- * factor) - see ods2_create_file()'s documentation for the exact
- * limit and why it exists.
+ * Supports files of any size ods2_create_file() itself supports -
+ * chained extension headers (spec 3.3) let a file span far more than
+ * one header's ~77-extent map area when needed.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,12 +46,8 @@ int main(int argc, char **argv)
     uint8_t dir_header[512];
     FILE *local_f;
     uint8_t *buf;
-    size_t buf_size = 12u * 1024u * 1024u; /* headroom above the ~9.5MB
-                                               practical limit, so an
-                                               oversized file gets a
-                                               clear error from
-                                               ods2_create_file rather
-                                               than a truncated read */
+    long file_size;
+    size_t buf_size;
     size_t content_len;
     uint8_t rtype;
 
@@ -69,16 +64,26 @@ int main(int argc, char **argv)
         perror(argv[2]);
         return 1;
     }
-    buf = malloc(buf_size);
+    /* Size the read buffer to the actual local file - see
+       ods2_create_file()'s documentation for how large a file it can
+       now hold (chained extension headers, not just a single ~9.5MB
+       header's worth). */
+    if (fseek(local_f, 0, SEEK_END) != 0 || (file_size = ftell(local_f)) < 0 ||
+        fseek(local_f, 0, SEEK_SET) != 0) {
+        fprintf(stderr, "%s: could not determine file size\n", argv[2]);
+        fclose(local_f);
+        return 1;
+    }
+    buf_size = (size_t) file_size;
+    buf = malloc(buf_size > 0 ? buf_size : 1);
     if (buf == NULL) {
         fprintf(stderr, "could not allocate read buffer\n");
         fclose(local_f);
         return 1;
     }
     content_len = fread(buf, 1, buf_size, local_f);
-    if (!feof(local_f)) {
-        fprintf(stderr, "%s: file too large for a single header's map area - "
-                        "see ods2_create_file())\n", argv[2]);
+    if (content_len != buf_size) {
+        fprintf(stderr, "%s: could not read the whole file\n", argv[2]);
         free(buf);
         fclose(local_f);
         return 1;

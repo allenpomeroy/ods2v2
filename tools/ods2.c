@@ -398,7 +398,8 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
     ods2_fid_t dir_fid, new_fid;
     FILE *f;
     uint8_t *buf;
-    size_t buf_size = 12u * 1024u * 1024u;
+    long file_size;
+    size_t buf_size;
     size_t content_len;
     ods2_result_t r;
     const char *name;
@@ -415,16 +416,27 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
         fprintf(stderr, "%%ODS2-E-OPENIN, could not open %s\n", local_file);
         return;
     }
-    buf = malloc(buf_size);
+    /* Size the read buffer to the actual local file, rather than a
+       fixed cap - ods2_create_file() itself now supports files well
+       beyond the old ~9.5MB single-header limit (chained extension
+       headers, spec 3.3), so a hard-coded buffer here would just
+       reintroduce that ceiling at the CLI layer. */
+    if (fseek(f, 0, SEEK_END) != 0 || (file_size = ftell(f)) < 0 ||
+        fseek(f, 0, SEEK_SET) != 0) {
+        fprintf(stderr, "%%ODS2-E-OPENIN, could not determine size of %s\n", local_file);
+        fclose(f);
+        return;
+    }
+    buf_size = (size_t) file_size;
+    buf = malloc(buf_size > 0 ? buf_size : 1);
     if (buf == NULL) {
         fprintf(stderr, "%%ODS2-E-NOMEM, could not allocate read buffer\n");
         fclose(f);
         return;
     }
     content_len = fread(buf, 1, buf_size, f);
-    if (!feof(f)) {
-        fprintf(stderr, "%%ODS2-E-TOOBIG, %s is too large for a single header's map area\n",
-                local_file);
+    if (content_len != buf_size) {
+        fprintf(stderr, "%%ODS2-E-READERR, could not read all of %s\n", local_file);
         free(buf);
         fclose(f);
         return;
@@ -457,7 +469,7 @@ static void cmd_type(ods2_volume_t *vol, const ods2_parsed_path_t *p)
     ods2_fid_t dir_fid, file_fid;
     ods2_result_t r;
     uint8_t *buf;
-    size_t buf_size = 12u * 1024u * 1024u;
+    size_t buf_size;
     size_t bytes_read = 0;
 
     if (p->filename[0] == '\0') {
@@ -483,7 +495,12 @@ static void cmd_type(ods2_volume_t *vol, const ods2_parsed_path_t *p)
         fprintf(stderr, "%%ODS2-E-READERR, %s\n", r.problem);
         return;
     }
-    buf = malloc(buf_size);
+    /* Size the buffer exactly to this file's own stated content
+       length (from EFBLK/FFBYTE, already in the header we just read)
+       rather than a fixed cap - a multi-header file can be far larger
+       than the old ~9.5MB single-header limit. */
+    buf_size = ods2_file_content_length(file_header);
+    buf = malloc(buf_size > 0 ? buf_size : 1);
     if (buf == NULL) {
         fprintf(stderr, "%%ODS2-E-NOMEM, could not allocate read buffer\n");
         return;

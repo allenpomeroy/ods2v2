@@ -33,10 +33,28 @@
 #include "ods2_ondisk.h"
 #include "ods2_retrieval.h"
 #include "ods2_directory.h"
+#include "ods2_header_build.h"
 #include <stdio.h>
 #include <stdbool.h>
 
-#define ODS2_MAX_EXTENTS 128
+/* A file needing more retrieval pointers than one header's Map Area
+ * can hold is represented as a chain of file headers, linked via
+ * each header's FH2$W_EXT_FID (spec 3.3/3.5.2.8) - the read side
+ * (ods2_decode_all_extents) and the write side (ods2_create_file's
+ * multi-header allocation, ods2_insert_into_directory's directory
+ * growth) both cap the chain at this many segments (1 primary +
+ * ODS2_MAX_HEADER_SEGMENTS-1 extension headers), so anything either
+ * side writes remains fully readable by the other and a corrupted or
+ * circular ext_fid chain can't loop forever. */
+#define ODS2_MAX_HEADER_SEGMENTS 64
+
+/* Sized to hold every retrieval pointer of a file using the maximum
+ * possible header chain: the primary header's capacity plus an
+ * extension header's (smaller Ident Area, more room for pointers)
+ * capacity for each additional segment. See ods2_header_build.h for
+ * where the 77/107-ish per-header figures come from. */
+#define ODS2_MAX_EXTENTS \
+    (ODS2_HEADER_MAX_EXTENTS + (ODS2_MAX_HEADER_SEGMENTS - 1) * ODS2_EXT_HEADER_MAX_EXTENTS)
 
 typedef struct {
     FILE          *fp;
@@ -81,7 +99,10 @@ void ods2_dismount(ods2_volume_t *vol);
    the VBN range covered by INDEXF.SYS's decoded extents - which for a
    volume with a small number of files (well under what a full
    INDEXF.SYS extent list would cover) is normally everything that
-   exists. Extension headers (seg_num > 0) are not yet supported. */
+   exists. Reads any individual header, primary or extension
+   (seg_num > 0) alike, exactly as stored - use
+   ods2_decode_all_extents() to walk a file's full ext_fid chain
+   automatically instead of following seg_num links by hand. */
 ods2_result_t ods2_read_header(ods2_volume_t *vol, unsigned file_number,
                                 uint8_t *header_out);
 
@@ -122,6 +143,10 @@ ods2_result_t ods2_decode_all_extents(ods2_volume_t *vol, const uint8_t *header,
                                        ods2_extent_t *extents_out, size_t max_extents,
                                        int *count_out);
 
+/* Reads a single 512-byte block from absolute LBN `lbn` into
+ * `block_out`. Read counterpart to ods2_write_block(). */
+ods2_result_t ods2_read_block(ods2_volume_t *vol, uint32_t lbn, uint8_t *block_out);
+
 /* Reads a file's entire logical content (respecting FAT$L_EFBLK/
    FAT$W_FFBYTE - the end-of-file mark - not just its physical
    allocation, which is normally larger) into a caller-allocated
@@ -129,9 +154,24 @@ ods2_result_t ods2_decode_all_extents(ods2_volume_t *vol, const uint8_t *header,
    `buf_out`, or a failure result if `buf_out` is too small or a
    block couldn't be read. Intended for text/binary file content
    (a TYPE/COPY equivalent), not directories - use
-   ods2_list_directory() for those. */
+   ods2_list_directory() for those. Decodes the file's full extent
+   chain (walking any extension headers, spec 3.3) exactly once up
+   front, then reads content blocks directly against that list -
+   callers with large or multi-header files (a multi-hundred-MB CD
+   image, easily thousands of extents, is a realistic case) should
+   always prefer this over looping ods2_read_file_block() one VBN at
+   a time, which would re-decode (and, once extension headers are
+   involved, re-read from disk) the whole chain on every single call. */
 ods2_result_t ods2_read_file(ods2_volume_t *vol, const uint8_t *header,
                               uint8_t *buf_out, size_t buf_size, size_t *bytes_read_out);
+
+/* Returns the exact logical content length in bytes of the file
+ * described by `header` (respecting FAT$L_EFBLK/FAT$W_FFBYTE, same
+ * rule ods2_read_file() itself uses) - without reading any content.
+ * Intended for callers that need to size a buffer exactly before
+ * calling ods2_read_file(), rather than guessing at (or hard-coding)
+ * a maximum. */
+size_t ods2_file_content_length(const uint8_t *header);
 
 /* Finds a free file number for a new file, and the correct file
    sequence number to assign it (spec 5.1.7: seq=1 for a genuinely
@@ -157,10 +197,15 @@ ods2_result_t ods2_write_file_block(ods2_volume_t *vol, const uint8_t *header,
    bitmap tracks clusters, not individual blocks - confirmed by the
    old project's own working allocation code). On success, *lbn_out
    is the starting LBN and *blocks_allocated_out is the actual number
-   of blocks reserved (may be more than requested, due to cluster
-   rounding - callers should use this actual count, not their
-   original request, when building extents/hiblk). The volume must be
-   mounted for write. */
+   of blocks reserved - which may be MORE than requested (cluster
+   rounding) or LESS than requested (no single contiguous run big
+   enough for the whole request existed, so the largest one actually
+   available was used instead - callers needing the full amount call
+   this again for the remainder, exactly as ods2_create_file() does).
+   Callers should always use this actual returned count, not their
+   original request, when building extents/hiblk. Fails only if there
+   is truly no free space left on the volume at all. The volume must
+   be mounted for write. */
 ods2_result_t ods2_allocate_blocks(ods2_volume_t *vol, unsigned blocks_needed,
                                     uint32_t *lbn_out, unsigned *blocks_allocated_out);
 

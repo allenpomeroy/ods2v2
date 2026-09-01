@@ -1,6 +1,6 @@
 # ods2v2 - from-scratch ODS2 implementation
 #
-# v1.3
+# v1.4
 #
 # Sanitizers are ON by default for dev builds to catch my bad bugs.
 # `make release` builds without them for a normal, fast binary
@@ -26,7 +26,8 @@ VOLUME_SRCS = src/ods2_volume.c src/ods2_validate.c src/ods2_checksum.c \
               src/ods2_header_build.c src/ods2_directory_write.c
 
 TOOLS = ods2 read_home_block read_file_header ods2_ls ods2_cat ods2_mkdir \
-        ods2_put ods2_check_headers ods2_dump_root ods2_dump_header ods2_rm
+        ods2_put ods2_check_headers ods2_dump_root ods2_dump_header ods2_rm \
+        ods2_header_capacity
 
 # `ods2` is the actual, intended day-to-day interface (DIR,
 # CREATE/DIRECTORY, COPY, TYPE, DELETE, SET DEFAULT - everything a
@@ -34,11 +35,12 @@ TOOLS = ods2 read_home_block read_file_header ods2_ls ods2_cat ods2_mkdir \
 #  make test / make all / make tools.
 MAIN_TOOLS = ods2
 
-# These ten tools are single-purpose tools used while building this
+# These eleven tools are single-purpose tools used while building this
 # project - each testing or inspecting one specific piece in
 # isolation. See README.md - not built by default - `make dev-tools` builds them.
 DEV_TOOLS = read_home_block read_file_header ods2_ls ods2_cat ods2_mkdir \
-            ods2_put ods2_check_headers ods2_dump_root ods2_dump_header ods2_rm
+            ods2_put ods2_check_headers ods2_dump_root ods2_dump_header ods2_rm \
+            ods2_header_capacity
 
 TESTS = $(BUILD)/ods2_ondisk_selftest $(BUILD)/ods2_checksum_selftest $(BUILD)/ods2_validate_selftest $(BUILD)/ods2_bitmap_selftest $(BUILD)/ods2_indexf_selftest $(BUILD)/ods2_retrieval_selftest $(BUILD)/ods2_root_header_selftest $(BUILD)/ods2_directory_selftest $(BUILD)/ods2_volume_selftest $(BUILD)/ods2_wildcard_selftest $(BUILD)/ods2_read_file_selftest $(BUILD)/ods2_header_build_selftest $(BUILD)/ods2_directory_write_selftest $(BUILD)/ods2_path_selftest
 
@@ -137,6 +139,9 @@ ods2_put: tools/ods2_put.c $(VOLUME_SRCS) include/ods2_volume.h
 
 ods2_check_headers: tools/ods2_check_headers.c $(VOLUME_SRCS) include/ods2_volume.h include/ods2_validate.h
 	$(CC) $(CFLAGS) $(SANFLAGS) tools/ods2_check_headers.c $(VOLUME_SRCS) -o $@
+
+ods2_header_capacity: tools/ods2_header_capacity.c $(VOLUME_SRCS) include/ods2_volume.h
+	$(CC) $(CFLAGS) $(SANFLAGS) tools/ods2_header_capacity.c $(VOLUME_SRCS) -o $@
 
 ods2_dump_root: tools/ods2_dump_root.c $(VOLUME_SRCS) include/ods2_volume.h
 	$(CC) $(CFLAGS) $(SANFLAGS) tools/ods2_dump_root.c $(VOLUME_SRCS) -o $@

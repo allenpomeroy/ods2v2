@@ -94,3 +94,50 @@ bool ods2_bitmap_find_free(const uint8_t *bitmap, size_t total_bits,
 
     return false;
 }
+
+bool ods2_bitmap_find_largest_free(const uint8_t *bitmap, size_t total_bits,
+                                    size_t max_count, size_t *start_bit, size_t *found_count)
+{
+    size_t i;
+    size_t run_start = 0;
+    size_t run_len = 0;
+    bool in_run = false;
+    size_t best_start = 0;
+    size_t best_len = 0;
+
+    if (max_count == 0) {
+        return false;
+    }
+
+    for (i = 0; i < total_bits; i++) {
+        if (bit_is_set(bitmap, i)) {
+            if (!in_run) {
+                run_start = i;
+                in_run = true;
+                run_len = 0;
+            }
+            run_len++;
+            if (run_len > best_len) {
+                best_len = run_len;
+                best_start = run_start;
+                if (best_len >= max_count) {
+                    best_len = max_count; /* cap - never report more
+                                              than the caller asked for,
+                                              matching ods2_bitmap_find_free's
+                                              own contract */
+                    break;
+                }
+            }
+        } else {
+            in_run = false;
+            run_len = 0;
+        }
+    }
+
+    if (best_len == 0) {
+        return false; /* no free bit anywhere - genuinely full */
+    }
+    *start_bit = best_start;
+    *found_count = best_len;
+    return true;
+}

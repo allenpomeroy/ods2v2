@@ -349,6 +349,11 @@ than linking against a system library like GNU Readline - keeps `make`
 working identically on every platform with no separate install step.
 FYI, the vanilla linenoise doesn't appear to support Ctrl-R reverse search.
 
+## Updates
+
+LispEngineer found a silent failure when directories have more than 512
+files.  Thanks for the discovery!
+
 ## License
 
 MIT - see LICENSE. Applies to this project's own code; the BSD copy of

@@ -42,7 +42,7 @@ int main(int argc, char **argv)
     ods2_result_t r;
     ods2_fid_t dir_fid;
     uint8_t dir_header[512];
-    ods2_dir_entry_t entries[512];
+    ods2_dir_entry_t *entries = NULL;
     int count = 0;
     int i;
     int shown = 0;
@@ -80,8 +80,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    r = ods2_list_directory(&vol, dir_header, entries,
-                             sizeof(entries) / sizeof(entries[0]), &count);
+    r = ods2_list_directory_alloc(&vol, dir_header, &entries, &count);
     if (!r.ok) {
         fprintf(stderr, "could not list directory: %s\n", r.problem);
         ods2_dismount(&vol);
@@ -96,6 +95,8 @@ int main(int argc, char **argv)
     }
     printf("\nTotal of %d file%s.\n", shown, (shown == 1) ? "" : "s");
 
+    free(entries);
     ods2_dismount(&vol);
     return 0;
 }
+

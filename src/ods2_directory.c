@@ -78,8 +78,10 @@ int ods2_parse_directory(const uint8_t *data, size_t len,
             entries_out[count].fid.fid_seq = read_word(data + entry_start + 4);
             entries_out[count].fid.fid_rvn = data[entry_start + 6];
             entries_out[count].fid.fid_nmx = data[entry_start + 7];
-            count++;
         }
+        /* Counted even when not stored, so the caller can detect
+           truncation (see ods2_directory.h). */
+        count++;
 
         pos += record_total;
     }

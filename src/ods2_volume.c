@@ -389,14 +389,23 @@ ods2_result_t ods2_decode_all_extents(ods2_volume_t *vol, const uint8_t *header,
                 "(possibly corrupted or circular ext_fid chain)");
 }
 
-ods2_result_t ods2_list_directory(ods2_volume_t *vol, const uint8_t *dir_header,
-                                   ods2_dir_entry_t *entries_out, size_t max_entries,
-                                   int *count_out)
+/* Walks every entry of a directory, one block at a time, handing each
+   entry to `visit`. `visit` returns false to stop early (e.g. a name
+   lookup that has found its match). Each block is parsed into a
+   buffer sized for the most records a block can physically hold, so
+   nothing is ever dropped here regardless of directory size - the
+   caller decides what to keep. This is the one place that reads
+   directory blocks; ods2_list_directory(), ods2_list_directory_alloc(),
+   ods2_count_directory_entries() and ods2_lookup_name() are all thin
+   visitors on top of it. */
+typedef bool (*dir_visit_fn)(const ods2_dir_entry_t *entry, void *ctx);
+
+static ods2_result_t walk_directory(ods2_volume_t *vol, const uint8_t *dir_header,
+                                    dir_visit_fn visit, void *ctx)
 {
     ods2_extent_t extents[ODS2_MAX_EXTENTS];
     int extent_count;
     unsigned total_blocks = 0, block_index;
-    int total_found = 0;
     int i;
     ods2_result_t r = ods2_decode_all_extents(vol, dir_header, extents, ODS2_MAX_EXTENTS, &extent_count);
 
@@ -408,14 +417,13 @@ ods2_result_t ods2_list_directory(ods2_volume_t *vol, const uint8_t *dir_header,
 
     for (block_index = 1; block_index <= total_blocks; block_index++) {
         uint8_t block[512];
+        ods2_dir_entry_t block_entries[ODS2_DIR_MAX_ENTRIES_PER_BLOCK];
         int n;
         r = ods2_read_file_block(vol, dir_header, block_index, block);
         if (!r.ok) return r;
 
-        n = ods2_parse_directory(block, sizeof(block),
-                                  entries_out + total_found,
-                                  (max_entries > (size_t) total_found)
-                                      ? max_entries - (size_t) total_found : 0);
+        n = ods2_parse_directory(block, sizeof(block), block_entries,
+                                  ODS2_DIR_MAX_ENTRIES_PER_BLOCK);
         if (n < 0) {
             /* Malformed block content is a real problem, but an
                entirely EMPTY block (all zero, size word 0x0000) just
@@ -423,10 +431,122 @@ ods2_result_t ods2_list_directory(ods2_volume_t *vol, const uint8_t *dir_header,
                multi-block directory - not every block need be full. */
             continue;
         }
-        total_found += n;
+        if (n > ODS2_DIR_MAX_ENTRIES_PER_BLOCK) {
+            /* Can't happen for anything ods2_parse_directory() accepts
+               (see ODS2_DIR_MAX_ENTRIES_PER_BLOCK), but refuse loudly
+               rather than silently drop entries if it ever does. */
+            return fail("directory block holds more records than is physically possible");
+        }
+        for (i = 0; i < n; i++) {
+            if (!visit(&block_entries[i], ctx)) return ok();
+        }
     }
+    return ok();
+}
 
-    *count_out = total_found;
+/* --- ods2_list_directory(): caller-supplied fixed buffer --- */
+typedef struct {
+    ods2_dir_entry_t *entries;
+    size_t max;
+    size_t total;
+} fixed_list_ctx_t;
+
+static bool visit_fixed_list(const ods2_dir_entry_t *entry, void *ctx_)
+{
+    fixed_list_ctx_t *ctx = (fixed_list_ctx_t *) ctx_;
+    if (ctx->total < ctx->max) ctx->entries[ctx->total] = *entry;
+    ctx->total++; /* keep counting past max so overflow is detectable */
+    return true;
+}
+
+ods2_result_t ods2_list_directory(ods2_volume_t *vol, const uint8_t *dir_header,
+                                   ods2_dir_entry_t *entries_out, size_t max_entries,
+                                   int *count_out)
+{
+    fixed_list_ctx_t ctx;
+    ods2_result_t r;
+
+    ctx.entries = entries_out;
+    ctx.max = max_entries;
+    ctx.total = 0;
+    r = walk_directory(vol, dir_header, visit_fixed_list, &ctx);
+    if (!r.ok) return r;
+
+    *count_out = (int) ctx.total;
+    if (ctx.total > max_entries) {
+        /* Never silently truncate: report it, with *count_out set to
+           the directory's real size so the caller can resize and
+           retry (or use ods2_list_directory_alloc()). */
+        return fail("directory has more entries than the supplied buffer holds");
+    }
+    return ok();
+}
+
+/* --- ods2_list_directory_alloc(): grows to fit --- */
+typedef struct {
+    ods2_dir_entry_t *entries;
+    size_t count;
+    size_t capacity;
+    bool out_of_memory;
+} alloc_list_ctx_t;
+
+static bool visit_alloc_list(const ods2_dir_entry_t *entry, void *ctx_)
+{
+    alloc_list_ctx_t *ctx = (alloc_list_ctx_t *) ctx_;
+    if (ctx->count == ctx->capacity) {
+        size_t new_cap = (ctx->capacity == 0) ? 64 : ctx->capacity * 2;
+        ods2_dir_entry_t *grown = realloc(ctx->entries, new_cap * sizeof(*grown));
+        if (grown == NULL) {
+            ctx->out_of_memory = true;
+            return false;
+        }
+        ctx->entries = grown;
+        ctx->capacity = new_cap;
+    }
+    ctx->entries[ctx->count++] = *entry;
+    return true;
+}
+
+ods2_result_t ods2_list_directory_alloc(ods2_volume_t *vol, const uint8_t *dir_header,
+                                         ods2_dir_entry_t **entries_out, int *count_out)
+{
+    alloc_list_ctx_t ctx;
+    ods2_result_t r;
+
+    ctx.entries = NULL;
+    ctx.count = 0;
+    ctx.capacity = 0;
+    ctx.out_of_memory = false;
+
+    *entries_out = NULL;
+    *count_out = 0;
+
+    r = walk_directory(vol, dir_header, visit_alloc_list, &ctx);
+    if (r.ok && ctx.out_of_memory) r = fail("out of memory listing directory");
+    if (!r.ok) {
+        free(ctx.entries);
+        return r;
+    }
+    *entries_out = ctx.entries;
+    *count_out = (int) ctx.count;
+    return ok();
+}
+
+/* --- ods2_count_directory_entries() --- */
+static bool visit_count(const ods2_dir_entry_t *entry, void *ctx_)
+{
+    (void) entry;
+    (*(size_t *) ctx_)++;
+    return true;
+}
+
+ods2_result_t ods2_count_directory_entries(ods2_volume_t *vol, const uint8_t *dir_header,
+                                            int *count_out)
+{
+    size_t total = 0;
+    ods2_result_t r = walk_directory(vol, dir_header, visit_count, &total);
+    if (!r.ok) return r;
+    *count_out = (int) total;
     return ok();
 }
 
@@ -574,35 +694,49 @@ ods2_result_t ods2_find_free_file_number(ods2_volume_t *vol, unsigned start_from
     return fail("no free header slot found within max_search range");
 }
 
+/* --- ods2_lookup_name(): streams the directory, no size limit --- */
+typedef struct {
+    const char *name;
+    ods2_fid_t fid;
+    bool found;
+} lookup_ctx_t;
+
+static bool visit_lookup(const ods2_dir_entry_t *entry, void *ctx_)
+{
+    lookup_ctx_t *ctx = (lookup_ctx_t *) ctx_;
+    /* Case-insensitive compare - VMS names are conventionally
+       uppercase on disk, but callers may pass either case. */
+    const char *a = entry->name;
+    const char *b = ctx->name;
+    while (*a && *b) {
+        if (toupper((unsigned char) *a) != toupper((unsigned char) *b)) return true;
+        a++; b++;
+    }
+    if (*a == '\0' && *b == '\0') {
+        ctx->fid = entry->fid;
+        ctx->found = true;
+        return false; /* stop walking */
+    }
+    return true;
+}
+
 ods2_result_t ods2_lookup_name(ods2_volume_t *vol, const uint8_t *dir_header,
                                 const char *name, ods2_fid_t *fid_out)
 {
-    ods2_dir_entry_t entries[256];
-    int count = 0;
-    ods2_result_t r = ods2_list_directory(vol, dir_header, entries, 256, &count);
-    int i;
+    /* Walks the directory block by block rather than listing it into
+       a fixed buffer first - an earlier version used a 256-entry
+       buffer here, so any name sorting after the 256th entry of its
+       directory was silently reported as "not found". */
+    lookup_ctx_t ctx;
+    ods2_result_t r;
 
+    ctx.name = name;
+    ctx.found = false;
+    r = walk_directory(vol, dir_header, visit_lookup, &ctx);
     if (!r.ok) return r;
-
-    for (i = 0; i < count; i++) {
-        /* Case-insensitive compare - VMS names are conventionally
-           uppercase on disk, but callers may pass either case. */
-        const char *a = entries[i].name;
-        const char *b = name;
-        bool match = true;
-        while (*a && *b) {
-            if (toupper((unsigned char) *a) != toupper((unsigned char) *b)) {
-                match = false;
-                break;
-            }
-            a++; b++;
-        }
-        if (match && *a == '\0' && *b == '\0') {
-            *fid_out = entries[i].fid;
-            return ok();
-        }
-    }
-    return fail("name not found in directory");
+    if (!ctx.found) return fail("name not found in directory");
+    *fid_out = ctx.fid;
+    return ok();
 }
 
 ods2_result_t ods2_lookup_path(ods2_volume_t *vol, const char *path, ods2_fid_t *fid_out)
@@ -1137,9 +1271,8 @@ ods2_result_t ods2_delete(ods2_volume_t *vol, unsigned dir_file_number, const ch
        contents (their headers would become unreachable but never
        freed - a real, if recoverable via ANALYZE/DISK, leak). */
     if (target_core->filechar & 0x2000u) { /* FH2$M_DIRECTORY, confirmed value */
-        ods2_dir_entry_t sub_entries[1];
         int sub_count = 0;
-        r = ods2_list_directory(vol, target_header, sub_entries, 1, &sub_count);
+        r = ods2_count_directory_entries(vol, target_header, &sub_count);
         if (!r.ok) return r;
         if (sub_count > 0) {
             return fail("directory is not empty - refusing to delete "

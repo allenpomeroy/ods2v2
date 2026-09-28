@@ -109,10 +109,28 @@ ods2_result_t ods2_lookup_name(ods2_volume_t *vol, const uint8_t *dir_header,
 ods2_result_t ods2_lookup_path(ods2_volume_t *vol, const char *path,
                                 ods2_fid_t *fid_out);
 
-/* Lists all entries in the directory whose header is `dir_header`. */
+/* Lists all entries in the directory whose header is `dir_header`
+   into a caller-supplied buffer of `max_entries`. Never truncates
+   silently: if the directory has more entries than fit, this returns
+   a failure, stores the first `max_entries`, and sets *count_out to
+   the directory's TOTAL entry count so the caller can size a buffer
+   and retry. For directories of unknown size prefer
+   ods2_list_directory_alloc(). */
 ods2_result_t ods2_list_directory(ods2_volume_t *vol, const uint8_t *dir_header,
                                    ods2_dir_entry_t *entries_out, size_t max_entries,
                                    int *count_out);
+
+/* Lists all entries in the directory whose header is `dir_header`
+   into a malloc'd array sized to fit, however large the directory.
+   On success *entries_out must be released with free() (it may be
+   NULL when *count_out is 0). On failure nothing needs freeing. */
+ods2_result_t ods2_list_directory_alloc(ods2_volume_t *vol, const uint8_t *dir_header,
+                                         ods2_dir_entry_t **entries_out, int *count_out);
+
+/* Counts the entries in the directory whose header is `dir_header`,
+   without storing them. */
+ods2_result_t ods2_count_directory_entries(ods2_volume_t *vol, const uint8_t *dir_header,
+                                            int *count_out);
 
 /* Decodes ALL of a file's extents, walking the ext_fid chain across
    extension headers if the file needs more than one. See

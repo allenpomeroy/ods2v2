@@ -754,10 +754,13 @@ int main(void)
         assert(r.ok);
 
         {
-            ods2_dir_entry_t entries[16];
+            /* Root has more than 16 entries by this point in the suite;
+               a fixed 16-slot listing used to truncate silently here
+               and only passed because these names sort early. */
+            ods2_dir_entry_t *entries = NULL;
             int count = 0, i;
             bool found_dir = false, found_file = false;
-            r = ods2_list_directory(&wvol, root_header, entries, 16, &count);
+            r = ods2_list_directory_alloc(&wvol, root_header, &entries, &count);
             assert(r.ok);
             for (i = 0; i < count; i++) {
                 if (strcmp(entries[i].name, "LOWERCASE.DIR") == 0) found_dir = true;
@@ -768,6 +771,7 @@ int main(void)
             }
             assert(found_dir);
             assert(found_file);
+            free(entries);
             printf("PASS: create_directory(\"lowercase\") and create_file(\"MixedCase.Txt\") "
                    "both stored fully uppercase (LOWERCASE.DIR, MIXEDCASE.TXT), "
                    "matching real VMS behavior\n");
@@ -811,6 +815,104 @@ int main(void)
         printf("PASS: a normal, wildcard-free name still creates successfully\n");
 
         ods2_dismount(&wvol);
+    }
+
+    /* --- Large-directory test: more entries than any old fixed  --- */
+    /* --- buffer (512 in DIR, 256 in name lookup). Regression for --- */
+    /* --- directories silently listing only their first 512      --- */
+    /* --- entries, and files past the 256th being "not found".   --- */
+    /* The synthetic disk's INDEXF.SYS only has room for about a      */
+    /* hundred more headers, so most entries are extra directory      */
+    /* names pointing at one real file's FID - exactly what the       */
+    /* listing and lookup code read, without needing 600 headers.     */
+    {
+        enum { N_ALIASES = 600 };
+        ods2_volume_t wvol;
+        uint8_t root_header[512], big_header[512], last_header[512];
+        ods2_fid_t big_fid, shared_fid, last_fid, found;
+        uint8_t content = 'x';
+        uint8_t last_content[] = "last file\n";
+        int i;
+
+        r = ods2_mount_write(DISK_PATH, &wvol);
+        assert(r.ok);
+        r = ods2_read_header(&wvol, 4, root_header);
+        assert(r.ok);
+        r = ods2_create_directory(&wvol, root_header, "BIGDIR", &big_fid);
+        assert(r.ok);
+
+        r = ods2_read_header(&wvol, big_fid.fid_num, big_header);
+        assert(r.ok);
+        r = ods2_create_file(&wvol, big_header, "A0000.TXT", &content, 1, 1, &shared_fid);
+        assert(r.ok);
+        for (i = 1; i < N_ALIASES; i++) {
+            char name[32];
+            snprintf(name, sizeof(name), "A%04d.TXT", i);
+            r = ods2_insert_into_directory(&wvol, big_fid.fid_num, name, 1, shared_fid);
+            assert(r.ok);
+        }
+        /* A real, distinct file that sorts after all 600 aliases. */
+        r = ods2_read_header(&wvol, big_fid.fid_num, big_header);
+        assert(r.ok);
+        r = ods2_create_file(&wvol, big_header, "ZZZLAST.TXT", last_content,
+                             sizeof(last_content) - 1, 1, &last_fid);
+        assert(r.ok);
+        ods2_dismount(&wvol);
+
+        {
+            ods2_volume_t rvol;
+            ods2_dir_entry_t *listed = NULL;
+            ods2_dir_entry_t small[16];
+            int listed_count = 0, counted = 0, small_count = 0;
+            uint8_t buf[64];
+            size_t got = 0;
+
+            r = ods2_mount(DISK_PATH, &rvol);
+            assert(r.ok);
+            r = ods2_read_header(&rvol, big_fid.fid_num, big_header);
+            assert(r.ok);
+
+            /* Full listing, dynamically sized. */
+            r = ods2_list_directory_alloc(&rvol, big_header, &listed, &listed_count);
+            assert(r.ok);
+            assert(listed_count == N_ALIASES + 1);
+            for (i = 0; i < N_ALIASES; i++) {
+                char name[32];
+                snprintf(name, sizeof(name), "A%04d.TXT", i);
+                assert(strcmp(listed[i].name, name) == 0); /* all present, sorted */
+            }
+            assert(strcmp(listed[N_ALIASES].name, "ZZZLAST.TXT") == 0);
+            free(listed);
+            printf("PASS: directory with %d entries lists completely (old limit: 512)\n",
+                   N_ALIASES + 1);
+
+            r = ods2_count_directory_entries(&rvol, big_header, &counted);
+            assert(r.ok && counted == N_ALIASES + 1);
+
+            /* Fixed buffer too small must fail loudly and report the
+               real size, never return a silently short list. */
+            r = ods2_list_directory(&rvol, big_header, small, 16, &small_count);
+            assert(!r.ok);
+            assert(small_count == N_ALIASES + 1);
+            printf("PASS: a too-small fixed buffer is reported as an error with the "
+                   "real entry count (%d), not silently truncated\n", small_count);
+
+            /* Lookup past the old 256-entry limit, then read it. */
+            r = ods2_lookup_name(&rvol, big_header, "zzzlast.txt", &found);
+            assert(r.ok);
+            assert(found.fid_num == last_fid.fid_num && found.fid_seq == last_fid.fid_seq);
+            r = ods2_read_header(&rvol, found.fid_num, last_header);
+            assert(r.ok);
+            r = ods2_read_file(&rvol, last_header, buf, sizeof(buf), &got);
+            assert(r.ok && got == sizeof(last_content) - 1);
+            assert(memcmp(buf, last_content, got) == 0);
+            r = ods2_lookup_name(&rvol, big_header, "A0599.TXT", &found);
+            assert(r.ok && found.fid_num == shared_fid.fid_num);
+            printf("PASS: names past the old 256-entry lookup limit resolve and read "
+                   "correctly\n");
+
+            ods2_dismount(&rvol);
+        }
     }
 
     ods2_dismount(&vol);

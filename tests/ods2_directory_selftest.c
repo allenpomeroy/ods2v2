@@ -91,6 +91,21 @@ int main(void)
     check(entries, 9,  "SECURITY.SYS", 10);
     check(entries, 10, "VOLSET.SYS",   6);
 
+    /* Truncation must be visible: with room for only 4 entries, the
+       parser stores 4 but still reports all 11 records it saw. An
+       earlier version returned 4 here, so every caller silently lost
+       entries 5-11 with no way to tell. */
+    {
+        ods2_dir_entry_t small[4];
+        int total = ods2_parse_directory(real_root_dir, sizeof(real_root_dir), small, 4);
+        assert(total == 11);
+        assert(strcmp(small[3].name, "BADLOG.SYS") == 0);
+        total = ods2_parse_directory(real_root_dir, sizeof(real_root_dir), NULL, 0);
+        assert(total == 11);
+        printf("PASS: parser reports all 11 records even when the buffer holds "
+               "only 4 (or none), so truncation is detectable\n");
+    }
+
     printf("\nods2_directory_selftest: all checks passed - full home block -> "
            "index file -> directory -> real filename chain verified against "
            "genuine disk bytes\n");

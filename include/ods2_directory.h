@@ -39,13 +39,27 @@ typedef struct {
     ods2_fid_t fid;
 } ods2_dir_entry_t;
 
+/* Upper bound on how many records one 512-byte directory block can
+ * physically hold: the smallest record ods2_parse_directory() accepts
+ * is 14 bytes (6-byte record header, empty name, one 8-byte version
+ * entry), and 512/14 < 40. Callers that parse block by block can use
+ * this to size a per-block buffer that never truncates. */
+#define ODS2_DIR_MAX_ENTRIES_PER_BLOCK 40
+
 /* Parses directory records starting at `data` (raw block bytes) for
  * up to `len` bytes, writing entries into `entries_out` (up to
  * `max_entries`). Stops at the first sentinel record (dir$size ==
- * 0xffff) or when `len` is exhausted. Returns the number of entries
- * found, or -1 if a record's declared size would run past `len`
- * (a genuinely malformed/truncated block - callers should treat this
- * as a real error, not a soft empty-directory case). */
+ * 0xffff) or when `len` is exhausted.
+ *
+ * Returns the TOTAL number of records found in the block - which can
+ * be larger than `max_entries`. Only the first `max_entries` are
+ * stored; a return value greater than `max_entries` is how a caller
+ * knows entries were dropped. (An earlier version returned only the
+ * number stored, which made truncation invisible to every caller.)
+ *
+ * Returns -1 if a record's declared size would run past `len` (a
+ * genuinely malformed/truncated block - callers should treat this as
+ * a real error, not a soft empty-directory case). */
 int ods2_parse_directory(const uint8_t *data, size_t len,
                           ods2_dir_entry_t *entries_out, size_t max_entries);
 

@@ -224,7 +224,7 @@ static int list_one_directory(ods2_volume_t *vol, const char *dir_path, const ch
 {
     uint8_t dir_header[512];
     ods2_fid_t dir_fid;
-    ods2_dir_entry_t entries[512];
+    ods2_dir_entry_t *entries = NULL;
     int count = 0, i, shown = 0;
     ods2_result_t r = resolve_dir(vol, dir_path, dir_header, &dir_fid);
 
@@ -232,7 +232,7 @@ static int list_one_directory(ods2_volume_t *vol, const char *dir_path, const ch
         fprintf(stderr, "%%ODS2-E-DIRERR, [%s]: %s\n", dir_path, r.problem);
         return -1;
     }
-    r = ods2_list_directory(vol, dir_header, entries, 512, &count);
+    r = ods2_list_directory_alloc(vol, dir_header, &entries, &count);
     if (!r.ok) {
         fprintf(stderr, "%%ODS2-E-LISTERR, [%s]: %s\n", dir_path, r.problem);
         return -1;
@@ -245,6 +245,7 @@ static int list_one_directory(ods2_volume_t *vol, const char *dir_path, const ch
         shown++;
     }
     printf("\nTotal of %d file%s.\n", shown, (shown == 1) ? "" : "s");
+    free(entries);
     return shown;
 }
 
@@ -270,7 +271,7 @@ static void list_directory_recursive(ods2_volume_t *vol, const char *dir_path, c
 {
     uint8_t dir_header[512];
     ods2_fid_t dir_fid;
-    ods2_dir_entry_t entries[512];
+    ods2_dir_entry_t *entries = NULL;
     int count = 0, i;
     ods2_result_t r;
     int shown;
@@ -289,7 +290,7 @@ static void list_directory_recursive(ods2_volume_t *vol, const char *dir_path, c
 
     r = resolve_dir(vol, dir_path, dir_header, &dir_fid);
     if (!r.ok) return; /* already reported by list_one_directory above */
-    r = ods2_list_directory(vol, dir_header, entries, 512, &count);
+    r = ods2_list_directory_alloc(vol, dir_header, &entries, &count);
     if (!r.ok) return;
 
     for (i = 0; i < count; i++) {
@@ -332,6 +333,7 @@ static void list_directory_recursive(ods2_volume_t *vol, const char *dir_path, c
             }
         }
     }
+    free(entries);
 }
 
 static void cmd_dir(ods2_volume_t *vol, const ods2_parsed_path_t *p)

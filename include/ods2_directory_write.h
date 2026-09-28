@@ -48,14 +48,34 @@
 bool ods2_insert_dir_entry(uint8_t *block, size_t block_size,
                             const char *name, uint16_t version, ods2_fid_t fid);
 
-/* Removes the directory entry matching `name` (case-insensitive) from
- * `block`, shifting all following bytes (through the sentinel) back
- * to close the gap - the exact inverse of ods2_insert_dir_entry().
- * Returns true if a matching entry was found and removed, false if no
- * entry with that name exists in this block (callers checking
+/* Removes the whole directory RECORD matching `name` (case-
+ * insensitive) from `block` - the name and EVERY version it holds in
+ * this block - shifting all following bytes (through the sentinel)
+ * back to close the gap - the exact inverse of ods2_insert_dir_entry().
+ * Returns true if a matching record was found and removed, false if
+ * no record with that name exists in this block (callers checking
  * multiple blocks should treat false as "not in this one, try the
  * next" rather than an error).
+ *
+ * To delete one version of a file that may have several, use
+ * ods2_remove_dir_version() instead: removing the whole record would
+ * also drop the other versions' entries while their headers stay
+ * allocated.
  */
 bool ods2_remove_dir_entry(uint8_t *block, size_t block_size, const char *name);
+
+/* Removes just the (`version`, FID) pair of `name` (case-insensitive)
+ * from `block`, shrinking that record by 8 bytes and shifting all
+ * following bytes (through the sentinel) back to close the gap. If
+ * that pair was the record's only version, the whole record is
+ * removed instead. Other versions of the same name - in this record
+ * or in records in other blocks - are left untouched.
+ * Returns true if the pair was found and removed, false if this block
+ * has no record for `name` holding `version` (callers checking
+ * multiple blocks should treat false as "not in this one, try the
+ * next").
+ */
+bool ods2_remove_dir_version(uint8_t *block, size_t block_size, const char *name,
+                             uint16_t version);
 
 #endif /* ODS2_DIRECTORY_WRITE_H */

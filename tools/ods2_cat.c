@@ -26,18 +26,19 @@
  * (a TYPE/COPY-to-stdout equivalent). Binary-safe: writes raw bytes
  * to stdout, does not assume text content.
  *
- * Usage: ods2_cat <disk-image> <dir-path> <filename>
+ * Usage: ods2_cat <disk-image> <dir-path> <filename>[;version]
  *   ods2_cat transfer.dsk DECUS.NETLIB020 AAAREADME.DOC
+ *   ods2_cat transfer.dsk DECUS.NETLIB020 AAAREADME.DOC;2
  *   ods2_cat transfer.dsk "" INDEXF.SYS > indexf_copy.sys
+ *
+ * With no version (or ";" / ";0") the highest version is printed;
+ * ";-1" is the next lower existing version.
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "ods2_volume.h"
-
-/* 64MB cap - generous for a hobbyist-scale ODS-2 volume's individual
-   files, and avoids an unbounded allocation for a corrupted/malicious
-   header claiming an absurd efblk. */
-#define MAX_FILE_SIZE (64u * 1024u * 1024u)
+#include "ods2_path.h"
 
 int main(int argc, char **argv)
 {
@@ -46,12 +47,27 @@ int main(int argc, char **argv)
     ods2_fid_t dir_fid, file_fid;
     uint8_t dir_header[512], file_header[512];
     uint8_t *buf;
+    size_t buf_size;
     size_t bytes_read = 0;
+    char name[ODS2_PATH_MAX];
+    bool has_version, version_wildcard;
+    int version;
 
     if (argc != 4) {
-        fprintf(stderr, "usage: %s <disk-image> <dir-path> <filename>\n", argv[0]);
+        fprintf(stderr, "usage: %s <disk-image> <dir-path> <filename>[;version]\n", argv[0]);
         fprintf(stderr, "  dir-path is dot-separated, no brackets (empty string for root)\n");
         fprintf(stderr, "  example: %s transfer.dsk DECUS.NETLIB020 AAAREADME.DOC\n", argv[0]);
+        return 1;
+    }
+
+    if (strlen(argv[3]) >= sizeof(name)) {
+        fprintf(stderr, "%s: filename too long\n", argv[3]);
+        return 1;
+    }
+    strcpy(name, argv[3]);
+    if (!ods2_split_version(name, &has_version, &version_wildcard, &version) ||
+        version_wildcard) {
+        fprintf(stderr, "%s: bad version (expected ;N, ;, ;0 or ;-N)\n", argv[3]);
         return 1;
     }
 
@@ -75,7 +91,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    r = ods2_lookup_name(&vol, dir_header, argv[3], &file_fid);
+    r = ods2_lookup_name_version(&vol, dir_header, name, version, &file_fid, NULL);
     if (!r.ok) {
         fprintf(stderr, "%s: not found: %s\n", argv[3], r.problem);
         ods2_dismount(&vol);
@@ -89,14 +105,25 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    buf = malloc(MAX_FILE_SIZE);
+    /* Size the buffer from the file's own end-of-file mark (what
+       ods2_read_file() will return), after checking the header does
+       not claim more than the file actually has allocated - a
+       corrupt header must not drive an absurd allocation. */
+    buf_size = ods2_file_content_length(file_header);
+    if (buf_size > ods2_file_allocated_bytes(file_header)) {
+        fprintf(stderr, "%s: end-of-file mark lies beyond the file's allocated "
+                        "blocks (corrupt header?)\n", argv[3]);
+        ods2_dismount(&vol);
+        return 1;
+    }
+    buf = malloc(buf_size > 0 ? buf_size : 1);
     if (buf == NULL) {
-        fprintf(stderr, "could not allocate read buffer\n");
+        fprintf(stderr, "could not allocate %zu-byte read buffer\n", buf_size);
         ods2_dismount(&vol);
         return 1;
     }
 
-    r = ods2_read_file(&vol, file_header, buf, MAX_FILE_SIZE, &bytes_read);
+    r = ods2_read_file(&vol, file_header, buf, buf_size, &bytes_read);
     if (!r.ok) {
         fprintf(stderr, "could not read file content: %s\n", r.problem);
         free(buf);

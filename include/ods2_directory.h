@@ -39,27 +39,43 @@ typedef struct {
     ods2_fid_t fid;
 } ods2_dir_entry_t;
 
-/* Upper bound on how many records one 512-byte directory block can
- * physically hold: the smallest record ods2_parse_directory() accepts
- * is 14 bytes (6-byte record header, empty name, one 8-byte version
- * entry), and 512/14 < 40. Callers that parse block by block can use
- * this to size a per-block buffer that never truncates. */
-#define ODS2_DIR_MAX_ENTRIES_PER_BLOCK 40
+/* Upper bound on how many ENTRIES one 512-byte directory block can
+ * physically hold. An entry is one (name, version, FID) triple, and a
+ * directory record is one name followed by one or more 8-byte version
+ * entries (spec 4.2/4.3, newest version first). The densest possible
+ * block is a single record with an empty name: 6-byte record header
+ * plus 8 bytes per version, so at most (512-6)/8 = 63 entries. Every
+ * additional record only adds header bytes, so no block can hold
+ * more. Callers that parse block by block use this to size a
+ * per-block buffer that never truncates. */
+#define ODS2_DIR_MAX_ENTRIES_PER_BLOCK 63
+
+/* Highest file version ODS-2 allows (versions are 1..32767). */
+#define ODS2_MAX_VERSION 32767
 
 /* Parses directory records starting at `data` (raw block bytes) for
  * up to `len` bytes, writing entries into `entries_out` (up to
  * `max_entries`). Stops at the first sentinel record (dir$size ==
  * 0xffff) or when `len` is exhausted.
  *
- * Returns the TOTAL number of records found in the block - which can
+ * Produces ONE ENTRY PER VERSION, not one per record: a record holds
+ * a name followed by every (version, FID) pair that fits, newest
+ * first, and each pair becomes its own entry carrying the record's
+ * name. (An earlier version read only the first pair of each record,
+ * so a file with many versions showed up once per record - e.g. a
+ * 64-version file split across two records listed as 2 entries.)
+ * Entries come out in on-disk order: records sorted by name, and
+ * versions within a name newest first.
+ *
+ * Returns the TOTAL number of entries found in the block - which can
  * be larger than `max_entries`. Only the first `max_entries` are
  * stored; a return value greater than `max_entries` is how a caller
- * knows entries were dropped. (An earlier version returned only the
- * number stored, which made truncation invisible to every caller.)
+ * knows entries were dropped.
  *
- * Returns -1 if a record's declared size would run past `len` (a
- * genuinely malformed/truncated block - callers should treat this as
- * a real error, not a soft empty-directory case). */
+ * Returns -1 if a record's declared size would run past `len`, or a
+ * record holds no complete version entry (a genuinely malformed or
+ * truncated block - callers should treat this as a real error, not a
+ * soft empty-directory case). */
 int ods2_parse_directory(const uint8_t *data, size_t len,
                           ods2_dir_entry_t *entries_out, size_t max_entries);
 

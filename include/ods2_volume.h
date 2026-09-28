@@ -97,10 +97,34 @@ ods2_result_t ods2_write_header(ods2_volume_t *vol, unsigned file_number,
 ods2_result_t ods2_read_file_block(ods2_volume_t *vol, const uint8_t *header,
                                     unsigned vbn, uint8_t *block_out);
 
-/* Looks up `name` (case-insensitive, e.g. "NETLIB020.DIR") within the
-   directory whose header is `dir_header`, returning its FID. */
+/* Looks up `name` (case-insensitive, e.g. "NETLIB020.DIR", no
+   ";version") within the directory whose header is `dir_header`,
+   returning the FID of its HIGHEST version. Equivalent to
+   ods2_lookup_name_version(..., ODS2_VERSION_HIGHEST, ...). */
 ods2_result_t ods2_lookup_name(ods2_volume_t *vol, const uint8_t *dir_header,
                                 const char *name, ods2_fid_t *fid_out);
+
+/* Version selectors for ods2_lookup_name_version() and
+   ods2_delete_version(), following VMS file-specification rules:
+     > 0   that exact version (1..32767)
+     0     the highest existing version (VMS "NAME;" or "NAME;0")
+     < 0   relative to the highest existing version: -1 is the next
+           lower EXISTING version, -2 the one below that, and so on
+           (VMS "NAME;-1"). Counts existing versions, not numbers, so
+           gaps (e.g. ;7 and ;3 only) are skipped over. */
+#define ODS2_VERSION_HIGHEST 0
+
+/* Looks up one version of `name` (case-insensitive, no ";version")
+   within the directory whose header is `dir_header`, selected by
+   `version` (see ODS2_VERSION_HIGHEST above). On success returns the
+   FID and, if `version_out` is non-NULL, the actual version number
+   selected. Fails with "name not found in directory" if the name
+   does not exist at all, or "version not found" if it does but the
+   selected version does not. Handles names whose versions span
+   several directory records and blocks. */
+ods2_result_t ods2_lookup_name_version(ods2_volume_t *vol, const uint8_t *dir_header,
+                                        const char *name, int version,
+                                        ods2_fid_t *fid_out, uint16_t *version_out);
 
 /* Splits a VMS-style directory path (e.g. "DECUS.NETLIB020", no
    brackets) on '.' and walks from the root directory (FID 4,4),
@@ -150,6 +174,24 @@ ods2_result_t ods2_decode_all_extents(ods2_volume_t *vol, const uint8_t *header,
    ods2_list_directory() for those. */
 ods2_result_t ods2_read_file(ods2_volume_t *vol, const uint8_t *header,
                               uint8_t *buf_out, size_t buf_size, size_t *bytes_read_out);
+
+/* Returns the number of bytes of logical content in the file whose
+   header is `header`, from its end-of-file mark: (EFBLK - 1) * 512 +
+   FFBYTE (spec 6.1.5/6.1.6). An EOF on a block boundary may be
+   recorded either as EFBLK=n+1/FFBYTE=0 (the preferred form, and
+   what VMS itself writes) or as EFBLK=n/FFBYTE=512; both give n*512.
+   EFBLK 0 is treated as an empty file. This is exactly how many bytes
+   ods2_read_file() returns, so callers can size its buffer to fit
+   rather than guess. It is not checked against the allocation here;
+   a corrupt header can claim more than the file's HIBLK blocks
+   (ods2_read_file() rejects that), so callers allocating from it
+   should check against HIBLK * 512 first - see
+   ods2_file_allocated_bytes(). */
+size_t ods2_file_content_length(const uint8_t *header);
+
+/* Returns the number of bytes the file's allocation can hold:
+   FAT$L_HIBLK * 512. */
+size_t ods2_file_allocated_bytes(const uint8_t *header);
 
 /* Finds a free file number for a new file, and the correct file
    sequence number to assign it (spec 5.1.7: seq=1 for a genuinely
@@ -265,5 +307,15 @@ ods2_result_t ods2_insert_into_directory(ods2_volume_t *vol, unsigned dir_file_n
  * this is not a transactional filesystem.
  */
 ods2_result_t ods2_delete(ods2_volume_t *vol, unsigned dir_file_number, const char *name);
+
+/* Same as ods2_delete(), for one version of `name` selected by
+ * `version` (see ODS2_VERSION_HIGHEST). Only that version's
+ * (version, FID) entry is removed from the directory; the name's
+ * other versions stay listed and readable. ods2_delete() is this
+ * with ODS2_VERSION_HIGHEST. If `version_out` is non-NULL it receives
+ * the actual version number deleted.
+ */
+ods2_result_t ods2_delete_version(ods2_volume_t *vol, unsigned dir_file_number,
+                                  const char *name, int version, uint16_t *version_out);
 
 #endif /* ODS2_VOLUME_H */

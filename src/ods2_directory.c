@@ -45,6 +45,15 @@ int ods2_parse_directory(const uint8_t *data, size_t len,
             /* Sentinel: end of records in this block. */
             break;
         }
+        if (size == 0) {
+            /* No real record can have dir$size 0 (the smallest is 12:
+               header, empty name, one version entry). Zeroed bytes
+               mean an unused block, or unused space after the last
+               record of a block that has no sentinel - either way,
+               the end of records, not a malformed block. Treating it
+               as malformed would discard the records before it. */
+            break;
+        }
 
         /* dir$size excludes itself (verified against real data: a
            record with header(6)+name(10)+entry(8)=24 total bytes
@@ -67,21 +76,33 @@ int ods2_parse_directory(const uint8_t *data, size_t len,
             return -1;
         }
 
-        if (count < max_entries) {
+        /* Every complete 8-byte (version, FID) pair up to the end of
+           the record is a separate version of this name - the spec
+           says their count is deduced from the record's byte count.
+           Any trailing bytes too short to be a whole pair are
+           ignored. */
+        {
+            size_t record_end = pos + record_total;
+            size_t e;
             size_t copy_len = namecount;
             if (copy_len > ODS2_DIR_MAX_NAME) copy_len = ODS2_DIR_MAX_NAME;
-            memcpy(entries_out[count].name, data + name_start, copy_len);
-            entries_out[count].name[copy_len] = '\0';
 
-            entries_out[count].version = read_word(data + entry_start);
-            entries_out[count].fid.fid_num = read_word(data + entry_start + 2);
-            entries_out[count].fid.fid_seq = read_word(data + entry_start + 4);
-            entries_out[count].fid.fid_rvn = data[entry_start + 6];
-            entries_out[count].fid.fid_nmx = data[entry_start + 7];
+            for (e = entry_start; e + 8 <= record_end; e += 8) {
+                if (count < max_entries) {
+                    memcpy(entries_out[count].name, data + name_start, copy_len);
+                    entries_out[count].name[copy_len] = '\0';
+
+                    entries_out[count].version = read_word(data + e);
+                    entries_out[count].fid.fid_num = read_word(data + e + 2);
+                    entries_out[count].fid.fid_seq = read_word(data + e + 4);
+                    entries_out[count].fid.fid_rvn = data[e + 6];
+                    entries_out[count].fid.fid_nmx = data[e + 7];
+                }
+                /* Counted even when not stored, so the caller can
+                   detect truncation (see ods2_directory.h). */
+                count++;
+            }
         }
-        /* Counted even when not stored, so the caller can detect
-           truncation (see ods2_directory.h). */
-        count++;
 
         pos += record_total;
     }

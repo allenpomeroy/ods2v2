@@ -78,8 +78,8 @@ implements basic command recall to ease repetitive command sequences.
 | `DIR [path...] [wildcard]` | `DIR [...]*.*` — recursive, VMS's `...` notation |
 | `CREATE/DIRECTORY path` | `CREATE/DIRECTORY [DECUS.NETLIB020]` |
 | `COPY <local-file> <path>` | `COPY readme.txt [DECUS]README.TXT` |
-| `TYPE path` | `TYPE [DECUS]README.TXT` |
-| `DELETE path` | `DELETE [DECUS]OLDFILE.TXT` |
+| `TYPE path` | `TYPE [DECUS]README.TXT;2` |
+| `DELETE path` | `DELETE [DECUS]OLDFILE.TXT;1` |
 | `SET DEFAULT path` | `SET DEFAULT [DECUS.NETLIB020]` |
 | `SHOW DEFAULT` | |
 | `HELP` | |
@@ -94,6 +94,15 @@ no brackets are relative to the current default directory (see `SET
 DEFAULT`); `[-]` means "up one level" (`[-.-]` for more); other
 bracketed paths are absolute from root. Names are automatically
 uppercased on creation, matching real VMS storage.
+
+File versions follow VMS rules too. `NAME;3` is version 3; `NAME`,
+`NAME;` and `NAME;0` mean the highest version; `NAME;-1` is the next
+lower existing version; `NAME;*` means every version (`DIR` and
+`DELETE`). `DIR` lists every version of every file unless you give a
+version (`DIR [DECUS]*.*;` shows just the newest of each). `DELETE`
+removes one version - the one given, or the highest if none is - and
+`DELETE NAME;*` removes them all. `COPY` onto the disk always creates
+version 1 and refuses a name that already exists.
 
 ### A simple example
 
@@ -177,6 +186,11 @@ in every structural test.
   and how to get a real, ready-to-use volume instead.
 - Files are capped around 9.5MB (a consequence of the extension-header
   limitation above).
+- `COPY` can't add a new version of an existing file - it creates
+  version 1 of a new name only.
+- INDEXF.SYS is never extended, so the number of new files is limited
+  by how many free headers the volume already has. The bundled empty
+  starter volume has room for only a handful.
 
 ## Dependencies
 

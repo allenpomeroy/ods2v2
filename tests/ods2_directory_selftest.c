@@ -67,6 +67,48 @@ static void check(ods2_dir_entry_t *entries, int idx, const char *name, unsigned
            entries[idx].fid.fid_seq, entries[idx].fid.fid_rvn);
 }
 
+
+/* Appends one directory record at `pos` in `block`: `name`, then
+   `n` (version, FID) pairs, newest first as VMS stores them. FID
+   number for each version is fid_base + version, so tests can tell
+   exactly which pair an entry came from. Returns the position just
+   past the record. Layout per spec 4.2/4.3, the same as the real
+   records above: dir$size (excludes itself), verlimit, flags,
+   namecount, name padded to even length, then 8-byte pairs. */
+static size_t put_record(uint8_t *block, size_t pos, const char *name,
+                         const uint16_t *versions, int n, uint16_t fid_base)
+{
+    size_t namelen = strlen(name);
+    size_t padded = namelen + (namelen % 2);
+    size_t total = 6 + padded + 8u * (size_t) n;
+    size_t e = pos + 6 + padded;
+    int i;
+
+    block[pos] = (uint8_t) ((total - 2) & 0xff);
+    block[pos + 1] = (uint8_t) ((total - 2) >> 8);
+    block[pos + 2] = 1; block[pos + 3] = 0;  /* verlimit */
+    block[pos + 4] = 0;                      /* flags */
+    block[pos + 5] = (uint8_t) namelen;
+    memcpy(block + pos + 6, name, namelen);
+    if (padded > namelen) block[pos + 6 + namelen] = 0;
+    for (i = 0; i < n; i++, e += 8) {
+        uint16_t fnum = (uint16_t) (fid_base + versions[i]);
+        block[e] = (uint8_t) (versions[i] & 0xff);
+        block[e + 1] = (uint8_t) (versions[i] >> 8);
+        block[e + 2] = (uint8_t) (fnum & 0xff);
+        block[e + 3] = (uint8_t) (fnum >> 8);
+        block[e + 4] = 1; block[e + 5] = 0;  /* fid_seq */
+        block[e + 6] = 0; block[e + 7] = 0;  /* rvn, nmx */
+    }
+    return pos + total;
+}
+
+static void put_sentinel(uint8_t *block, size_t pos)
+{
+    block[pos] = 0xff;
+    block[pos + 1] = 0xff;
+}
+
 int main(void)
 {
     ods2_dir_entry_t entries[16];
@@ -104,6 +146,91 @@ int main(void)
         assert(total == 11);
         printf("PASS: parser reports all 11 records even when the buffer holds "
                "only 4 (or none), so truncation is detectable\n");
+    }
+
+    /* --- Issue #4: one entry per VERSION, not one per record --- */
+    {
+        uint8_t block[512];
+        ods2_dir_entry_t e[16];
+        static const uint16_t a_versions[] = {3, 2, 1};
+        static const uint16_t b_versions[] = {1};
+        size_t pos = 0;
+        int total;
+
+        memset(block, 0, sizeof(block));
+        pos = put_record(block, pos, "A.TXT", a_versions, 3, 100);
+        pos = put_record(block, pos, "B.TXT", b_versions, 1, 200);
+        put_sentinel(block, pos);
+
+        total = ods2_parse_directory(block, sizeof(block), e, 16);
+        assert(total == 4);
+        assert(strcmp(e[0].name, "A.TXT") == 0 && e[0].version == 3 && e[0].fid.fid_num == 103);
+        assert(strcmp(e[1].name, "A.TXT") == 0 && e[1].version == 2 && e[1].fid.fid_num == 102);
+        assert(strcmp(e[2].name, "A.TXT") == 0 && e[2].version == 1 && e[2].fid.fid_num == 101);
+        assert(strcmp(e[3].name, "B.TXT") == 0 && e[3].version == 1 && e[3].fid.fid_num == 201);
+        printf("PASS: a 3-version record parses as 3 entries (newest first, each with "
+               "its own FID), followed by the next record\n");
+
+        /* Truncation still detectable when it happens mid-record. */
+        total = ods2_parse_directory(block, sizeof(block), e, 2);
+        assert(total == 4);
+        assert(e[1].version == 2);
+        printf("PASS: truncation part-way through a record's versions is still "
+               "reported (4 entries seen, 2 stored)\n");
+    }
+
+    /* The densest possible block - one record, empty name, as many
+       versions as fit before the sentinel - must fit exactly in
+       ODS2_DIR_MAX_ENTRIES_PER_BLOCK, which walk_directory() relies
+       on to never drop entries. */
+    {
+        uint8_t block[512];
+        ods2_dir_entry_t e[ODS2_DIR_MAX_ENTRIES_PER_BLOCK];
+        uint16_t versions[ODS2_DIR_MAX_ENTRIES_PER_BLOCK];
+        size_t pos;
+        int i, total;
+
+        for (i = 0; i < ODS2_DIR_MAX_ENTRIES_PER_BLOCK; i++) {
+            versions[i] = (uint16_t) (ODS2_DIR_MAX_ENTRIES_PER_BLOCK - i);
+        }
+        memset(block, 0, sizeof(block));
+        pos = put_record(block, 0, "", versions, ODS2_DIR_MAX_ENTRIES_PER_BLOCK, 0);
+        assert(pos == 510); /* 6 + 63*8 */
+        put_sentinel(block, pos);
+        total = ods2_parse_directory(block, sizeof(block), e, ODS2_DIR_MAX_ENTRIES_PER_BLOCK);
+        assert(total == ODS2_DIR_MAX_ENTRIES_PER_BLOCK);
+        assert(e[0].version == ODS2_DIR_MAX_ENTRIES_PER_BLOCK && e[62].version == 1);
+        printf("PASS: densest possible block holds exactly %d entries = "
+               "ODS2_DIR_MAX_ENTRIES_PER_BLOCK\n", total);
+    }
+
+    /* Records followed by zeroed space with no sentinel: the records
+       must still be returned (an earlier version reported the whole
+       block as malformed, discarding them). */
+    {
+        uint8_t block[512];
+        ods2_dir_entry_t e[4];
+        static const uint16_t v[] = {7, 5};
+
+        memset(block, 0, sizeof(block));
+        (void) put_record(block, 0, "LOG.TXT", v, 2, 0);
+        assert(ods2_parse_directory(block, sizeof(block), e, 4) == 2);
+        assert(e[0].version == 7 && e[1].version == 5);
+        memset(block, 0, sizeof(block));
+        assert(ods2_parse_directory(block, sizeof(block), e, 4) == 0);
+        printf("PASS: zeroed space after the last record (no sentinel) ends the "
+               "block instead of discarding it; an all-zero block is empty\n");
+    }
+
+    /* A record with a name but no complete version pair is malformed. */
+    {
+        uint8_t block[512];
+        ods2_dir_entry_t e[4];
+        memset(block, 0, sizeof(block));
+        (void) put_record(block, 0, "ODD.TXT", NULL, 0, 0);
+        put_sentinel(block, 14);
+        assert(ods2_parse_directory(block, sizeof(block), e, 4) == -1);
+        printf("PASS: a record with no version entry is rejected as malformed\n");
     }
 
     printf("\nods2_directory_selftest: all checks passed - full home block -> "

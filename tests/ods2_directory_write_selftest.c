@@ -28,6 +28,38 @@
 #include "ods2_directory_write.h"
 #include "ods2_directory.h"
 
+
+/* Appends one directory record (name + n version pairs, newest
+   first) at `pos`; FID number = fid_base + version. See the same
+   helper in ods2_directory_selftest.c. Returns the end position. */
+static size_t put_record(uint8_t *block, size_t pos, const char *name,
+                         const uint16_t *versions, int n, uint16_t fid_base)
+{
+    size_t namelen = strlen(name);
+    size_t padded = namelen + (namelen % 2);
+    size_t total = 6 + padded + 8u * (size_t) n;
+    size_t e = pos + 6 + padded;
+    int i;
+
+    block[pos] = (uint8_t) ((total - 2) & 0xff);
+    block[pos + 1] = (uint8_t) ((total - 2) >> 8);
+    block[pos + 2] = 1; block[pos + 3] = 0;
+    block[pos + 4] = 0;
+    block[pos + 5] = (uint8_t) namelen;
+    memcpy(block + pos + 6, name, namelen);
+    if (padded > namelen) block[pos + 6 + namelen] = 0;
+    for (i = 0; i < n; i++, e += 8) {
+        uint16_t fnum = (uint16_t) (fid_base + versions[i]);
+        block[e] = (uint8_t) (versions[i] & 0xff);
+        block[e + 1] = (uint8_t) (versions[i] >> 8);
+        block[e + 2] = (uint8_t) (fnum & 0xff);
+        block[e + 3] = (uint8_t) (fnum >> 8);
+        block[e + 4] = 1; block[e + 5] = 0;
+        block[e + 6] = 0; block[e + 7] = 0;
+    }
+    return pos + total;
+}
+
 int main(void)
 {
     uint8_t block[512];
@@ -240,6 +272,82 @@ int main(void)
         printf("PASS: removing DECUS.DIR from real root directory data leaves "
                "the other 10 real entries intact and correctly sorted (INDEXF.SYS "
                "now directly followed by SECURITY.SYS)\n");
+    }
+
+    /* --- ods2_remove_dir_version(): delete ONE version (issue #5) --- */
+    {
+        uint8_t vb[512], before[512];
+        static const uint16_t a_versions[] = {3, 2, 1};
+        static const uint16_t b_versions[] = {1};
+        size_t pos;
+        ods2_fid_t cfid;
+
+        memset(vb, 0, sizeof(vb));
+        pos = put_record(vb, 0, "A.TXT", a_versions, 3, 100);
+        pos = put_record(vb, pos, "B.TXT", b_versions, 1, 200);
+        vb[pos] = 0xff; vb[pos + 1] = 0xff;
+
+        /* Middle version: record shrinks by 8, others untouched. */
+        assert(ods2_remove_dir_version(vb, sizeof(vb), "a.txt", 2));
+        n = ods2_parse_directory(vb, sizeof(vb), entries, 32);
+        assert(n == 3);
+        assert(strcmp(entries[0].name, "A.TXT") == 0 && entries[0].version == 3 &&
+               entries[0].fid.fid_num == 103);
+        assert(strcmp(entries[1].name, "A.TXT") == 0 && entries[1].version == 1 &&
+               entries[1].fid.fid_num == 101);
+        assert(strcmp(entries[2].name, "B.TXT") == 0 && entries[2].fid.fid_num == 201);
+        assert(vb[0] == 6 + 6 + 16 - 2); /* dir$size: header+name+2 pairs, minus itself */
+        printf("PASS: removing A.TXT;2 leaves A.TXT;3 and ;1 (with their own FIDs) "
+               "and B.TXT intact, record shrunk by one pair\n");
+
+        /* A version that is not there changes nothing. */
+        memcpy(before, vb, sizeof(vb));
+        assert(!ods2_remove_dir_version(vb, sizeof(vb), "A.TXT", 2));
+        assert(!ods2_remove_dir_version(vb, sizeof(vb), "NOPE.TXT", 1));
+        assert(memcmp(before, vb, sizeof(vb)) == 0);
+        printf("PASS: removing an absent version or name returns false and leaves "
+               "the block byte-for-byte unchanged\n");
+
+        /* Last remaining versions: the record itself goes. */
+        assert(ods2_remove_dir_version(vb, sizeof(vb), "A.TXT", 3));
+        assert(ods2_remove_dir_version(vb, sizeof(vb), "A.TXT", 1));
+        n = ods2_parse_directory(vb, sizeof(vb), entries, 32);
+        assert(n == 1 && strcmp(entries[0].name, "B.TXT") == 0);
+        printf("PASS: removing a name's last version removes its whole record\n");
+
+        /* The edited block is still a valid target for inserts. */
+        cfid.fid_num = 300; cfid.fid_seq = 1; cfid.fid_rvn = 0; cfid.fid_nmx = 0;
+        assert(ods2_insert_dir_entry(vb, sizeof(vb), "A.TXT", 1, cfid));
+        n = ods2_parse_directory(vb, sizeof(vb), entries, 32);
+        assert(n == 2 && strcmp(entries[0].name, "A.TXT") == 0 &&
+               strcmp(entries[1].name, "B.TXT") == 0);
+        printf("PASS: the block accepts a sorted insert after version removals\n");
+    }
+
+    /* A completely full block (one record filling all 512 bytes, so
+       no room for a sentinel): after removing a version the block
+       must end in a real sentinel, not zeros. */
+    {
+        uint8_t fb[512];
+        uint16_t versions[63];
+        int i;
+        for (i = 0; i < 63; i++) versions[i] = (uint16_t) (63 - i);
+        memset(fb, 0, sizeof(fb));
+        assert(put_record(fb, 0, "AB", versions, 63, 0) == 512);
+        n = ods2_parse_directory(fb, sizeof(fb), entries, 32);
+        assert(n == 63);
+
+        assert(ods2_remove_dir_version(fb, sizeof(fb), "AB", 40));
+        assert(fb[504] == 0xff && fb[505] == 0xff);
+        {
+            ods2_dir_entry_t all[63];
+            n = ods2_parse_directory(fb, sizeof(fb), all, 63);
+            assert(n == 62);
+            for (i = 0; i < n; i++) assert(all[i].version != 40);
+            assert(all[0].version == 63 && all[61].version == 1);
+        }
+        printf("PASS: removing a version from a completely full block (no "
+               "sentinel) writes a sentinel at the new end\n");
     }
 
     printf("\nods2_directory_write_selftest: all checks passed\n");

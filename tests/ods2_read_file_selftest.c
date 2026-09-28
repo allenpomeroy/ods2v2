@@ -42,6 +42,7 @@ static void build_synthetic_header(uint8_t *header, uint32_t content_lbn,
     core->idoffset = 20;  /* arbitrary, unused by these functions */
     core->mpoffset = 30;  /* map area starts at word 30 = byte 60 */
     core->map_inuse = 2;  /* one Format 1 extent = 2 words */
+    core->recattr.hiblk = ods2_word_swap32(block_count); /* allocation, as real headers record it */
     core->recattr.efblk = ods2_word_swap32(efblk);
     core->recattr.ffbyte = ffbyte;
 

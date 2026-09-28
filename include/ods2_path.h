@@ -79,6 +79,21 @@ typedef struct {
                                        since going "up" only makes
                                        sense relative to something. 0
                                        when no '-' notation was used. */
+    bool has_version;              /* was a ";version" given after the
+                                       filename? `filename` never
+                                       includes it either way. */
+    bool version_wildcard;         /* ";*" - every version */
+    int version;                   /* meaningful when has_version and
+                                       !version_wildcard: >0 an exact
+                                       version, 0 the highest (";" or
+                                       ";0"), <0 relative to the
+                                       highest (";-1" = next lower
+                                       existing version) - the same
+                                       selector ods2_lookup_name_version()
+                                       takes. 0 when has_version is
+                                       false, so passing it straight
+                                       through selects the highest
+                                       version, as VMS does. */
 } ods2_parsed_path_t;
 
 /* Parses `input` into `out`. Recognizes:
@@ -96,10 +111,27 @@ typedef struct {
  *   FILE.TXT                         -> dir_path="", filename="FILE.TXT", had_brackets=false, relative=true
  *   [DECUS]*.*                         -> dir_path="DECUS", filename="*.*"
  *   *.*                                  -> dir_path="", filename="*.*", had_brackets=false, relative=true
- * Returns false if `input` is too long to fit ODS2_PATH_MAX, or the
+ *   [DECUS]FILE.TXT;3              -> filename="FILE.TXT", has_version, version=3
+ *   [DECUS]FILE.TXT;  or ;0        -> filename="FILE.TXT", has_version, version=0 (highest)
+ *   [DECUS]FILE.TXT;-1             -> filename="FILE.TXT", has_version, version=-1
+ *   [DECUS]*.*;*                   -> filename="*.*", has_version, version_wildcard
+ * Returns false if `input` is too long to fit ODS2_PATH_MAX, the
  * bracket syntax is malformed (unmatched '[' or ']', or more than one
- * bracketed section).
+ * bracketed section), or the ";version" is malformed (see
+ * ods2_split_version()).
  */
 bool ods2_parse_path(const char *input, ods2_parsed_path_t *out);
+
+/* Splits an optional ";version" suffix off a filename in place:
+ * `name` is truncated at the ';' and the version is decoded into
+ * *has_version, *version_wildcard and *version with the same meanings
+ * as the ods2_parsed_path_t fields above. Accepts ";" (highest), ";*",
+ * ";N" for N in 1..32767, ";0", and ";-N" for N in 1..32767. Returns
+ * false - leaving `name` unchanged - for anything else after the ';'
+ * (non-digits, out-of-range numbers, a second ';'), or a version with
+ * no name in front of it. Used by ods2_parse_path(), and directly by
+ * tools that take a bare filename argument. */
+bool ods2_split_version(char *name, bool *has_version, bool *version_wildcard,
+                        int *version);
 
 #endif /* ODS2_PATH_H */

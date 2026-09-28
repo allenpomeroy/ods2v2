@@ -115,6 +115,66 @@ int main(void)
         printf("PASS: overlong input is correctly rejected\n");
     }
 
+    /* --- ";version" handling (issue #5) --- */
+    {
+        ods2_parsed_path_t p;
+
+        /* No version: filename untouched, "highest" selector. */
+        assert(ods2_parse_path("[GNU.LISP]YOW.ELC", &p));
+        assert(strcmp(p.filename, "YOW.ELC") == 0);
+        assert(!p.has_version && !p.version_wildcard && p.version == 0);
+
+        assert(ods2_parse_path("[GNU.LISP]YOW.ELC;1", &p));
+        assert(strcmp(p.dir_path, "GNU.LISP") == 0);
+        assert(strcmp(p.filename, "YOW.ELC") == 0);
+        assert(p.has_version && !p.version_wildcard && p.version == 1);
+
+        assert(ods2_parse_path("[HOME.USER1.SAVAGE]BUILD.COM;432", &p));
+        assert(strcmp(p.filename, "BUILD.COM") == 0 && p.version == 432);
+
+        assert(ods2_parse_path("[X]YOW.ELC;", &p));   /* highest */
+        assert(strcmp(p.filename, "YOW.ELC") == 0 && p.has_version && p.version == 0);
+        assert(ods2_parse_path("[X]YOW.ELC;0", &p));
+        assert(p.has_version && p.version == 0);
+        assert(ods2_parse_path("[X]YOW.ELC;-0", &p));
+        assert(p.has_version && p.version == 0);
+        assert(ods2_parse_path("[X]YOW.ELC;-1", &p));
+        assert(p.has_version && p.version == -1);
+        assert(ods2_parse_path("[X]*.*;*", &p));
+        assert(strcmp(p.filename, "*.*") == 0 && p.has_version && p.version_wildcard);
+        assert(ods2_parse_path("[X]A.B;32767", &p) && p.version == 32767);
+        assert(ods2_parse_path("[X]A.B;-32767", &p) && p.version == -32767);
+
+        /* No brackets: relative filename, version still split off. */
+        assert(ods2_parse_path("NOTES.TXT;2", &p));
+        assert(!p.had_brackets && p.relative);
+        assert(strcmp(p.filename, "NOTES.TXT") == 0 && p.version == 2);
+        printf("PASS: ;N, ;, ;0, ;-N and ;* are split off the filename and decoded\n");
+
+        assert(!ods2_parse_path("[X]A.B;32768", &p));  /* out of range */
+        assert(!ods2_parse_path("[X]A.B;-32768", &p));
+        assert(!ods2_parse_path("[X]A.B;1x", &p));
+        assert(!ods2_parse_path("[X]A.B;-", &p));
+        assert(!ods2_parse_path("[X]A.B;1;2", &p));
+        assert(!ods2_parse_path("[X]A.B;+1", &p));
+        assert(!ods2_parse_path("[X];1", &p));         /* version, no name */
+        assert(!ods2_parse_path(";1", &p));
+        printf("PASS: malformed or out-of-range versions are rejected\n");
+    }
+    {
+        char name[32];
+        bool hv, vw;
+        int v;
+        strcpy(name, "LOGIN.COM;7");
+        assert(ods2_split_version(name, &hv, &vw, &v));
+        assert(strcmp(name, "LOGIN.COM") == 0 && hv && !vw && v == 7);
+        strcpy(name, "LOGIN.COM;x");
+        assert(!ods2_split_version(name, &hv, &vw, &v));
+        assert(strcmp(name, "LOGIN.COM;x") == 0); /* unchanged on failure */
+        printf("PASS: ods2_split_version() works on a bare filename, and leaves "
+               "it unchanged on failure\n");
+    }
+
     printf("\nods2_path_selftest: all checks passed\n");
     return 0;
 }

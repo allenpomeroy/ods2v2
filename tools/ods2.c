@@ -44,7 +44,8 @@
  *   CREATE/DIRECTORY path         create a directory
  *   COPY <local-file> <path>      write a local file onto the disk
  *   TYPE path                     print a file's content
- *   DELETE path                   delete a file or empty directory
+ *   DELETE path                   delete a file (one version) or an
+ *                                 empty directory
  *   SET DEFAULT path              set the current default directory
  *   SHOW DEFAULT                  show the current default directory
  *   HELP                          show this command list
@@ -55,6 +56,11 @@
  * relative to the current default directory (see SET DEFAULT); '-'
  * means "go up one level" (repeat as "-.-" for more); other
  * bracketed paths are always absolute from root, matching real VMS.
+ *
+ * File versions follow VMS rules: NAME;3 is version 3, NAME; or NAME;0
+ * or plain NAME is the highest version, NAME;-1 the next lower
+ * existing version, and NAME;* every version (DIR and DELETE only).
+ * DIR lists every version unless a version is given.
  *
  * Interactive mode uses a vendored copy of linenoise (BSD licensed,
  * single .c/.h file, see third_party/linenoise/) for line editing and
@@ -100,6 +106,30 @@ static bool matches(const char *token, const char *name)
         }
     }
     return token[i] == '\0' && name[i] == '\0';
+}
+
+/* Case-insensitive equality of two directory entry names. */
+static bool same_name(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++) {
+        if (toupper((unsigned char) *a) != toupper((unsigned char) *b)) return false;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+/* Formats a parsed path's filename plus its ";version" exactly as
+   typed (";", ";*", ";3", ";-1"), for messages. */
+static void format_file_spec(const ods2_parsed_path_t *p, char *out, size_t out_size)
+{
+    if (!p->has_version) {
+        snprintf(out, out_size, "%s", p->filename);
+    } else if (p->version_wildcard) {
+        snprintf(out, out_size, "%s;*", p->filename);
+    } else if (p->version == 0) {
+        snprintf(out, out_size, "%s;", p->filename);
+    } else {
+        snprintf(out, out_size, "%s;%d", p->filename, p->version);
+    }
 }
 
 /* Combines a parsed path's dir_path/relative flag with the current
@@ -220,12 +250,23 @@ static void split_last_component(const char *dir_path, char *out_buf,
  * plain DIR command and the recursive one below use. `dir_path` here
  * is already fully resolved/absolute (from root), not a raw parsed
  * path - callers handle SET DEFAULT resolution before this. */
-static int list_one_directory(ods2_volume_t *vol, const char *dir_path, const char *pattern)
+/* Does entry `i` of a directory listing pass a DIR version filter?
+   `rank` is its position among its name's versions (0 = highest,
+   since they are stored newest first). */
+static bool version_selected(const ods2_parsed_path_t *p, const ods2_dir_entry_t *e, int rank)
+{
+    if (!p->has_version || p->version_wildcard) return true; /* all versions */
+    if (p->version > 0) return e->version == (unsigned) p->version;
+    return rank == -p->version; /* 0 = highest, -1 = next lower, ... */
+}
+
+static int list_one_directory(ods2_volume_t *vol, const char *dir_path, const char *pattern,
+                              const ods2_parsed_path_t *p)
 {
     uint8_t dir_header[512];
     ods2_fid_t dir_fid;
     ods2_dir_entry_t *entries = NULL;
-    int count = 0, i, shown = 0;
+    int count = 0, i, shown = 0, rank = 0;
     ods2_result_t r = resolve_dir(vol, dir_path, dir_header, &dir_fid);
 
     if (!r.ok) {
@@ -240,7 +281,11 @@ static int list_one_directory(ods2_volume_t *vol, const char *dir_path, const ch
 
     printf("\nDirectory [%s%s]\n\n", (dir_path[0] == '\0') ? "000000" : "", dir_path);
     for (i = 0; i < count; i++) {
+        /* Every version of a name is its own entry, newest first and
+           contiguous (a name's versions may span several records). */
+        rank = (i > 0 && same_name(entries[i].name, entries[i - 1].name)) ? rank + 1 : 0;
         if (!ods2_wildcard_match(pattern, entries[i].name)) continue;
+        if (!version_selected(p, &entries[i], rank)) continue;
         printf("%-20s;%u\n", entries[i].name, entries[i].version);
         shown++;
     }
@@ -267,6 +312,7 @@ static int list_one_directory(ods2_volume_t *vol, const char *dir_path, const ch
 #define MAX_RECURSION_DEPTH 50
 
 static void list_directory_recursive(ods2_volume_t *vol, const char *dir_path, const char *pattern,
+                                      const ods2_parsed_path_t *p,
                                       int *total_files, int *total_dirs, int depth)
 {
     uint8_t dir_header[512];
@@ -282,7 +328,7 @@ static void list_directory_recursive(ods2_volume_t *vol, const char *dir_path, c
         return;
     }
 
-    shown = list_one_directory(vol, dir_path, pattern);
+    shown = list_one_directory(vol, dir_path, pattern, p);
 
     if (shown < 0) return; /* error already reported */
     *total_files += shown;
@@ -303,6 +349,13 @@ static void list_directory_recursive(ods2_volume_t *vol, const char *dir_path, c
            descend into root via that entry causing an infinite loop. */
         if (entries[i].fid.fid_num == dir_fid.fid_num &&
             entries[i].fid.fid_seq == dir_fid.fid_seq) {
+            continue;
+        }
+        /* Only a name's highest version can be the subdirectory a
+           path like [A.B] refers to - older versions of a name are
+           never descended into (and would otherwise list the same
+           subtree more than once). */
+        if (i > 0 && same_name(entries[i].name, entries[i - 1].name)) {
             continue;
         }
 
@@ -329,7 +382,8 @@ static void list_directory_recursive(ods2_volume_t *vol, const char *dir_path, c
                         continue;
                     }
                 }
-                list_directory_recursive(vol, sub_path, pattern, total_files, total_dirs, depth + 1);
+                list_directory_recursive(vol, sub_path, pattern, p, total_files, total_dirs,
+                                         depth + 1);
             }
         }
     }
@@ -344,7 +398,7 @@ static void cmd_dir(ods2_volume_t *vol, const ods2_parsed_path_t *p)
 
     if (p->recursive) {
         int total_files = 0, total_dirs = 0;
-        list_directory_recursive(vol, effective_dir, pattern, &total_files, &total_dirs, 0);
+        list_directory_recursive(vol, effective_dir, pattern, p, &total_files, &total_dirs, 0);
         if (total_dirs > 0) {
             printf("\nGrand total of %d director%s, %d file%s.\n",
                    total_dirs, (total_dirs == 1) ? "y" : "ies",
@@ -356,7 +410,7 @@ static void cmd_dir(ods2_volume_t *vol, const ods2_parsed_path_t *p)
            too would misleadingly suggest a legitimately empty
            (rather than failed) subtree. */
     } else {
-        list_one_directory(vol, effective_dir, pattern);
+        list_one_directory(vol, effective_dir, pattern, p);
     }
 }
 
@@ -410,6 +464,18 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
         fprintf(stderr, "%%ODS2-E-BADPATH, no destination filename given\n");
         return;
     }
+    /* A new file is always created as version 1 here. Accept the
+       spellings that mean that on a new file ("NAME", "NAME;",
+       "NAME;0", "NAME;1") and refuse the rest, rather than ever
+       storing ";version" as part of the name. */
+    if (p->has_version &&
+        (p->version_wildcard || p->version < 0 || p->version > 1)) {
+        char spec[ODS2_PATH_MAX + 16];
+        format_file_spec(p, spec, sizeof(spec));
+        fprintf(stderr, "%%ODS2-E-BADVER, %s: COPY creates version 1 only - "
+                        "give NAME, NAME; or NAME;1\n", spec);
+        return;
+    }
     name = p->filename;
 
     f = fopen(local_file, "rb");
@@ -459,11 +525,17 @@ static void cmd_type(ods2_volume_t *vol, const ods2_parsed_path_t *p)
     ods2_fid_t dir_fid, file_fid;
     ods2_result_t r;
     uint8_t *buf;
-    size_t buf_size = 12u * 1024u * 1024u;
+    size_t buf_size;
     size_t bytes_read = 0;
+    char spec[ODS2_PATH_MAX + 16];
 
     if (p->filename[0] == '\0') {
         fprintf(stderr, "%%ODS2-E-BADPATH, no filename given\n");
+        return;
+    }
+    format_file_spec(p, spec, sizeof(spec));
+    if (p->version_wildcard) {
+        fprintf(stderr, "%%ODS2-E-BADVER, %s: TYPE takes one version, not ;*\n", spec);
         return;
     }
     {
@@ -475,9 +547,10 @@ static void cmd_type(ods2_volume_t *vol, const ods2_parsed_path_t *p)
         fprintf(stderr, "%%ODS2-E-DIRERR, %s\n", r.problem);
         return;
     }
-    r = ods2_lookup_name(vol, dir_header, p->filename, &file_fid);
+    /* p->version is 0 (highest) when no version was given. */
+    r = ods2_lookup_name_version(vol, dir_header, p->filename, p->version, &file_fid, NULL);
     if (!r.ok) {
-        fprintf(stderr, "%%ODS2-E-FNF, %s not found\n", p->filename);
+        fprintf(stderr, "%%ODS2-E-FNF, %s not found\n", spec);
         return;
     }
     r = ods2_read_header(vol, file_fid.fid_num, file_header);
@@ -485,9 +558,17 @@ static void cmd_type(ods2_volume_t *vol, const ods2_parsed_path_t *p)
         fprintf(stderr, "%%ODS2-E-READERR, %s\n", r.problem);
         return;
     }
-    buf = malloc(buf_size);
+    /* Sized from the file's own end-of-file mark rather than a fixed
+       guess, so any size of file can be typed. */
+    buf_size = ods2_file_content_length(file_header);
+    if (buf_size > ods2_file_allocated_bytes(file_header)) {
+        fprintf(stderr, "%%ODS2-E-READERR, %s: end-of-file mark lies beyond the "
+                        "file's allocated blocks (corrupt header?)\n", spec);
+        return;
+    }
+    buf = malloc(buf_size > 0 ? buf_size : 1);
     if (buf == NULL) {
-        fprintf(stderr, "%%ODS2-E-NOMEM, could not allocate read buffer\n");
+        fprintf(stderr, "%%ODS2-E-NOMEM, could not allocate %zu-byte read buffer\n", buf_size);
         return;
     }
     r = ods2_read_file(vol, file_header, buf, buf_size, &bytes_read);
@@ -510,6 +591,10 @@ static void cmd_delete(ods2_volume_t *vol, const ods2_parsed_path_t *p)
     char effective_path[ODS2_PATH_MAX];
     char split_buf[ODS2_PATH_MAX];
     char name_buf[ODS2_PATH_MAX];
+
+    int version = p->version; /* 0 (highest) when none was given */
+    uint16_t deleted_version = 0;
+    int deleted = 0;
 
     resolve_effective_path(p, effective_path, sizeof(effective_path));
 
@@ -540,12 +625,27 @@ static void cmd_delete(ods2_volume_t *vol, const ods2_parsed_path_t *p)
         fprintf(stderr, "%%ODS2-E-DIRERR, %s\n", r.problem);
         return;
     }
-    r = ods2_delete(vol, dir_fid.fid_num, name);
-    if (!r.ok) {
-        fprintf(stderr, "%%ODS2-E-DELETEERR, %s\n", r.problem);
-        return;
+
+    /* One version (the one selected, the highest by default), or with
+       ";*" every version - highest first, until none remain. */
+    do {
+        r = ods2_delete_version(vol, dir_fid.fid_num, name,
+                                p->version_wildcard ? ODS2_VERSION_HIGHEST : version,
+                                &deleted_version);
+        if (!r.ok) break;
+        printf("%%ODS2-I-DELETED, deleted %s;%u\n", name, deleted_version);
+        deleted++;
+    } while (p->version_wildcard);
+
+    if (!r.ok && !(p->version_wildcard && deleted > 0)) {
+        char spec[ODS2_PATH_MAX + 16];
+        if (p->filename[0] != '\0') {
+            format_file_spec(p, spec, sizeof(spec));
+        } else {
+            snprintf(spec, sizeof(spec), "%s", name);
+        }
+        fprintf(stderr, "%%ODS2-E-DELETEERR, %s: %s\n", spec, r.problem);
     }
-    printf("%%ODS2-I-DELETED, deleted %s\n", name);
 }
 
 static void print_help(void)
@@ -556,7 +656,7 @@ static void print_help(void)
            "  CREATE/DIRECTORY path      create a directory\n"
            "  COPY <local-file> <path>   write a local file onto the disk\n"
            "  TYPE path                  print a file's content\n"
-           "  DELETE path                delete a file or empty directory\n"
+           "  DELETE path                delete a file (one version) or empty directory\n"
            "  SET DEFAULT path           set the current default directory\n"
            "  SHOW DEFAULT               show the current default directory\n"
            "  HELP                       show this command list\n"
@@ -566,7 +666,11 @@ static void print_help(void)
            "[-], [-.SIBLING]) and bare filenames with no brackets at all are\n"
            "relative to the current default directory (see SET DEFAULT); '-'\n"
            "means \"go up one level\" (repeat as \"-.-\" for more); other bracketed\n"
-           "paths are always absolute from root, matching real VMS.\n");
+           "paths are always absolute from root, matching real VMS.\n"
+           "\n"
+           "Versions: NAME;3 is version 3; NAME, NAME; or NAME;0 the highest;\n"
+           "NAME;-1 the next lower existing version; NAME;* every version\n"
+           "(DIR and DELETE). DIR lists every version unless one is given.\n");
 }
 
 /* Splits `line` into up to MAX_TOKENS whitespace-separated tokens,
@@ -663,6 +767,11 @@ static bool execute_line(ods2_volume_t *vol, char *line)
         if (n > 2) {
             strncpy(p.filename, tokens[2], sizeof(p.filename) - 1);
             p.filename[sizeof(p.filename) - 1] = '\0';
+            if (!ods2_split_version(p.filename, &p.has_version,
+                                    &p.version_wildcard, &p.version)) {
+                fprintf(stderr, "%%ODS2-E-BADPATH, could not parse %s\n", tokens[2]);
+                return true;
+            }
         }
         cmd_dir(vol, &p);
         return true;

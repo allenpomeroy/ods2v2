@@ -192,3 +192,73 @@ bool ods2_remove_dir_entry(uint8_t *block, size_t block_size, const char *name)
 
     return true;
 }
+
+bool ods2_remove_dir_version(uint8_t *block, size_t block_size, const char *name,
+                             uint16_t version)
+{
+    size_t pos = 0;
+    size_t end_pos;
+    size_t record_pos = (size_t) -1;
+    size_t record_total = 0;
+    size_t pair_pos = (size_t) -1;
+
+    /* Find the record for `name` that holds `version`, remembering
+       where the used-content region ends (the sentinel, or where
+       scanning stops for lack of a real one). */
+    while (pos + 6 <= block_size) {
+        uint16_t size = read_word(block + pos);
+        size_t this_total;
+        uint8_t namecount;
+        if (size == 0xffff || size == 0) {
+            break;
+        }
+        this_total = (size_t) size + 2;
+        if (pos + this_total > block_size) {
+            return false; /* malformed - refuse to edit */
+        }
+        namecount = block[pos + 5];
+        if (pair_pos == (size_t) -1 &&
+            compare_names(block + pos + 6, namecount, name) == 0) {
+            size_t name_end = pos + 6 + namecount;
+            size_t e = name_end + (name_end % 2);
+            for (; e + 8 <= pos + this_total; e += 8) {
+                if (read_word(block + e) == version) {
+                    record_pos = pos;
+                    record_total = this_total;
+                    pair_pos = e;
+                    break;
+                }
+            }
+        }
+        pos += this_total;
+    }
+    end_pos = pos;
+
+    if (pair_pos == (size_t) -1) {
+        return false; /* not in this block */
+    }
+
+    {
+        size_t name_end = record_pos + 6 + block[record_pos + 5];
+        size_t first_pair = name_end + (name_end % 2);
+        size_t pair_count = (record_pos + record_total - first_pair) / 8;
+        size_t tail_end = (end_pos + 2 <= block_size) ? end_pos + 2 : block_size;
+
+        if (pair_count <= 1) {
+            /* Last version in this record: drop the record itself. */
+            return ods2_remove_dir_entry(block, block_size, name);
+        }
+
+        /* Close the 8-byte gap (through the sentinel's own 2 bytes),
+           shrink the record's dir$size, and zero the vacated tail so
+           it can never be misread as a further record. */
+        memmove(block + pair_pos, block + pair_pos + 8, tail_end - (pair_pos + 8));
+        memset(block + tail_end - 8, 0, 8);
+        write_word(block + record_pos, (uint16_t) (record_total - 8 - 2));
+        /* Content now ends 8 bytes earlier. Put a real sentinel there
+           even if the block was completely full and had none before,
+           so the zeroed tail is never parsed as a record. */
+        write_word(block + end_pos - 8, 0xffff);
+    }
+    return true;
+}

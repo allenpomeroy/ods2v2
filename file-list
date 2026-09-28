@@ -23,6 +23,8 @@
 ./tests/ods2_retrieval_selftest.c
 ./tests/ods2_validate_selftest.c
 ./tests/ods2_volume_selftest.c
+./tests/ods2_versions_selftest.c
+./tests/cli_versions_check.sh
 ./third_party/linenoise/linenoise.c
 ./third_party/linenoise/LICENSE
 ./third_party/linenoise/linenoise.h

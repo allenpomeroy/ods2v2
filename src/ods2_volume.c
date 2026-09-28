@@ -550,42 +550,66 @@ ods2_result_t ods2_count_directory_entries(ods2_volume_t *vol, const uint8_t *di
     return ok();
 }
 
-ods2_result_t ods2_read_file(ods2_volume_t *vol, const uint8_t *header,
-                              uint8_t *buf_out, size_t buf_size, size_t *bytes_read_out)
+size_t ods2_file_content_length(const uint8_t *header)
 {
     const ods2_head_core_t *core = (const ods2_head_core_t *) header;
     uint32_t efblk = ods2_word_swap32(core->recattr.efblk);
     uint16_t ffbyte = core->recattr.ffbyte;
-    size_t written = 0;
-    unsigned vbn;
 
+    /* Spec 6.1.5/6.1.6: EFBLK is the VBN holding the end-of-file
+       position and FFBYTE is the count of bytes in use in that block,
+       so the content is (EFBLK-1) full blocks plus FFBYTE bytes. An
+       EOF on a block boundary is EFBLK=n+1/FFBYTE=0 (preferred, and
+       what every real VMS header in samples/ uses - e.g. BADBLK.SYS,
+       empty: EFBLK=1 FFBYTE=0; a one-block directory: EFBLK=2
+       FFBYTE=0) or EFBLK=n/FFBYTE=512. An earlier version read
+       FFBYTE=0 as "the whole EFBLK block is in use", which returned
+       512 bytes of junk for empty files, one block too many for real
+       VMS files ending on a block boundary, and failed outright on a
+       file with no allocation at all such as BADBLK.SYS. */
     if (efblk == 0) {
-        /* Empty file. */
-        *bytes_read_out = 0;
-        return ok();
+        return 0; /* never written; no EOF mark at all */
+    }
+    if (ffbyte > 512) {
+        ffbyte = 512; /* out of range - never claim more than a block */
+    }
+    return (size_t) (efblk - 1) * 512u + ffbyte;
+}
+
+size_t ods2_file_allocated_bytes(const uint8_t *header)
+{
+    const ods2_head_core_t *core = (const ods2_head_core_t *) header;
+    return (size_t) ods2_word_swap32(core->recattr.hiblk) * 512u;
+}
+
+ods2_result_t ods2_read_file(ods2_volume_t *vol, const uint8_t *header,
+                              uint8_t *buf_out, size_t buf_size, size_t *bytes_read_out)
+{
+    size_t content_len = ods2_file_content_length(header);
+    size_t allocated = ods2_file_allocated_bytes(header);
+    size_t written = 0;
+    unsigned vbn = 1;
+
+    if (content_len > allocated) {
+        /* Corrupt header: the EOF mark claims more data than the file
+           has blocks. Say so, rather than fail later on an unmapped
+           VBN (or have a caller size a buffer from a bogus length). */
+        return fail("file's end-of-file mark lies beyond its allocated blocks");
+    }
+    if (content_len > buf_size) {
+        return fail("output buffer too small for file content");
     }
 
-    for (vbn = 1; vbn <= efblk; vbn++) {
+    while (written < content_len) {
         uint8_t block[512];
-        size_t this_block_bytes;
+        size_t this_block_bytes = content_len - written;
         ods2_result_t r = ods2_read_file_block(vol, header, vbn, block);
         if (!r.ok) return r;
 
-        if (vbn < efblk) {
-            this_block_bytes = 512;
-        } else {
-            /* Last block: ffbyte==0 means the whole block is valid
-               data (e.g. fixed-512-byte-record files, confirmed
-               against INDEXF.SYS's own real header), otherwise only
-               the first ffbyte bytes are. */
-            this_block_bytes = (ffbyte == 0) ? 512 : ffbyte;
-        }
-
-        if (written + this_block_bytes > buf_size) {
-            return fail("output buffer too small for file content");
-        }
+        if (this_block_bytes > 512) this_block_bytes = 512;
         memcpy(buf_out + written, block, this_block_bytes);
         written += this_block_bytes;
+        vbn++;
     }
 
     *bytes_read_out = written;
@@ -739,6 +763,85 @@ ods2_result_t ods2_lookup_name(ods2_volume_t *vol, const uint8_t *dir_header,
     return ok();
 }
 
+/* --- ods2_lookup_name_version(): one specific version of a name --- */
+
+/* Case-insensitive equality of two nul-terminated names. */
+static bool names_equal(const char *a, const char *b)
+{
+    while (*a && *b) {
+        if (toupper((unsigned char) *a) != toupper((unsigned char) *b)) return false;
+        a++; b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+typedef struct {
+    const char *name;
+    int version;         /* selector, see ODS2_VERSION_HIGHEST */
+    int seen;            /* versions of `name` seen so far */
+    bool name_found;
+    bool found;
+    ods2_fid_t fid;
+    uint16_t found_version;
+} version_lookup_ctx_t;
+
+static bool visit_lookup_version(const ods2_dir_entry_t *entry, void *ctx_)
+{
+    version_lookup_ctx_t *ctx = (version_lookup_ctx_t *) ctx_;
+
+    if (!names_equal(entry->name, ctx->name)) {
+        /* Directories are sorted by name, so every version of a name
+           is contiguous (even when split across several records and
+           blocks). Once past them there is nothing more to find. */
+        return !ctx->name_found;
+    }
+    ctx->name_found = true;
+
+    if (ctx->version > 0) {
+        if (entry->version == (unsigned) ctx->version) {
+            ctx->found = true;
+        }
+    } else {
+        /* Highest (0) or relative (-n): versions are stored newest
+           first, so the n-th one encountered (0-based) is the one
+           wanted - counting existing versions, as VMS does. */
+        if (ctx->seen == -ctx->version) {
+            ctx->found = true;
+        }
+    }
+    ctx->seen++;
+
+    if (ctx->found) {
+        ctx->fid = entry->fid;
+        ctx->found_version = entry->version;
+        return false; /* stop walking */
+    }
+    return true;
+}
+
+ods2_result_t ods2_lookup_name_version(ods2_volume_t *vol, const uint8_t *dir_header,
+                                        const char *name, int version,
+                                        ods2_fid_t *fid_out, uint16_t *version_out)
+{
+    version_lookup_ctx_t ctx;
+    ods2_result_t r;
+
+    if (version > ODS2_MAX_VERSION || version < -ODS2_MAX_VERSION) {
+        return fail("version number out of range (1..32767)");
+    }
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.name = name;
+    ctx.version = version;
+    r = walk_directory(vol, dir_header, visit_lookup_version, &ctx);
+    if (!r.ok) return r;
+    if (!ctx.name_found) return fail("name not found in directory");
+    if (!ctx.found) return fail("version not found");
+    *fid_out = ctx.fid;
+    if (version_out != NULL) *version_out = ctx.found_version;
+    return ok();
+}
+
 ods2_result_t ods2_lookup_path(ods2_volume_t *vol, const char *path, ods2_fid_t *fid_out)
 {
     ods2_fid_t current;
@@ -803,6 +906,10 @@ ods2_result_t ods2_create_directory(ods2_volume_t *vol, const uint8_t *parent_he
     }
     if (contains_wildcard(name)) {
         return fail("directory name cannot contain wildcard characters ('*' or '%')");
+    }
+    if (strchr(name, ';') != NULL) {
+        return fail("directory name cannot contain ';' (a version belongs in the "
+                    "directory entry, never in the name itself)");
     }
     if (strlen(name) + 4 >= sizeof(dirname)) {
         return fail("directory name too long");
@@ -918,6 +1025,12 @@ ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,
     if (contains_wildcard(name)) {
         return fail("file name cannot contain wildcard characters ('*' or '%')");
     }
+    if (strchr(name, ';') != NULL) {
+        /* A "NAME;VER" string stored as the name itself would create
+           an entry no VMS system can open. Callers split the version
+           off first (see ods2_path.h). */
+        return fail("file name cannot contain ';' - pass the name without its version");
+    }
     if (strlen(name) >= sizeof(upper_name)) {
         return fail("file name too long");
     }
@@ -1002,8 +1115,15 @@ ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,
     spec.extents = extents;
     spec.extent_count = extent_count;
     spec.hiblk = total_allocated;
-    spec.efblk = blocks_needed;
-    spec.ffbyte = (uint16_t) (content_len % 512); /* 0 correctly means "whole last block used" */
+    /* End-of-file mark per spec 6.1.5/6.1.6, in the preferred form
+       VMS itself writes: EFBLK is the VBN holding the EOF position,
+       FFBYTE the bytes in use there. Content ending exactly on a
+       block boundary (including an empty file) gets EFBLK = blocks+1
+       and FFBYTE = 0. (An earlier version wrote EFBLK = blocks and
+       FFBYTE = 0 for that case, which VMS reads as one block SHORTER
+       than the real content, and an empty file as 512 bytes.) */
+    spec.efblk = (uint32_t) (content_len / 512) + 1;
+    spec.ffbyte = (uint16_t) (content_len % 512);
 
     {
         char ident[260]; /* name is already bounded (<256 chars, checked
@@ -1238,6 +1358,13 @@ ods2_result_t ods2_free_blocks(ods2_volume_t *vol, uint32_t lbn, unsigned block_
 
 ods2_result_t ods2_delete(ods2_volume_t *vol, unsigned dir_file_number, const char *name)
 {
+    return ods2_delete_version(vol, dir_file_number, name, ODS2_VERSION_HIGHEST, NULL);
+}
+
+ods2_result_t ods2_delete_version(ods2_volume_t *vol, unsigned dir_file_number,
+                                  const char *name, int version, uint16_t *version_out)
+{
+    uint16_t target_version;
     uint8_t dir_header[512];
     ods2_fid_t target_fid;
     uint8_t target_header[512];
@@ -1259,8 +1386,8 @@ ods2_result_t ods2_delete(ods2_volume_t *vol, unsigned dir_file_number, const ch
     r = ods2_read_header(vol, dir_file_number, dir_header);
     if (!r.ok) return r;
 
-    r = ods2_lookup_name(vol, dir_header, name, &target_fid);
-    if (!r.ok) return fail("name not found in directory");
+    r = ods2_lookup_name_version(vol, dir_header, name, version, &target_fid, &target_version);
+    if (!r.ok) return r;
 
     r = ods2_read_header(vol, target_fid.fid_num, target_header);
     if (!r.ok) return r;
@@ -1311,8 +1438,11 @@ ods2_result_t ods2_delete(ods2_volume_t *vol, unsigned dir_file_number, const ch
     r = ods2_write_header(vol, target_fid.fid_num, target_header);
     if (!r.ok) return r;
 
-    /* Remove the directory entry from the parent - trying each
-       content block until the (sorted) matching record is found. */
+    /* Remove just this version's entry from the parent - trying each
+       content block until the record holding it is found. Removing
+       the whole record instead (as an earlier version did) would also
+       drop every other version of the name stored there, leaving
+       their headers allocated but unreachable. */
     r = ods2_decode_all_extents(vol, dir_header, dir_extents, ODS2_MAX_EXTENTS, &dir_extent_count);
     if (!r.ok) return r;
     for (i = 0; i < dir_extent_count; i++) dir_total_blocks += dir_extents[i].block_count;
@@ -1321,7 +1451,7 @@ ods2_result_t ods2_delete(ods2_volume_t *vol, unsigned dir_file_number, const ch
         uint8_t block[512];
         r = ods2_read_file_block(vol, dir_header, vbn, block);
         if (!r.ok) return r;
-        if (ods2_remove_dir_entry(block, sizeof(block), name)) {
+        if (ods2_remove_dir_version(block, sizeof(block), name, target_version)) {
             r = ods2_write_file_block(vol, dir_header, vbn, block);
             if (!r.ok) return r;
             removed = true;
@@ -1332,5 +1462,6 @@ ods2_result_t ods2_delete(ods2_volume_t *vol, unsigned dir_file_number, const ch
                     "found for removal (should be unreachable)");
     }
 
+    if (version_out != NULL) *version_out = target_version;
     return ok();
 }

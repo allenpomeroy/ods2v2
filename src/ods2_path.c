@@ -24,6 +24,62 @@
 
 #include "ods2_path.h"
 #include <string.h>
+#include <ctype.h>
+
+/* Highest version ODS-2 allows (mirrors ODS2_MAX_VERSION in
+   ods2_directory.h, not included here to keep this module free of
+   any on-disk dependencies). */
+#define PATH_MAX_VERSION 32767
+
+bool ods2_split_version(char *name, bool *has_version, bool *version_wildcard,
+                        int *version)
+{
+    char *semi = strchr(name, ';');
+    const char *v;
+    bool negative = false;
+    long value = 0;
+
+    *has_version = false;
+    *version_wildcard = false;
+    *version = 0;
+
+    if (semi == NULL) {
+        return true; /* no version given - highest, implicitly */
+    }
+    if (semi == name) {
+        return false; /* ";3" with no name in front of it */
+    }
+
+    v = semi + 1;
+    if (v[0] == '\0') {
+        /* "NAME;" - VMS shorthand for the highest version. */
+    } else if (strcmp(v, "*") == 0) {
+        *version_wildcard = true;
+    } else {
+        if (*v == '-') {
+            negative = true;
+            v++;
+        }
+        if (*v == '\0') {
+            return false; /* ";-" alone */
+        }
+        for (; *v; v++) {
+            if (!isdigit((unsigned char) *v)) {
+                return false;
+            }
+            value = value * 10 + (*v - '0');
+            if (value > PATH_MAX_VERSION) {
+                return false;
+            }
+        }
+        /* ";-0" comes out as 0, the same as ";0" - highest. */
+        *version = negative ? -(int) value : (int) value;
+    }
+
+    *has_version = true;
+    *semi = '\0';
+    return true;
+}
 
 bool ods2_parse_path(const char *input, ods2_parsed_path_t *out)
 {
@@ -45,7 +101,8 @@ bool ods2_parse_path(const char *input, ods2_parsed_path_t *out)
         strcpy(out->filename, input);
         out->had_brackets = false;
         out->relative = true;
-        return true;
+        return ods2_split_version(out->filename, &out->has_version,
+                                  &out->version_wildcard, &out->version);
     }
     out->had_brackets = true;
 
@@ -120,5 +177,7 @@ bool ods2_parse_path(const char *input, ods2_parsed_path_t *out)
     }
 
     strcpy(out->filename, close_bracket + 1);
-    return true;
+    /* "[DIR];1" (a version with no filename) is rejected here too. */
+    return ods2_split_version(out->filename, &out->has_version,
+                              &out->version_wildcard, &out->version);
 }

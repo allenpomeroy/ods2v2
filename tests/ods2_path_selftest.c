@@ -77,8 +77,11 @@ int main(void)
     printf("PASS: leading-'.' relative notation parses correctly\n");
 
     /* Recursive notation: trailing "..." inside brackets. */
-    check("[...]", "", "", true, false, true);
-    check("[...]*.*", "", "*.*", true, false, true);
+    /* "[...]" starts with an ellipsis, so it is relative: the
+       current default and everything below it (OpenVMS User's
+       Manual). It used to parse as the whole disk from root. */
+    check("[...]", "", "", true, true, true);
+    check("[...]*.*", "", "*.*", true, true, true);
     check("[DECUS...]", "DECUS", "", true, false, true);
     check("[DECUS...]*.*", "DECUS", "*.*", true, false, true);
     check("[DECUS.NETLIB020...]*.*", "DECUS.NETLIB020", "*.*", true, false, true);
@@ -96,6 +99,60 @@ int main(void)
     check_full("[-.-.SUBDIR]", "SUBDIR", "", true, true, false, 2);
     check_full("[-]FILE.TXT", "", "FILE.TXT", true, true, false, 1);
     printf("PASS: up-level '[-]' notation parses correctly\n");
+
+    /* Directory wildcards: '*' and '%' in any name, and an ellipsis
+       anywhere. dir_path keeps them; a trailing ellipsis is still
+       reported through `recursive`. */
+    {
+        struct { const char *in, *dir; bool relative, recursive, wild; int up; } c[] = {
+            { "[*]",            "*",          false, false, true,  0 },
+            { "[*...]",         "*",          false, true,  true,  0 },
+            { "[*...]*.*",      "*",          false, true,  true,  0 },
+            { "[TEST%]",        "TEST%",      false, false, true,  0 },
+            { "[DECUS.*]",      "DECUS.*",    false, false, true,  0 },
+            { "[*.SRC]",        "*.SRC",      false, false, true,  0 },
+            { "[DECUS...SRC]",  "DECUS...SRC",false, false, true,  0 },
+            { "[...SALES]",     "...SALES",   true,  false, true,  0 },
+            { "[.*]",           "*",          true,  false, true,  0 },
+            { "[.A...]",        "A",          true,  true,  true,  0 },
+            { "[-.*]",          "*",          true,  false, true,  1 },
+            { "[-...]",         "",           true,  true,  true,  1 },
+            { "[-...X]",        "...X",       true,  false, true,  1 },
+            { "[000000...]",    "",           false, true,  true,  0 },
+            { "[000000.*]",     "*",          false, false, true,  0 },
+            { "[000000.DECUS]", "DECUS",      false, false, false, 0 },
+            { "[000000...X]",   "...X",       false, false, true,  0 },
+            { "[DECUS]",        "DECUS",      false, false, false, 0 },
+        };
+        size_t i;
+        for (i = 0; i < sizeof c / sizeof c[0]; i++) {
+            ods2_parsed_path_t p;
+            bool ok = ods2_parse_path(c[i].in, &p);
+            if (!ok || strcmp(p.dir_path, c[i].dir) != 0 || p.relative != c[i].relative ||
+                p.recursive != c[i].recursive || p.dir_wildcard != c[i].wild ||
+                p.up_levels != c[i].up) {
+                printf("FAIL: parse(%s) ok=%d dir=%s relative=%d recursive=%d "
+                       "wild=%d up=%d\n", c[i].in, ok, ok ? p.dir_path : "",
+                       p.relative, p.recursive, p.dir_wildcard, p.up_levels);
+                assert(0);
+            }
+        }
+        printf("PASS: directory wildcards ('*', '%%', ellipsis anywhere, "
+               "[000000.X]) parse correctly\n");
+    }
+    {
+        const char *bad[] = { "[A..B]", "[A.]", "[A......]", "[A.......B]" };
+        size_t i;
+        for (i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+            ods2_parsed_path_t p;
+            if (ods2_parse_path(bad[i], &p)) {
+                printf("FAIL: %s should be rejected\n", bad[i]);
+                assert(0);
+            }
+        }
+        printf("PASS: malformed directory specs ([A..B], [A.], stray dots) "
+               "are rejected\n");
+    }
 
     /* Malformed input is rejected, not silently mishandled. */
     {

@@ -24,8 +24,8 @@
 
 #include "ods2_header_build.h"
 #include "ods2_checksum.h"
+#include "ods2_time.h"
 #include <string.h>
-#include <time.h>
 
 /* Header layout matching real VMS exactly, confirmed against two
    independently-examined real headers (root's own, INDEXF.SYS's own):
@@ -121,16 +121,11 @@ bool ods2_build_file_header(uint8_t *header_out, const ods2_header_spec_t *spec)
 
         /* FI2$Q_CREDATE / FI2$Q_REVDATE: binary 64-bit VMS timestamp -
            (spec 3.5.3.3) Both set to "now" for a freshly
-           created file that hasn't been revised since. */
-        vms_now = ((uint64_t) time(NULL) + 3506716800ULL) * 10000000ULL;
-        {
-            int b;
-            for (b = 0; b < 8; b++) {
-                uint8_t byte = (uint8_t) ((vms_now >> (b * 8)) & 0xff);
-                ident[22 + b] = byte; /* CREDATE */
-                ident[30 + b] = byte; /* REVDATE */
-            }
-        }
+           created file that hasn't been revised since. VMS dates
+           are local wall-clock time, not UTC: see ods2_time.h. */
+        vms_now = ods2_vms_time_now();
+        ods2_store_vms_time(ident + 22, vms_now); /* CREDATE */
+        ods2_store_vms_time(ident + 30, vms_now); /* REVDATE */
 
         /* FI2$Q_EXPDATE / FI2$Q_BAKDATE: zero - "no expiration set" /
            "never backed up", a normal, valid state for a new file

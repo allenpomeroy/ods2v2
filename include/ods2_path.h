@@ -67,6 +67,14 @@ typedef struct {
                                        recursive-subtree wildcard,
                                        e.g. "[DECUS...]*.*" or
                                        "[...]*.*"). */
+    bool dir_wildcard;             /* true if the directory part can
+                                       name more than one directory:
+                                       a '*' or '%' in any name, or an
+                                       ellipsis anywhere (including the
+                                       trailing one `recursive` covers).
+                                       dir_path keeps any wildcard and
+                                       any non-trailing ellipsis as
+                                       typed - see ods2_wildcard.h. */
     int up_levels;                 /* VMS's "[-]" notation: number of
                                        levels to go up from the current
                                        default before applying dir_path
@@ -103,7 +111,11 @@ typedef struct {
  *   [DECUS.NETLIB020]       -> dir_path="DECUS.NETLIB020", had_brackets=true, relative=false
  *   [.NETLIB020]             -> dir_path="NETLIB020", had_brackets=true, relative=true
  *   [DECUS...]                 -> dir_path="DECUS", recursive=true
- *   [...]                        -> dir_path="", recursive=true
+ *   [...]                        -> dir_path="", recursive=true, relative=true
+ *   [*...]                       -> dir_path="*", recursive=true, dir_wildcard=true
+ *   [...SALES]                   -> dir_path="...SALES", relative=true, dir_wildcard=true
+ *   [DECUS.*]                    -> dir_path="DECUS.*", dir_wildcard=true
+ *   [000000.DECUS]               -> dir_path="DECUS"
  *   [-]                            -> up_levels=1, dir_path="", relative=true
  *   [-.-]                           -> up_levels=2, dir_path="", relative=true
  *   [-.SUBDIR]                       -> up_levels=1, dir_path="SUBDIR", relative=true
@@ -115,9 +127,13 @@ typedef struct {
  *   [DECUS]FILE.TXT;  or ;0        -> filename="FILE.TXT", has_version, version=0 (highest)
  *   [DECUS]FILE.TXT;-1             -> filename="FILE.TXT", has_version, version=-1
  *   [DECUS]*.*;*                   -> filename="*.*", has_version, version_wildcard
+ * A spec beginning with "..." is relative to the current default,
+ * like one beginning with '.' (VMS: "[...]" is the default directory
+ * and everything below it; "[*...]" is every directory on the disk).
  * Returns false if `input` is too long to fit ODS2_PATH_MAX, the
  * bracket syntax is malformed (unmatched '[' or ']', or more than one
- * bracketed section), or the ";version" is malformed (see
+ * bracketed section), the directory part has an empty name or stray
+ * dots ("[A..B]", "[A.]"), or the ";version" is malformed (see
  * ods2_split_version()).
  */
 bool ods2_parse_path(const char *input, ods2_parsed_path_t *out);

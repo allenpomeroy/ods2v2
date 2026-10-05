@@ -23,6 +23,7 @@
  */
 
 #include "ods2_path.h"
+#include "ods2_wildcard.h"
 #include <string.h>
 #include <ctype.h>
 
@@ -86,6 +87,7 @@ bool ods2_parse_path(const char *input, ods2_parsed_path_t *out)
     const char *open_bracket;
     const char *close_bracket;
     size_t len;
+    bool starts_with_ellipsis;
 
     memset(out, 0, sizeof(*out));
 
@@ -121,6 +123,13 @@ bool ods2_parse_path(const char *input, ods2_parsed_path_t *out)
     memcpy(out->dir_path, open_bracket + 1, len);
     out->dir_path[len] = '\0';
 
+    /* A spec that begins with an ellipsis ("[...]", "[...SALES]") is
+       relative to the current default, just as one beginning with a
+       single '.' is (OpenVMS User's Manual, "Ellipsis Wildcard
+       Character"). Noted before the trailing "..." is stripped below,
+       which would leave "[...]" looking like a bare "[]". */
+    starts_with_ellipsis = strncmp(out->dir_path, "...", 3) == 0;
+
     /* VMS's recursive-subtree wildcard: a trailing "..." means "this
        directory and everything beneath it". Checked before the
        leading-'.' relative check below, since "[DECUS...]" has both a
@@ -135,6 +144,11 @@ bool ods2_parse_path(const char *input, ods2_parsed_path_t *out)
             out->dir_path[dlen - 3] == '.') {
             out->recursive = true;
             out->dir_path[dlen - 3] = '\0';
+            /* "[A......]": an ellipsis straight after another is
+               meaningless, and VMS rejects it. */
+            if (dlen >= 6 && strcmp(out->dir_path + dlen - 6, "...") == 0) {
+                return false;
+            }
         }
     }
 
@@ -152,7 +166,10 @@ bool ods2_parse_path(const char *input, ods2_parsed_path_t *out)
         while (pos < dlen && out->dir_path[pos] == '-') {
             out->up_levels++;
             pos++;
-            if (pos < dlen && out->dir_path[pos] == '.') {
+            /* Skip the separating '.', but not the first dot of an
+               ellipsis: "[-...X]" is "up one, then X at any depth". */
+            if (pos < dlen && out->dir_path[pos] == '.' &&
+                strncmp(out->dir_path + pos, "...", 3) != 0) {
                 pos++;
             }
         }
@@ -162,7 +179,9 @@ bool ods2_parse_path(const char *input, ods2_parsed_path_t *out)
 
     /* VMS's relative-to-default notation: a leading '.' means "under
        the current default directory" rather than "from root". */
-    if (out->dir_path[0] == '.') {
+    if (starts_with_ellipsis || strncmp(out->dir_path, "...", 3) == 0) {
+        out->relative = true; /* the ellipsis stays: it's part of the spec */
+    } else if (out->dir_path[0] == '.') {
         out->relative = true;
         memmove(out->dir_path, out->dir_path + 1, strlen(out->dir_path));
     }
@@ -174,7 +193,20 @@ bool ods2_parse_path(const char *input, ods2_parsed_path_t *out)
        -handling specifically. */
     if (strcmp(out->dir_path, "000000") == 0) {
         out->dir_path[0] = '\0';
+    } else if (!out->relative && strncmp(out->dir_path, "000000.", 7) == 0) {
+        /* "[000000.X]" is "[X]", and "[000000...X]" is X at any depth
+           from root: drop the root's own name, keeping an ellipsis. */
+        size_t skip = (strncmp(out->dir_path + 6, "...", 3) == 0) ? 6 : 7;
+        memmove(out->dir_path, out->dir_path + skip, strlen(out->dir_path + skip) + 1);
     }
+
+    /* Wildcards ('*', '%') and ellipses may appear in any directory
+       name; reject what VMS would (empty names, stray dots) rather
+       than look up "A..B" as a literal name. */
+    if (!ods2_dir_spec_valid(out->dir_path)) {
+        return false;
+    }
+    out->dir_wildcard = out->recursive || ods2_dir_spec_has_wildcard(out->dir_path);
 
     strcpy(out->filename, close_bracket + 1);
     /* "[DIR];1" (a version with no filename) is rejected here too. */

@@ -28,10 +28,10 @@
 #include "ods2_header_build.h"
 #include "ods2_directory_write.h"
 #include "ods2_checksum.h"
+#include "ods2_time.h"
 #include <string.h>
 #include <ctype.h>
 #include <stdlib.h>
-#include <time.h>
 
 static ods2_result_t ok(void)
 {
@@ -1251,10 +1251,8 @@ ods2_result_t ods2_insert_into_directory(ods2_volume_t *vol, unsigned dir_file_n
             ident[20] = (uint8_t) (revision & 0xff);
             ident[21] = (uint8_t) (revision >> 8);
 
-            vms_now = ((uint64_t) time(NULL) + 3506716800ULL) * 10000000ULL;
-            for (i = 0; i < 8; i++) {
-                ident[30 + i] = (uint8_t) ((vms_now >> (i * 8)) & 0xff); /* REVDATE */
-            }
+            vms_now = ods2_vms_time_now(); /* local time, see ods2_time.h */
+            ods2_store_vms_time(ident + 30, vms_now); /* REVDATE */
         }
 
         checksum = ods2_checksum(dir_header, 255);

@@ -22,11 +22,25 @@
  * SOFTWARE.
  */
 
+/* setenv() is POSIX, not C11. */
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <time.h>
 #include "ods2_volume.h"
+#include "ods2_time.h"
+
+/* Reads a little-endian FI2$Q_* date from 8 header bytes. */
+static uint64_t load_vms_time(const uint8_t *p)
+{
+    uint64_t v = 0;
+    int i;
+    for (i = 7; i >= 0; i--) v = (v << 8) | p[i];
+    return v;
+}
 
 /* This test writes to the disk image it operates on (creating
    directories, files, etc.) - it must NEVER do that against
@@ -423,6 +437,15 @@ int main(void)
                                need comfortably more than that worth of
                                ~26-byte records to force genuine extension */
         int i;
+        uint64_t stamp_before, stamp_after;
+        time_t unix_before;
+
+        /* Dates are stamped in local time. Run this test in a zone
+           nine hours from UTC, so a UTC stamp can't pass for local. */
+        setenv("TZ", "JST-9", 1);
+        unsetenv("ODS2_TZ");
+        unix_before = time(NULL);
+        stamp_before = ods2_vms_time_now();
 
         r = ods2_mount_write(DISK_PATH, &wvol);
         assert(r.ok);
@@ -463,6 +486,26 @@ int main(void)
             printf("PASS: directory header now has %d extents, confirming it "
                    "genuinely grew (not just fit in the original allocation)\n",
                    extent_count);
+        }
+
+        /* Extension revises the directory's own header (in
+           ods2_volume.c, not ods2_header_build.c): REVISION goes up and
+           REVDATE is restamped, in local time like CREDATE. Header
+           ident area is at byte 80: REVISION +20, CREDATE +22,
+           REVDATE +30. */
+        {
+            uint16_t revision = (uint16_t) (subdir_header[100] | (subdir_header[101] << 8));
+            uint64_t credate = load_vms_time(subdir_header + 102);
+            uint64_t revdate = load_vms_time(subdir_header + 110);
+            uint64_t utc_before = ((uint64_t) unix_before + 3506716800ULL) * 10000000ULL;
+
+            stamp_after = ods2_vms_time_now();
+            assert(revision > 1);
+            assert(stamp_before <= credate && credate <= revdate && revdate <= stamp_after);
+            assert(revdate >= utc_before + 9ULL * 3600 * 10000000ULL); /* JST, not UTC */
+            printf("PASS: extending the directory bumped its revision to %u and "
+                   "stamped CREDATE/REVDATE in local time (TZ=JST-9, 9h ahead "
+                   "of UTC)\n", (unsigned) revision);
         }
 
         ods2_dismount(&wvol);

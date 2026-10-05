@@ -76,6 +76,7 @@ implements basic command recall to ease repetitive command sequences.
 |---|---|
 | `DIR [path] [wildcard]` | `DIR [DECUS] *.TXT` |
 | `DIR [path...] [wildcard]` | `DIR [...]*.*` — recursive, VMS's `...` notation |
+| `DIR [*...] [wildcard]` | `DIR [*...]*.COM` — wildcards in directory names (see below) |
 | `CREATE/DIRECTORY path` | `CREATE/DIRECTORY [DECUS.NETLIB020]` |
 | `COPY <local-file> <path>` | `COPY readme.txt [DECUS]README.TXT` |
 | `TYPE path` | `TYPE [DECUS]README.TXT;2` |
@@ -95,6 +96,28 @@ DEFAULT`); `[-]` means "up one level" (`[-.-]` for more); other
 bracketed paths are absolute from root. Names are automatically
 uppercased on creation, matching real VMS storage.
 
+`DIR` accepts VMS directory wildcards, as `DIRECTORY` does on VMS:
+`*` and `%` in any directory name, and the ellipsis `...` (any
+number of levels, including none) anywhere in the directory spec.
+
+| Spec | Lists |
+|---|---|
+| `[*]` | every top-level directory |
+| `[*...]` | every directory on the disk except root's own files |
+| `[000000...]` | everything, root included |
+| `[...]` | the current default directory and everything below it |
+| `[DECUS.*]` | every directory directly under `[DECUS]` |
+| `[...SALES]` | every directory named `SALES` at any depth below the default |
+| `[DECUS...SRC]` | every `SRC` anywhere below `[DECUS]` |
+| `[TEST%...]` | `[TEST1]`, `[TESTA]` ... and everything below them |
+
+Like VMS, a multi-directory listing shows only directories that hold
+something matching, ends with a grand total, and says "no files
+found" when nothing matches. Quote these specs on the shell command
+line (`./ods2 transfer.dsk DIR "[*...]*.*"`), since `[`, `*` and `?`
+are shell wildcards too. The other commands act on one directory and
+refuse a wildcard one.
+
 File versions follow VMS rules too. `NAME;3` is version 3; `NAME`,
 `NAME;` and `NAME;0` mean the highest version; `NAME;-1` is the next
 lower existing version; `NAME;*` means every version (`DIR` and
@@ -103,6 +126,26 @@ version (`DIR [DECUS]*.*;` shows just the newest of each). `DELETE`
 removes one version - the one given, or the highest if none is - and
 `DELETE NAME;*` removes them all. `COPY` onto the disk always creates
 version 1 and refuses a name that already exists.
+
+### File dates and time zones
+
+VMS keeps file dates in local time, so `ods2` stamps new files (and
+revised directories) with the time in the zone your VMS system runs
+on, not in UTC. By default that's the host's own zone, which honours
+`TZ`. If the guest's zone differs from the host's, set `ODS2_TZ` to
+the guest's zone; it takes precedence over `TZ` and affects only
+`ods2`:
+
+```bash
+ODS2_TZ=America/New_York ./ods2 transfer.dsk COPY build.com [CONVERT]
+export ODS2_TZ=UTC        # for a VMS system that really runs on UTC
+```
+
+Any value `TZ` accepts works, including POSIX rules such as
+`EST5EDT,M3.2.0,M11.1.0`. A zone name the host doesn't recognise
+quietly falls back to UTC, so check the spelling if dates still look
+off. If they're wrong, `ANALYZE/DISK_STRUCTURE` on VMS reports
+`FUTCREDAT` / `FUTREVDAT` for files dated ahead of its clock.
 
 ### A simple example
 
@@ -167,8 +210,8 @@ third_party/linenoise/  BSD licensed - interactive-mode command history
 
 ## Testing
 
-`make test` builds and runs 14 test suites, 122 individual assertions,
-with `-fsanitize=address,undefined` on by default for development
+`make test` builds and runs 16 test suites and two scripts that check
+the `ods2` command line, with `-fsanitize=address,undefined` on by default for development
 builds (`make release` builds without them once things are stable).
 Most tests run entirely offline against a synthetic disk
 image assembled from real, VMS-written byte fragments captured during
@@ -188,6 +231,8 @@ in every structural test.
   limitation above).
 - `COPY` can't add a new version of an existing file - it creates
   version 1 of a new name only.
+- `TYPE` and `DELETE` don't take wildcards yet, in file names or
+  directories (VMS's do); only `DIR` does.
 - INDEXF.SYS is never extended, so the number of new files is limited
   by how many free headers the volume already has. The bundled empty
   starter volume has room for only a handful.

@@ -41,6 +41,10 @@
  *   DIR [path...] [wildcard]      list a directory and everything
  *                                 beneath it, recursively (VMS's
  *                                 "..." notation)
+ *   DIR [*...] [wildcard]         directory wildcards: '*' and '%' in
+ *                                 any directory name, "..." anywhere
+ *                                 (e.g. [*], [*.SRC], [...SALES],
+ *                                 [DECUS...SRC]) - as VMS DIRECTORY
  *   CREATE/DIRECTORY path         create a directory
  *   COPY <local-file> <path>      write a local file onto the disk
  *   TYPE path                     print a file's content
@@ -56,6 +60,12 @@
  * relative to the current default directory (see SET DEFAULT); '-'
  * means "go up one level" (repeat as "-.-" for more); other
  * bracketed paths are always absolute from root, matching real VMS.
+ *
+ * A directory spec beginning with "..." is relative too: [...] is the
+ * default directory and everything below it; [*...] is every
+ * directory on the disk except root's own (use [000000...] for that).
+ * Only DIR accepts wildcard directories; the other commands act on
+ * one directory and refuse them.
  *
  * File versions follow VMS rules: NAME;3 is version 3, NAME; or NAME;0
  * or plain NAME is the highest version, NAME;-1 the next lower
@@ -130,6 +140,17 @@ static void format_file_spec(const ods2_parsed_path_t *p, char *out, size_t out_
     } else {
         snprintf(out, out_size, "%s;%d", p->filename, p->version);
     }
+}
+
+/* Commands that act on one directory refuse a wildcard or ellipsis
+   in it with a clear message, rather than looking up "*" as a
+   literal name or quietly ignoring a "...". Returns true if refused. */
+static bool refuse_wild_dir(const ods2_parsed_path_t *p, const char *command, const char *arg)
+{
+    if (!p->dir_wildcard) return false;
+    fprintf(stderr, "%%ODS2-E-WILDDIR, %s: %s does not accept a wildcard or \"...\" "
+                    "in the directory\n", arg, command);
+    return true;
 }
 
 /* Combines a parsed path's dir_path/relative flag with the current
@@ -245,11 +266,6 @@ static void split_last_component(const char *dir_path, char *out_buf,
     }
 }
 
-/* Lists one directory's matching entries, printing a "Directory
- * [path]" header first - the non-recursive building block both the
- * plain DIR command and the recursive one below use. `dir_path` here
- * is already fully resolved/absolute (from root), not a raw parsed
- * path - callers handle SET DEFAULT resolution before this. */
 /* Does entry `i` of a directory listing pass a DIR version filter?
    `rank` is its position among its name's versions (0 = highest,
    since they are stored newest first). */
@@ -260,157 +276,198 @@ static bool version_selected(const ods2_parsed_path_t *p, const ods2_dir_entry_t
     return rank == -p->version; /* 0 = highest, -1 = next lower, ... */
 }
 
-static int list_one_directory(ods2_volume_t *vol, const char *dir_path, const char *pattern,
-                              const ods2_parsed_path_t *p)
+/* Lists the entries of one directory that match `pattern` and the
+ * version filter, VMS DIRECTORY style: the "Directory [path]" heading,
+ * the entries and a "Total of N files." line. Like VMS, prints nothing
+ * at all for a directory with no matching entries, so a listing across
+ * many directories shows only the ones that have something to show.
+ * `dir_path` is absolute (from root). Returns the number shown. */
+static int show_directory(const char *dir_path, const ods2_dir_entry_t *entries, int count,
+                          const char *pattern, const ods2_parsed_path_t *p)
 {
-    uint8_t dir_header[512];
-    ods2_fid_t dir_fid;
-    ods2_dir_entry_t *entries = NULL;
-    int count = 0, i, shown = 0, rank = 0;
-    ods2_result_t r = resolve_dir(vol, dir_path, dir_header, &dir_fid);
+    int i, shown = 0, rank = 0;
 
-    if (!r.ok) {
-        fprintf(stderr, "%%ODS2-E-DIRERR, [%s]: %s\n", dir_path, r.problem);
-        return -1;
-    }
-    r = ods2_list_directory_alloc(vol, dir_header, &entries, &count);
-    if (!r.ok) {
-        fprintf(stderr, "%%ODS2-E-LISTERR, [%s]: %s\n", dir_path, r.problem);
-        return -1;
-    }
-
-    printf("\nDirectory [%s%s]\n\n", (dir_path[0] == '\0') ? "000000" : "", dir_path);
+    /* Every version of a name is its own entry, newest first and
+       contiguous (a name's versions may span several records). */
     for (i = 0; i < count; i++) {
-        /* Every version of a name is its own entry, newest first and
-           contiguous (a name's versions may span several records). */
         rank = (i > 0 && same_name(entries[i].name, entries[i - 1].name)) ? rank + 1 : 0;
-        if (!ods2_wildcard_match(pattern, entries[i].name)) continue;
-        if (!version_selected(p, &entries[i], rank)) continue;
-        printf("%-20s;%u\n", entries[i].name, entries[i].version);
-        shown++;
+        if (ods2_wildcard_match(pattern, entries[i].name) &&
+            version_selected(p, &entries[i], rank)) {
+            if (shown == 0) {
+                printf("\nDirectory [%s%s]\n\n", (dir_path[0] == '\0') ? "000000" : "",
+                       dir_path);
+            }
+            printf("%-20s;%u\n", entries[i].name, entries[i].version);
+            shown++;
+        }
     }
-    printf("\nTotal of %d file%s.\n", shown, (shown == 1) ? "" : "s");
-    free(entries);
+    if (shown > 0) {
+        printf("\nTotal of %d file%s.\n", shown, (shown == 1) ? "" : "s");
+    }
     return shown;
 }
 
-/* Recursive listing - VMS's "[DIR...]*.*" notation: lists dir_path
- * itself, then descends into every subdirectory found there
- * (regardless of whether the subdirectory's own name matches
- * `pattern` - the pattern filters what's shown at each level, not
- * which directories get descended into, matching real VMS), each
- * getting its own "Directory [...]" header, recursively. Whether an
- * entry is a subdirectory is checked via its own header's
- * FH2$M_DIRECTORY bit (0x2000, confirmed against real VMS-written
- * headers earlier in this project) rather than just a ".DIR" name
- * suffix - more robust, matches how ods2_delete() already checks
- * this same thing. */
-/* Real VMS directory hierarchies are never more than a handful of
-   levels deep in practice; this is a generous but finite backstop
-   against stack overflow from a cycle I haven't thought of - the
-   project reads arbitrary, possibly corrupted disk images. */
+/* Real VMS allows 8 directory levels; this is a generous but finite
+   backstop against a directory cycle on a corrupted disk image. */
 #define MAX_RECURSION_DEPTH 50
 
-static void list_directory_recursive(ods2_volume_t *vol, const char *dir_path, const char *pattern,
-                                      const ods2_parsed_path_t *p,
-                                      int *total_files, int *total_dirs, int depth)
+/* State for one DIR across a wildcard directory spec. */
+typedef struct {
+    ods2_volume_t *vol;
+    const char *spec;              /* what remains to match below the start
+                                      directory, e.g. "*...", "...SALES" */
+    const char *pattern;           /* file name pattern, e.g. "*.TXT" */
+    const ods2_parsed_path_t *p;   /* for the version filter */
+    int dirs_shown;
+    int files_shown;
+    int errors;
+} dir_walk_t;
+
+/* Walks the tree below the start directory depth first, in directory
+ * order (alphabetical, as VMS stores them), listing every directory
+ * whose path relative to the start matches w->spec. `abs_path` is the
+ * directory's absolute path, `rel_path` the same directory relative to
+ * where the walk began ("" for the start itself). Subtrees that cannot
+ * contain a match are never read. This one walk serves every DIR:
+ * "[A]" (spec "" - just the start), "[A...]" (spec "..."), "[*]",
+ * "[*...]", "[A...B]" and so on. */
+static void walk_directories(dir_walk_t *w, const char *abs_path, const char *rel_path,
+                             int depth)
 {
     uint8_t dir_header[512];
     ods2_fid_t dir_fid;
     ods2_dir_entry_t *entries = NULL;
     int count = 0, i;
     ods2_result_t r;
-    int shown;
+    bool here = ods2_dir_spec_match(w->spec, rel_path);
+    bool deeper = ods2_dir_spec_could_descend(w->spec, rel_path);
 
+    if (!here && !deeper) return;
     if (depth > MAX_RECURSION_DEPTH) {
         fprintf(stderr, "%%ODS2-E-TOODEEP, recursion limit reached, skipping "
-                        "subtree under [%s]\n", dir_path);
+                        "subtree under [%s]\n", abs_path);
+        w->errors++;
         return;
     }
 
-    shown = list_one_directory(vol, dir_path, pattern, p);
+    r = resolve_dir(w->vol, abs_path, dir_header, &dir_fid);
+    if (!r.ok) {
+        fprintf(stderr, "%%ODS2-E-DIRERR, [%s]: %s\n", abs_path, r.problem);
+        w->errors++;
+        return;
+    }
+    r = ods2_list_directory_alloc(w->vol, dir_header, &entries, &count);
+    if (!r.ok) {
+        fprintf(stderr, "%%ODS2-E-LISTERR, [%s]: %s\n", abs_path, r.problem);
+        w->errors++;
+        return;
+    }
 
-    if (shown < 0) return; /* error already reported */
-    *total_files += shown;
-    (*total_dirs)++;
+    if (here) {
+        int shown = show_directory(abs_path, entries, count, w->pattern, w->p);
+        if (shown > 0) {
+            w->dirs_shown++;
+            w->files_shown += shown;
+        }
+    }
 
-    r = resolve_dir(vol, dir_path, dir_header, &dir_fid);
-    if (!r.ok) return; /* already reported by list_one_directory above */
-    r = ods2_list_directory_alloc(vol, dir_header, &entries, &count);
-    if (!r.ok) return;
-
-    for (i = 0; i < count; i++) {
+    for (i = 0; deeper && i < count; i++) {
         uint8_t sub_header[512];
+        char name[ODS2_PATH_MAX];
+        char child_abs[ODS2_PATH_MAX];
+        char child_rel[ODS2_PATH_MAX];
+        size_t len;
+        int a, b;
 
-        /* Skip self-referential entries - root's own directory
-           always contains a "000000.DIR" entry pointing straight
-           back at itself (FID (4,4) - spec-mandated, present on
-           every ODS-2 volume). Avoids erroneous recursive DIR
-           descend into root via that entry causing an infinite loop. */
+        /* Skip self-referential entries - root's own directory always
+           contains a "000000.DIR" entry pointing straight back at
+           itself (FID (4,4), present on every ODS-2 volume). This is
+           also why "[*]" never matches [000000], as on VMS. */
         if (entries[i].fid.fid_num == dir_fid.fid_num &&
             entries[i].fid.fid_seq == dir_fid.fid_seq) {
             continue;
         }
         /* Only a name's highest version can be the subdirectory a
-           path like [A.B] refers to - older versions of a name are
-           never descended into (and would otherwise list the same
-           subtree more than once). */
+           path like [A.B] refers to. */
         if (i > 0 && same_name(entries[i].name, entries[i - 1].name)) {
             continue;
         }
-
-        r = ods2_read_header(vol, entries[i].fid.fid_num, sub_header);
-        if (r.ok) {
-            ods2_head_core_t *core = (ods2_head_core_t *) sub_header;
-            if (core->filechar & 0x2000u) { /* FH2$M_DIRECTORY */
-                char name_no_suffix[ODS2_PATH_MAX];
-                char sub_path[ODS2_PATH_MAX];
-                char *dot;
-                strncpy(name_no_suffix, entries[i].name, sizeof(name_no_suffix) - 1);
-                name_no_suffix[sizeof(name_no_suffix) - 1] = '\0';
-                dot = strrchr(name_no_suffix, '.');
-                if (dot != NULL) *dot = '\0'; /* strip ".DIR" */
-
-                if (dir_path[0] == '\0') {
-                    snprintf(sub_path, sizeof(sub_path), "%s", name_no_suffix);
-                } else {
-                    int written = snprintf(sub_path, sizeof(sub_path), "%s.%s",
-                                            dir_path, name_no_suffix);
-                    if (written < 0 || (size_t) written >= sizeof(sub_path)) {
-                        fprintf(stderr, "%%ODS2-E-PATHTOOLONG, path too deep to represent, "
-                                        "skipping subtree under [%s]\n", dir_path);
-                        continue;
-                    }
-                }
-                list_directory_recursive(vol, sub_path, pattern, p, total_files, total_dirs,
-                                         depth + 1);
-            }
+        /* Directories are NAME.DIR; the name is the path component. */
+        len = strlen(entries[i].name);
+        if (len <= 4 || len >= sizeof(name) || !same_name(entries[i].name + len - 4, ".DIR")) {
+            continue;
         }
+        memcpy(name, entries[i].name, len - 4);
+        name[len - 4] = '\0';
+
+        a = snprintf(child_abs, sizeof(child_abs), "%s%s%s", abs_path,
+                     abs_path[0] ? "." : "", name);
+        b = snprintf(child_rel, sizeof(child_rel), "%s%s%s", rel_path,
+                     rel_path[0] ? "." : "", name);
+        if (a < 0 || (size_t) a >= sizeof(child_abs) || b < 0 ||
+            (size_t) b >= sizeof(child_rel)) {
+            fprintf(stderr, "%%ODS2-E-PATHTOOLONG, path too deep to represent, "
+                            "skipping subtree under [%s]\n", abs_path);
+            w->errors++;
+            continue;
+        }
+        /* Cheap name test before reading the entry's header. */
+        if (!ods2_dir_spec_match(w->spec, child_rel) &&
+            !ods2_dir_spec_could_descend(w->spec, child_rel)) {
+            continue;
+        }
+        /* Is it really a directory? Checked via its own header's
+           FH2$M_DIRECTORY bit (0x2000), not just the .DIR suffix. */
+        r = ods2_read_header(w->vol, entries[i].fid.fid_num, sub_header);
+        if (!r.ok || !(((ods2_head_core_t *) sub_header)->filechar & 0x2000u)) {
+            continue;
+        }
+        walk_directories(w, child_abs, child_rel, depth + 1);
     }
     free(entries);
 }
 
+/* DIR, following VMS DIRECTORY: '*' and '%' may appear in any
+ * directory name and the ellipsis anywhere in the directory spec, so
+ * one command can list many directories. As on VMS, directories with
+ * no matching files are not shown, a "Grand total" follows when more
+ * than one directory was listed, and a listing that finds nothing at
+ * all reports "no files found". */
 static void cmd_dir(ods2_volume_t *vol, const ods2_parsed_path_t *p)
 {
     char effective_dir[ODS2_PATH_MAX];
-    const char *pattern = (p->filename[0] != '\0') ? p->filename : "*";
-    resolve_effective_path(p, effective_dir, sizeof(effective_dir));
+    char spec[ODS2_PATH_MAX + 4];
+    char start[ODS2_PATH_MAX];
+    const char *rest;
+    dir_walk_t w;
 
-    if (p->recursive) {
-        int total_files = 0, total_dirs = 0;
-        list_directory_recursive(vol, effective_dir, pattern, p, &total_files, &total_dirs, 0);
-        if (total_dirs > 0) {
-            printf("\nGrand total of %d director%s, %d file%s.\n",
-                   total_dirs, (total_dirs == 1) ? "y" : "ies",
-                   total_files, (total_files == 1) ? "" : "s");
-        }
-        /* total_dirs==0 means the root of the requested subtree
-           itself couldn't be listed - list_one_directory() already
-           reported that error, printing a "Grand total" of zero here
-           too would misleadingly suggest a legitimately empty
-           (rather than failed) subtree. */
-    } else {
-        list_one_directory(vol, effective_dir, pattern, p);
+    resolve_effective_path(p, effective_dir, sizeof(effective_dir));
+    /* A trailing ellipsis was split off as `recursive`; put it back,
+       so the spec says everything the walk has to match. */
+    snprintf(spec, sizeof(spec), "%s%s", effective_dir, p->recursive ? "..." : "");
+
+    /* Start at the longest plain prefix ("A.B" of "A.B.*...") - it is
+       looked up directly, so a missing directory there is reported
+       as such - and match only what follows it. */
+    rest = ods2_dir_spec_split_prefix(spec, start, sizeof(start));
+    if (rest == NULL) {
+        fprintf(stderr, "%%ODS2-E-BADPATH, [%s]: invalid directory specification\n", spec);
+        return;
+    }
+
+    memset(&w, 0, sizeof(w));
+    w.vol = vol;
+    w.spec = rest;
+    w.pattern = (p->filename[0] != '\0') ? p->filename : "*";
+    w.p = p;
+    walk_directories(&w, start, "", 0);
+
+    if (w.dirs_shown > 1) {
+        printf("\nGrand total of %d director%s, %d file%s.\n",
+               w.dirs_shown, (w.dirs_shown == 1) ? "y" : "ies",
+               w.files_shown, (w.files_shown == 1) ? "" : "s");
+    } else if (w.dirs_shown == 0 && w.errors == 0) {
+        fprintf(stderr, "%%ODS2-W-NOFILES, no files found\n");
     }
 }
 
@@ -653,6 +710,8 @@ static void print_help(void)
     printf("Commands (VMS bracket-notation paths, e.g. [DECUS.NETLIB020]FILE.TXT):\n"
            "  DIR [path] [wildcard]      list a directory\n"
            "  DIR [path...] [wildcard]   list a directory and everything beneath it\n"
+           "  DIR [*...] [wildcard]      '*' '%%' in directory names, '...' anywhere\n"
+           "                             ([*], [*.SRC], [...SALES], [DECUS...SRC])\n"
            "  CREATE/DIRECTORY path      create a directory\n"
            "  COPY <local-file> <path>   write a local file onto the disk\n"
            "  TYPE path                  print a file's content\n"
@@ -666,7 +725,8 @@ static void print_help(void)
            "[-], [-.SIBLING]) and bare filenames with no brackets at all are\n"
            "relative to the current default directory (see SET DEFAULT); '-'\n"
            "means \"go up one level\" (repeat as \"-.-\" for more); other bracketed\n"
-           "paths are always absolute from root, matching real VMS.\n"
+           "paths are always absolute from root, matching real VMS. [...] is the\n"
+           "default directory and below; [*...] every directory on the disk.\n"
            "\n"
            "Versions: NAME;3 is version 3; NAME, NAME; or NAME;0 the highest;\n"
            "NAME;-1 the next lower existing version; NAME;* every version\n"
@@ -719,6 +779,7 @@ static bool execute_line(ods2_volume_t *vol, char *line)
             fprintf(stderr, "%%ODS2-E-BADPATH, could not parse %s\n", tokens[2]);
             return true;
         }
+        if (refuse_wild_dir(&p, "SET DEFAULT", tokens[2])) return true;
         if (p.filename[0] != '\0') {
             fprintf(stderr, "%%ODS2-E-BADPATH, SET DEFAULT takes a directory, "
                             "not a file (%s)\n", tokens[2]);
@@ -787,6 +848,7 @@ static bool execute_line(ods2_volume_t *vol, char *line)
             fprintf(stderr, "%%ODS2-E-BADPATH, could not parse %s\n", tokens[1]);
             return true;
         }
+        if (refuse_wild_dir(&p, "CREATE/DIRECTORY", tokens[1])) return true;
         cmd_create_directory(vol, &p);
         return true;
     }
@@ -800,6 +862,7 @@ static bool execute_line(ods2_volume_t *vol, char *line)
             fprintf(stderr, "%%ODS2-E-BADPATH, could not parse %s\n", tokens[2]);
             return true;
         }
+        if (refuse_wild_dir(&p, "COPY", tokens[2])) return true;
         cmd_copy(vol, tokens[1], &p);
         return true;
     }
@@ -813,6 +876,7 @@ static bool execute_line(ods2_volume_t *vol, char *line)
             fprintf(stderr, "%%ODS2-E-BADPATH, could not parse %s\n", tokens[1]);
             return true;
         }
+        if (refuse_wild_dir(&p, "TYPE", tokens[1])) return true;
         cmd_type(vol, &p);
         return true;
     }
@@ -826,6 +890,7 @@ static bool execute_line(ods2_volume_t *vol, char *line)
             fprintf(stderr, "%%ODS2-E-BADPATH, could not parse %s\n", tokens[1]);
             return true;
         }
+        if (refuse_wild_dir(&p, "DELETE", tokens[1])) return true;
         cmd_delete(vol, &p);
         return true;
     }

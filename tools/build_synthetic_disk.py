@@ -52,49 +52,13 @@ def main():
     write_at(1470720, 'indexf_headers.bin')    # bitmap + first 16 headers
     write_at(1470474, 'root_dir.bin')          # root directory content
 
-    # INDEXF.SYS's own header (file 1) has a fixed, real map area with
-    # only 4 extents, covering file numbers up to ~18 - a genuine limit
-    # of the real disk this sample was extracted from (extending
-    # INDEXF.SYS itself, the bootstrap file, is a separate, more
-    # delicate feature not yet implemented). To let tests exercise
-    # DIRECTORY extension (allocating many files in one directory)
-    # without immediately hitting that separate, unrelated limit, I
-    # patch a 5th, synthetic extent onto INDEXF.SYS's own header here -
-    # test-fixture-only, giving room for ~120 more file numbers at a
-    # safe, otherwise-unused LBN range (cluster 2000+, well clear of
-    # every other region this fixture uses).
-    indexf_header_offset = (1470720 + 90) * 512  # header(1)'s absolute position in the target file
-    with open(TARGET, 'r+b') as tf:
-        tf.seek(indexf_header_offset)
-        header = bytearray(tf.read(512))
-
-        mpoffset_words = header[1]
-        map_inuse_words = header[58]
-        map_area_start = mpoffset_words * 2
-        new_extent_offset = map_area_start + map_inuse_words * 2
-
-        # Format 1 retrieval pointer: word0 = [format=01][high_lbn:6][count:8],
-        # word1 = low_lbn. LBN 6000, 120 blocks (count field = 119).
-        synthetic_lbn = 6000
-        synthetic_blocks = 120
-        word0 = (1 << 14) | ((synthetic_lbn >> 16) << 8) | (synthetic_blocks - 1)
-        word1 = synthetic_lbn & 0xffff
-        header[new_extent_offset:new_extent_offset + 4] = bytes([
-            word0 & 0xff, (word0 >> 8) & 0xff, word1 & 0xff, (word1 >> 8) & 0xff
-        ])
-        header[58] = map_inuse_words + 2  # +1 extent = +2 words
-
-        # Recompute the additive checksum (last word, covers the 255
-        # words before it) - same algorithm used throughout this
-        # project, confirmed against real VMS-computed checksums.
-        checksum = 0
-        for i in range(0, 510, 2):
-            checksum = (checksum + header[i] + (header[i + 1] << 8)) & 0xffff
-        header[510] = checksum & 0xff
-        header[511] = (checksum >> 8) & 0xff
-
-        tf.seek(indexf_header_offset)
-        tf.write(bytes(header))
+    # INDEXF.SYS's own header (file 1) is left exactly as VMS wrote it:
+    # 4 extents, HIBLK 120, room for file numbers up to 18. Tests that
+    # create more files than that exercise ods2v2's real INDEXF.SYS
+    # extension. (An earlier version of this script patched a fifth,
+    # synthetic extent on here instead, without raising HIBLK - a
+    # stopgap from before extension existed, and a header that
+    # disagreed with itself.)
 
     # BITMAP.SYS's own content lives at LBN 1470477, 243 blocks (decoded
     # from its real header's own extents, in indexf_headers.bin). We

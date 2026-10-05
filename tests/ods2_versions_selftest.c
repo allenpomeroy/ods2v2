@@ -52,6 +52,7 @@
 #include <stdlib.h>
 #include <assert.h>
 #include "ods2_volume.h"
+#include "ods2_checksum.h"
 
 #define SOURCE_DISK_PATH "samples/synthetic_disk.img"
 #define CLI_DISK_PATH    "samples/versions_cli_disk.img"
@@ -247,6 +248,21 @@ int main(void)
             r = ods2_write_file_block(&vol, vers_header, vbn, block);
             assert(r.ok);
         }
+        /* Three blocks in use: the end-of-file must say so (EFBLK 4,
+           FFBYTE 0, as VMS writes it), or VMS - and ods2v2, which
+           reads no further than VMS does - sees only the first. */
+        {
+            ods2_head_core_t *vc = (ods2_head_core_t *) vers_header;
+            uint16_t checksum;
+            assert(blocks >= 3);
+            vc->recattr.efblk = ods2_word_swap32(4);
+            vc->recattr.ffbyte = 0;
+            checksum = ods2_checksum(vers_header, 255);
+            vers_header[510] = (uint8_t) (checksum & 0xff);
+            vers_header[511] = (uint8_t) (checksum >> 8);
+            r = ods2_write_header(&vol, vers_fid.fid_num, vers_header);
+            assert(r.ok);
+        }
     }
     ods2_dismount(&vol);
     copy_sparse(CLI_DISK_PATH, DISK_PATH); /* tests below modify their own copy */
@@ -387,9 +403,19 @@ int main(void)
         assert(ods2_file_content_length(hdr) == 512);
         r = ods2_read_file(&vol, hdr, block, sizeof(block), &n);
         assert(r.ok && n == 512);
-        r = ods2_read_header(&vol, 1, hdr);                 /* INDEXF.SYS: EFBLK 116, FFBYTE 0 */
-        assert(r.ok);
-        assert(ods2_file_content_length(hdr) == 115u * 512u);
+        /* INDEXF.SYS: EFBLK 116, FFBYTE 0 - read from the untouched
+           fixture, since creating files on this working copy has
+           (correctly) moved INDEXF.SYS's end-of-file past the new
+           headers. */
+        {
+            ods2_volume_t pristine;
+            r = ods2_mount(SOURCE_DISK_PATH, &pristine);
+            assert(r.ok);
+            r = ods2_read_header(&pristine, 1, hdr);
+            assert(r.ok);
+            assert(ods2_file_content_length(hdr) == 115u * 512u);
+            ods2_dismount(&pristine);
+        }
         printf("PASS: real VMS headers: BADBLK.SYS is 0 bytes (read used to fail), "
                "000000.DIR 512, INDEXF.SYS 115 blocks\n");
     }

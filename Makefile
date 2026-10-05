@@ -40,7 +40,7 @@ MAIN_TOOLS = ods2
 DEV_TOOLS = read_home_block read_file_header ods2_ls ods2_cat ods2_mkdir \
             ods2_put ods2_check_headers ods2_dump_root ods2_dump_header ods2_rm
 
-TESTS = $(BUILD)/ods2_ondisk_selftest $(BUILD)/ods2_checksum_selftest $(BUILD)/ods2_validate_selftest $(BUILD)/ods2_bitmap_selftest $(BUILD)/ods2_indexf_selftest $(BUILD)/ods2_retrieval_selftest $(BUILD)/ods2_root_header_selftest $(BUILD)/ods2_directory_selftest $(BUILD)/ods2_volume_selftest $(BUILD)/ods2_wildcard_selftest $(BUILD)/ods2_read_file_selftest $(BUILD)/ods2_header_build_selftest $(BUILD)/ods2_directory_write_selftest $(BUILD)/ods2_path_selftest $(BUILD)/ods2_versions_selftest $(BUILD)/ods2_time_selftest
+TESTS = $(BUILD)/ods2_ondisk_selftest $(BUILD)/ods2_checksum_selftest $(BUILD)/ods2_validate_selftest $(BUILD)/ods2_bitmap_selftest $(BUILD)/ods2_indexf_selftest $(BUILD)/ods2_retrieval_selftest $(BUILD)/ods2_root_header_selftest $(BUILD)/ods2_directory_selftest $(BUILD)/ods2_volume_selftest $(BUILD)/ods2_wildcard_selftest $(BUILD)/ods2_read_file_selftest $(BUILD)/ods2_header_build_selftest $(BUILD)/ods2_directory_write_selftest $(BUILD)/ods2_path_selftest $(BUILD)/ods2_versions_selftest $(BUILD)/ods2_time_selftest $(BUILD)/ods2_file_alloc_selftest $(BUILD)/ods2_dir_order_selftest
 
 .PHONY: all test tools dev-tools release clean starter-volume
 
@@ -116,6 +116,12 @@ $(BUILD)/ods2_versions_selftest: tests/ods2_versions_selftest.c $(VOLUME_SRCS) i
 $(BUILD)/ods2_time_selftest: tests/ods2_time_selftest.c src/ods2_time.c include/ods2_time.h | $(BUILD)
 	$(CC) $(CFLAGS) $(SANFLAGS) tests/ods2_time_selftest.c src/ods2_time.c -o $@
 
+$(BUILD)/ods2_file_alloc_selftest: tests/ods2_file_alloc_selftest.c $(VOLUME_SRCS) include/ods2_volume.h samples/synthetic_disk.img | $(BUILD)
+	$(CC) $(CFLAGS) $(SANFLAGS) tests/ods2_file_alloc_selftest.c $(VOLUME_SRCS) -o $@
+
+$(BUILD)/ods2_dir_order_selftest: tests/ods2_dir_order_selftest.c $(VOLUME_SRCS) include/ods2_volume.h include/ods2_directory.h samples/synthetic_disk.img | $(BUILD)
+	$(CC) $(CFLAGS) $(SANFLAGS) tests/ods2_dir_order_selftest.c $(VOLUME_SRCS) -o $@
+
 # --- CLI tools (built directly into the project root, e.g. ./ods2_ls,
 #     not into build/, since that's where they're actually run from) ---
 
@@ -189,6 +195,10 @@ test: $(TESTS) tools
 	@$(BUILD)/ods2_versions_selftest
 	@echo "--- ods2_time_selftest ---"
 	@$(BUILD)/ods2_time_selftest
+	@echo "--- ods2_file_alloc_selftest ---"
+	@$(BUILD)/ods2_file_alloc_selftest
+	@echo "--- ods2_dir_order_selftest ---"
+	@$(BUILD)/ods2_dir_order_selftest
 	@echo "--- CLI file version checks ---"
 	@sh tests/cli_versions_check.sh
 	@echo "--- CLI directory wildcard checks ---"
@@ -231,5 +241,5 @@ release: test
 clean:
 	rm -rf $(BUILD)
 	rm -f samples/synthetic_disk.img samples/synthetic_disk_working.img
-	rm -f samples/versions_disk.img samples/versions_cli_disk.img samples/cli_wildcard_disk.img
+	rm -f samples/versions_disk.img samples/versions_cli_disk.img samples/cli_wildcard_disk.img samples/file_alloc_disk.img samples/dir_order_disk.img
 	rm -f $(TOOLS)

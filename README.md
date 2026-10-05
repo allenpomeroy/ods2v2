@@ -118,6 +118,14 @@ line (`./ods2 transfer.dsk DIR "[*...]*.*"`), since `[`, `*` and `?`
 are shell wildcards too. The other commands act on one directory and
 refuse a wildcard one.
 
+File names follow ODS-2's rules: letters, digits, `$`, `_` and `-`,
+with one `.` before the type, and up to 39 characters on each side
+(names are uppercased for you). A host path won't do as a name -
+`COPY src/x.c [TEST1]src/x.c` is refused; create `[TEST1.SRC]` and
+copy to `[TEST1.SRC]X.C` instead. A name without a type is stored as
+VMS stores it, with the dot (`MAKEFILE.`), and can be typed either
+way.
+
 File versions follow VMS rules too. `NAME;3` is version 3; `NAME`,
 `NAME;` and `NAME;0` mean the highest version; `NAME;-1` is the next
 lower existing version; `NAME;*` means every version (`DIR` and
@@ -210,7 +218,7 @@ third_party/linenoise/  BSD licensed - interactive-mode command history
 
 ## Testing
 
-`make test` builds and runs 16 test suites and two scripts that check
+`make test` builds and runs 18 test suites and two scripts that check
 the `ods2` command line, with `-fsanitize=address,undefined` on by default for development
 builds (`make release` builds without them once things are stable).
 Most tests run entirely offline against a synthetic disk
@@ -233,9 +241,14 @@ in every structural test.
   version 1 of a new name only.
 - `TYPE` and `DELETE` don't take wildcards yet, in file names or
   directories (VMS's do); only `DIR` does.
-- INDEXF.SYS is never extended, so the number of new files is limited
-  by how many free headers the volume already has. The bundled empty
-  starter volume has room for only a handful.
+- INDEXF.SYS is extended as new files need it, but only into space
+  below LBN 4,194,304 (2 GB), since that's all a Format 1 retrieval
+  pointer can address. On a bigger volume whose free space starts
+  above that, creating a file fails with a clear message once the
+  headers INITIALIZE preallocated (`/HEADERS`) are used up.
+- File numbers stop at 65,535 (the FID_NMX extension isn't used).
+- A directory is limited to 256 blocks (a few thousand entries), the
+  most one contiguous extent can map here.
 
 ## Dependencies
 

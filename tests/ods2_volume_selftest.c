@@ -473,19 +473,36 @@ int main(void)
         printf("PASS: created %d files in a directory, forcing it past its "
                "initial single-block allocation\n", n_created);
 
-        /* Confirm the directory's header now genuinely has more than
-           one extent - proof extension actually happened, not that
-           all 40 somehow fit in the original allocation. */
+        /* Confirm the directory genuinely grew past its original
+           cluster - and stayed one contiguous extent, as spec 4.2
+           requires of a directory (it is moved to a bigger area rather
+           than given a second extent elsewhere) - with its entries in
+           order across all its blocks, which VMS's directory search
+           depends on, and every block inside the end-of-file. */
         {
             ods2_extent_t extents[ODS2_MAX_EXTENTS];
             int extent_count;
+            const ods2_head_core_t *sub_core = (const ods2_head_core_t *) subdir_header;
+            uint32_t sub_hiblk = ods2_word_swap32(sub_core->recattr.hiblk);
+            uint32_t sub_efblk = ods2_word_swap32(sub_core->recattr.efblk);
+            ods2_dir_entry_t in_order[128];
+            int listed = 0, k;
+
             r = ods2_decode_all_extents(&wvol, subdir_header, extents, ODS2_MAX_EXTENTS,
                                          &extent_count);
             assert(r.ok);
-            assert(extent_count >= 2);
-            printf("PASS: directory header now has %d extents, confirming it "
-                   "genuinely grew (not just fit in the original allocation)\n",
-                   extent_count);
+            assert(extent_count == 1);
+            assert(sub_hiblk > wvol.home.cluster);
+            assert(sub_core->filechar & 0x0080u); /* FH2$M_CONTIG */
+            assert(sub_efblk - 1 > wvol.home.cluster && sub_core->recattr.ffbyte == 0);
+            r = ods2_list_directory(&wvol, subdir_header, in_order, 128, &listed);
+            assert(r.ok && listed == n_created);
+            for (k = 1; k < listed; k++) {
+                assert(strcmp(in_order[k - 1].name, in_order[k].name) < 0);
+            }
+            printf("PASS: directory grew to %u blocks (%u in use) as one contiguous "
+                   "extent, all %d entries in order across its blocks\n",
+                   (unsigned) sub_hiblk, (unsigned) sub_efblk - 1, listed);
         }
 
         /* Extension revises the directory's own header (in

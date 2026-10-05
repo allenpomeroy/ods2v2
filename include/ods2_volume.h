@@ -193,14 +193,16 @@ size_t ods2_file_content_length(const uint8_t *header);
    FAT$L_HIBLK * 512. */
 size_t ods2_file_allocated_bytes(const uint8_t *header);
 
-/* Finds a free file number for a new file, and the correct file
-   sequence number to assign it (spec 5.1.7: seq=1 for a genuinely
-   never-used slot, or (old seq)+1 for a slot that held a deleted
-   file - distinguished via FH2$M_MARKDEL, since both cases have
-   fid_num==0). See ods2_volume.c for why this validates actual
-   header content rather than trusting the index file bitmap alone -
-   the spec itself documents the bitmap can have "dropped bits" and
-   the header content is the real authority. */
+/* Finds a free file number for a new file, and the file sequence
+   number to give it, following spec 5.1.6/5.1.7: the number comes from
+   the index file bitmap (searching start_from up to start_from +
+   max_search - 1, within MAXFILES); its header slot, if inside
+   INDEXF.SYS's end-of-file, is then checked - a valid header there is
+   never reused even when the bitmap says free, a deleted one gives
+   (old seq)+1, anything else gives 1. A slot beyond the end-of-file
+   always gives 1. Changes nothing on disk: ods2_create_file() and
+   ods2_create_directory() also move INDEXF.SYS's end-of-file past the
+   new header (extending INDEXF.SYS if needed) and mark the bitmap. */
 ods2_result_t ods2_find_free_file_number(ods2_volume_t *vol, unsigned start_from,
                                           unsigned max_search, unsigned *file_number_out,
                                           uint16_t *seq_out);

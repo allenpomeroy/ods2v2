@@ -350,6 +350,102 @@ int main(void)
                "sentinel) writes a sentinel at the new end\n");
     }
 
+    /* --- File and directory names (spec 4.2.5) --- */
+    {
+        char out[64];
+        const char *why = NULL;
+        struct { const char *in, *out; } good[] = {
+            { "readme.md", "README.MD" },
+            { "makefile", "MAKEFILE." },          /* the dot is always stored */
+            { "MAKEFILE.", "MAKEFILE." },
+            { ".login", ".LOGIN" },                /* null name, as VMS allows */
+            { "ods2-spec_v1$.txt", "ODS2-SPEC_V1$.TXT" },
+            { "A23456789012345678901234567890123456789.B23456789012345678901234567890123456789",
+              "A23456789012345678901234567890123456789.B23456789012345678901234567890123456789" },
+        };
+        const char *bad[] = { "src/ods2_bitmap.c", "a.b.c", "", ".", "with space.txt",
+                              "star*.txt", "back\\slash.c",
+                              "A234567890123456789012345678901234567890.TXT" /* 40 */ };
+        size_t i;
+        for (i = 0; i < sizeof good / sizeof good[0]; i++) {
+            char big[128];
+            assert(ods2_make_file_name(good[i].in, big, sizeof big, &why));
+            assert(strcmp(big, good[i].out) == 0);
+        }
+        for (i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+            char big[128];
+            why = NULL;
+            assert(!ods2_make_file_name(bad[i], big, sizeof big, &why) && why != NULL);
+        }
+        assert(!ods2_make_file_name("src/x.c", out, sizeof out, &why) && strstr(why, "'/'"));
+        assert(ods2_valid_dir_name("convert", &why) && ods2_valid_dir_name("A-B_C$1", &why));
+        assert(!ods2_valid_dir_name("", &why) && !ods2_valid_dir_name("A.B", &why));
+        assert(!ods2_valid_dir_name("src/x", &why));
+        assert(!ods2_valid_dir_name("A234567890123456789012345678901234567890", &why));
+        printf("PASS: names: only A-Z 0-9 $ _ -, one dot always stored "
+               "(MAKEFILE -> MAKEFILE.), 39-character parts; '/' explained\n");
+    }
+    {
+        assert(ods2_dir_name_compare("MAKEFILE", 8, "MAKEFILE.", 9) == 0);
+        assert(ods2_dir_name_compare("makefile.", 9, "MAKEFILE.", 9) == 0);
+        assert(ods2_dir_name_compare("A.B", 3, "A-B.C", 5) > 0);  /* '-' < '.' */
+        assert(ods2_dir_name_compare("A.B", 3, "A.BC", 4) < 0);
+        assert(ods2_dir_name_compare("AB", 2, "A.B", 3) > 0);     /* "AB." vs "A.B" */
+        printf("PASS: name comparison is byte order, case-insensitive, with "
+               "MAKEFILE equal to MAKEFILE.\n");
+    }
+
+    /* --- Choosing a block, splitting a full one --- */
+    {
+        static uint8_t blocks[3 * 512];
+        ods2_fid_t f = { 1, 1, 0, 0 };
+        memset(blocks, 0, sizeof blocks);
+        blocks[0] = blocks[1] = 0xff;
+        assert(ods2_insert_dir_entry(blocks, 512, "B.TXT", 1, f));
+        assert(ods2_insert_dir_entry(blocks, 512, "C.TXT", 1, f));
+        blocks[512] = blocks[513] = 0xff;                /* block 1: empty */
+        blocks[1024] = blocks[1025] = 0xff;
+        assert(ods2_insert_dir_entry(blocks + 1024, 512, "M.TXT", 1, f));
+        assert(ods2_insert_dir_entry(blocks + 1024, 512, "P.TXT", 1, f));
+        assert(ods2_dir_block_is_empty(blocks + 512) && !ods2_dir_block_is_empty(blocks));
+        assert(ods2_dir_choose_block(blocks, 3, "A.TXT") == 0);  /* before all */
+        assert(ods2_dir_choose_block(blocks, 3, "D.TXT") == 0);
+        assert(ods2_dir_choose_block(blocks, 3, "M.TXT") == 2);  /* equal to a first */
+        assert(ods2_dir_choose_block(blocks, 3, "Z.TXT") == 2);
+        printf("PASS: a name goes in the last block whose first entry sorts "
+               "at or before it (empty blocks skipped)\n");
+    }
+    {
+        static uint8_t combined[1024], a[512], b[512];
+        ods2_dir_entry_t ea[64], eb[64];
+        ods2_fid_t f = { 1, 1, 0, 0 };
+        char name[40], last_a[sizeof ea[0].name];
+        int i, na, nb;
+        memset(combined, 0, sizeof combined);
+        combined[0] = combined[1] = 0xff;
+        for (i = 0; i < 36; i++) {              /* 36 x 26-byte records: > 512 */
+            snprintf(name, sizeof name, "FILE%04d.TXT", i * 7 % 36); /* out of order */
+            assert(ods2_insert_dir_entry(combined, sizeof combined, name, 1, f));
+        }
+        assert(ods2_dir_split_block(combined, sizeof combined, a, b));
+        na = ods2_parse_directory(a, 512, ea, 64);
+        nb = ods2_parse_directory(b, 512, eb, 64);
+        assert(na + nb == 36 && na >= 17 && nb >= 17);    /* about half each */
+        for (i = 1; i < na; i++) assert(strcmp(ea[i - 1].name, ea[i].name) < 0);
+        for (i = 1; i < nb; i++) assert(strcmp(eb[i - 1].name, eb[i].name) < 0);
+        snprintf(last_a, sizeof last_a, "%s", ea[na - 1].name);
+        assert(strcmp(last_a, eb[0].name) < 0);           /* order across the split */
+        {
+            static uint8_t one[1024];
+            memset(one, 0, sizeof one);
+            one[0] = one[1] = 0xff;
+            assert(ods2_insert_dir_entry(one, sizeof one, "ONLY.TXT", 1, f));
+            assert(!ods2_dir_split_block(one, sizeof one, a, b)); /* needs 2 records */
+        }
+        printf("PASS: a full block splits into two halves (%d + %d records), in "
+               "order within and across them\n", na, nb);
+    }
+
     printf("\nods2_directory_write_selftest: all checks passed\n");
     return 0;
 }

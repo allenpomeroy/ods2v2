@@ -94,6 +94,7 @@
 #include "ods2_volume.h"
 #include "ods2_path.h"
 #include "ods2_wildcard.h"
+#include "ods2_directory_write.h"
 
 #define MAX_LINE 1024
 #define MAX_TOKENS 8
@@ -439,6 +440,7 @@ static void cmd_dir(ods2_volume_t *vol, const ods2_parsed_path_t *p)
     char spec[ODS2_PATH_MAX + 4];
     char start[ODS2_PATH_MAX];
     const char *rest;
+    char file_pattern[ODS2_PATH_MAX + 4];
     dir_walk_t w;
 
     resolve_effective_path(p, effective_dir, sizeof(effective_dir));
@@ -458,7 +460,17 @@ static void cmd_dir(ods2_volume_t *vol, const ods2_parsed_path_t *p)
     memset(&w, 0, sizeof(w));
     w.vol = vol;
     w.spec = rest;
-    w.pattern = (p->filename[0] != '\0') ? p->filename : "*";
+    /* As in VMS DIRECTORY, a name with no type means any type:
+       "MAKEFILE" is "MAKEFILE.*", "*" is "*.*". (Names are stored with
+       their dot, "MAKEFILE.", so the bare pattern would match nothing.) */
+    if (p->filename[0] == '\0') {
+        snprintf(file_pattern, sizeof(file_pattern), "*.*");
+    } else if (strchr(p->filename, '.') == NULL) {
+        snprintf(file_pattern, sizeof(file_pattern), "%s.*", p->filename);
+    } else {
+        snprintf(file_pattern, sizeof(file_pattern), "%s", p->filename);
+    }
+    w.pattern = file_pattern;
     w.p = p;
     walk_directories(&w, start, "", 0);
 
@@ -572,7 +584,15 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
         free(buf);
         return;
     }
-    printf("%%ODS2-I-COPIED, %zu bytes to %s;1\n", content_len, name);
+    {
+        /* Report the name as stored: uppercase, with its dot. */
+        char stored[ODS2_PATH_MAX];
+        const char *why;
+        if (!ods2_make_file_name(name, stored, sizeof(stored), &why)) {
+            snprintf(stored, sizeof(stored), "%s", name);
+        }
+        printf("%%ODS2-I-COPIED, %zu bytes to %s;1\n", content_len, stored);
+    }
     free(buf);
 }
 

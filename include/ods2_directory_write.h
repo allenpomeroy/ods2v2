@@ -78,4 +78,53 @@ bool ods2_remove_dir_entry(uint8_t *block, size_t block_size, const char *name);
 bool ods2_remove_dir_version(uint8_t *block, size_t block_size, const char *name,
                              uint16_t version);
 
+/* --- Names (spec 4.2.5) ---
+ *
+ * A directory record's name is "NAME.TYPE": the dot is always there,
+ * even when the type (or name) is empty ("MAKEFILE."), and only
+ * letters, digits, '$', '_' and '-' may appear. VMS also limits NAME
+ * and TYPE to 39 characters each. */
+#define ODS2_NAME_PART_MAX 39
+
+/* Validates a file name for a new file and writes its canonical
+   on-disk form to `out`: uppercased, with the dot added if missing
+   ("makefile" -> "MAKEFILE."). On failure returns false and sets
+   *why to a message naming the problem. */
+bool ods2_make_file_name(const char *in, char *out, size_t out_size, const char **why);
+
+/* Validates a directory's own name (the part before ".DIR"): 1-39
+   letters, digits, '$', '_' or '-'. Sets *why on failure. */
+bool ods2_valid_dir_name(const char *name, const char **why);
+
+/* Compares two names the way a directory is ordered: case-insensitive
+   byte order, with a name that has no dot compared as if it ended in
+   one - so "MAKEFILE" (as ods2v2 once stored it) and "MAKEFILE." are
+   the same name. Returns <0, 0, >0 like strcmp. */
+int ods2_dir_name_compare(const char *a, size_t a_len, const char *b, size_t b_len);
+
+/* --- Multi-block directories (spec 4.2) ---
+ *
+ * Entries are sorted across the whole directory, not just within each
+ * block: VMS searches a directory by comparing against each block's
+ * names and stops looking once it is past where a name would be, so
+ * an entry in the wrong block is never found (TYPE gives RMS-E-FNF,
+ * ANALYZE/DISK gives BAD_NAMEORDER). */
+
+/* Is `block` empty (no records before its -1 end marker)? */
+bool ods2_dir_block_is_empty(const uint8_t *block);
+
+/* Which of `count` consecutive 512-byte blocks `name` belongs in: the
+   last non-empty block whose first record sorts at or before `name`,
+   or block 0 if `name` sorts before them all. */
+unsigned ods2_dir_choose_block(const uint8_t *blocks, unsigned count, const char *name);
+
+/* Splits the records of `src` (a directory block of `src_size` bytes,
+   which may be larger than 512 - e.g. a full block with one more
+   record inserted into a 1024-byte copy) into two 512-byte blocks `a`
+   and `b`, keeping their order and dividing them as evenly as
+   possible. Each gets its -1 end marker; the rest is zeroed. Returns
+   false if they can't be divided into two blocks that fit (fewer than
+   two records, or too large). */
+bool ods2_dir_split_block(const uint8_t *src, size_t src_size, uint8_t *a, uint8_t *b);
+
 #endif /* ODS2_DIRECTORY_WRITE_H */

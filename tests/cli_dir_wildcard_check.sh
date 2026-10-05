@@ -89,6 +89,18 @@ done
 check "the refused DELETE left NOTE.TXT in place" \
     "TEST1.TEST2" "$(dirs 'DIR [TEST1...]NOTE.TXT')"
 
+# File names: ODS-2 characters only; a type-less name is stored with
+# its dot (MAKEFILE.), and DIR's missing type means any type, as on VMS.
+check "COPY to a name with '/' is refused with a hint" \
+    "1" "$($ODS2 $DISK 'COPY samples/cli_wildcard_tmp.txt [JONES]src/x.c' 2>&1 | grep -c "subdirectory")"
+check "COPY to makefile stores MAKEFILE." \
+    "%ODS2-I-COPIED, 6 bytes to MAKEFILE.;1" \
+    "$($ODS2 $DISK 'COPY samples/cli_wildcard_tmp.txt [JONES]makefile' 2>&1)"
+check "DIR [JONES]MAKEFILE finds MAKEFILE." \
+    "MAKEFILE.;1" "$($ODS2 $DISK 'DIR [JONES]MAKEFILE' | grep ';' | tr -d ' ')"
+check "TYPE [JONES]MAKEFILE finds it without the dot" \
+    "hello" "$($ODS2 $DISK 'TYPE [JONES]MAKEFILE')"
+
 rm -f samples/cli_wildcard_tmp.txt samples/cli_wildcard_tmp.cmd "$DISK"
 if [ "$fails" -ne 0 ]; then
     echo "FAIL: $fails CLI directory wildcard check(s) failed"

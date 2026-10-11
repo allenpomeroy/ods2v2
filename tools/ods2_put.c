@@ -30,14 +30,64 @@
  *   rtype defaults to 5 (FAB$C_STMLF, stream-LF - typical for text);
  *   pass 1 (FAB$C_FIX) for binary content.
  *
- * Supports multi-extent files up to ~9.5MB (77 extents in a single
- * header's map area, ~254 blocks each on a typical small cluster
- * factor) - see ods2_create_file()'s documentation for the exact
- * limit and why it exists.
+ * Any size of file the volume has room for - see ods2_create_file().
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include "ods2_volume.h"
+
+/* Reads all of `path` into a malloc'd buffer (*buf_out, *len_out),
+   however large: sized from the file's own length, growing as needed
+   for something without one (a pipe). Returns false and prints why
+   on failure. */
+static bool read_whole_file(const char *path, uint8_t **buf_out, size_t *len_out)
+{
+    FILE *f = fopen(path, "rb");
+    uint8_t *buf = NULL;
+    size_t cap = 0, len = 0;
+    long size;
+
+    if (f == NULL) {
+        fprintf(stderr, "%%ODS2-E-OPENIN, could not open %s\n", path);
+        return false;
+    }
+    if (fseek(f, 0, SEEK_END) == 0 && (size = ftell(f)) >= 0 && fseek(f, 0, SEEK_SET) == 0) {
+        cap = (size_t) size + 1; /* +1: a read that fills it means the file grew */
+    } else {
+        clearerr(f);
+        cap = 1u << 20;
+    }
+    for (;;) {
+        size_t n;
+        if (len == cap || buf == NULL) {
+            uint8_t *grown;
+            if (buf != NULL) cap *= 2;
+            grown = realloc(buf, cap);
+            if (grown == NULL) {
+                fprintf(stderr, "%%ODS2-E-NOMEM, could not allocate %zu bytes to read %s\n",
+                        cap, path);
+                free(buf);
+                fclose(f);
+                return false;
+            }
+            buf = grown;
+        }
+        n = fread(buf + len, 1, cap - len, f);
+        len += n;
+        if (n == 0) break;
+    }
+    if (ferror(f)) {
+        fprintf(stderr, "%%ODS2-E-READERR, error reading %s\n", path);
+        free(buf);
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+    *buf_out = buf;
+    *len_out = len;
+    return true;
+}
 
 int main(int argc, char **argv)
 {
@@ -45,14 +95,7 @@ int main(int argc, char **argv)
     ods2_result_t r;
     ods2_fid_t dir_fid, new_fid;
     uint8_t dir_header[512];
-    FILE *local_f;
     uint8_t *buf;
-    size_t buf_size = 12u * 1024u * 1024u; /* headroom above the ~9.5MB
-                                               practical limit, so an
-                                               oversized file gets a
-                                               clear error from
-                                               ods2_create_file rather
-                                               than a truncated read */
     size_t content_len;
     uint8_t rtype;
 
@@ -64,26 +107,9 @@ int main(int argc, char **argv)
     }
     rtype = (argc == 6) ? (uint8_t) atoi(argv[5]) : 5;
 
-    local_f = fopen(argv[2], "rb");
-    if (local_f == NULL) {
-        perror(argv[2]);
+    if (!read_whole_file(argv[2], &buf, &content_len)) {
         return 1;
     }
-    buf = malloc(buf_size);
-    if (buf == NULL) {
-        fprintf(stderr, "could not allocate read buffer\n");
-        fclose(local_f);
-        return 1;
-    }
-    content_len = fread(buf, 1, buf_size, local_f);
-    if (!feof(local_f)) {
-        fprintf(stderr, "%s: file too large for a single header's map area - "
-                        "see ods2_create_file())\n", argv[2]);
-        free(buf);
-        fclose(local_f);
-        return 1;
-    }
-    fclose(local_f);
 
     r = ods2_mount_write(argv[1], &vol);
     if (!r.ok) {

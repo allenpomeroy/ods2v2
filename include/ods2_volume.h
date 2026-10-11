@@ -36,7 +36,11 @@
 #include <stdio.h>
 #include <stdbool.h>
 
-#define ODS2_MAX_EXTENTS 128
+/* Most extents (retrieval pointers) a file may have across all its
+   headers - the size of the extent lists used when reading, writing
+   and deleting. ods2_create_file() refuses a file that would need
+   more, which happens only on badly fragmented free space. */
+#define ODS2_MAX_EXTENTS 1024
 
 typedef struct {
     FILE          *fp;
@@ -81,7 +85,7 @@ void ods2_dismount(ods2_volume_t *vol);
    the VBN range covered by INDEXF.SYS's decoded extents - which for a
    volume with a small number of files (well under what a full
    INDEXF.SYS extent list would cover) is normally everything that
-   exists. Extension headers (seg_num > 0) are not yet supported. */
+   exists. Reads any header, primary or extension (seg_num > 0). */
 ods2_result_t ods2_read_header(ods2_volume_t *vol, unsigned file_number,
                                 uint8_t *header_out);
 
@@ -226,6 +230,15 @@ ods2_result_t ods2_write_file_block(ods2_volume_t *vol, const uint8_t *header,
 ods2_result_t ods2_allocate_blocks(ods2_volume_t *vol, unsigned blocks_needed,
                                     uint32_t *lbn_out, unsigned *blocks_allocated_out);
 
+/* Like ods2_allocate_blocks(), but when no free run of `max_blocks`
+   (rounded up to whole clusters) exists, allocates the longest free
+   run there is instead, so a large file can be laid down in as few
+   pieces as possible. *blocks_allocated_out says how much was
+   reserved - possibly less than asked for; the caller allocates again
+   for the rest. Fails only when the volume has no free cluster. */
+ods2_result_t ods2_allocate_extent(ods2_volume_t *vol, unsigned max_blocks,
+                                    uint32_t *lbn_out, unsigned *blocks_allocated_out);
+
 /* Frees `block_count` blocks starting at `lbn` back to BITMAP.SYS's
  * storage bitmap - the exact inverse of ods2_allocate_blocks(). Marks
  * the corresponding clusters free (set, per spec 5.2.2); `lbn` and
@@ -262,15 +275,17 @@ ods2_result_t ods2_create_directory(ods2_volume_t *vol, const uint8_t *parent_he
  * uniform-size chunks; ods2_header_build.h's ods2_header_spec_t has
  * the full field if finer control is needed via a lower-level call.
  *
- * Supports multi-extent files (content allocated across several
- * retrieval pointers when it exceeds Format 1's 256-block/128KB
- * single-extent limit, chunked in a way that guarantees cluster
- * rounding never pushes any one extent over that limit). A single
- * header's map area holds up to ~77 extents; content needing more
- * than that (a genuinely large, badly fragmented file) fails cleanly
- * rather than silently truncating - a second, extension header would
- * be needed and is not yet implemented. Same parent-has-no-room-so-
- * it-grows and duplicate-name behavior as ods2_create_directory().
+ * Any size of file the volume has room for: the content is allocated
+ * in as few, as large pieces as the free space allows (one piece on a
+ * volume with a long enough free run), each described by the smallest
+ * retrieval pointer that fits it (Format 1, 2 or 3). Pointers that
+ * don't fit in the primary header's map area continue in extension
+ * headers, chained through FH2$W_EXT_FID, so even a file spread over
+ * fragmented free space is stored whole. A file that would need more
+ * than ODS2_MAX_EXTENTS pieces, or more space than is free, fails
+ * cleanly and gives back everything it had allocated. Same
+ * parent-has-no-room-so-it-grows and duplicate-name behavior as
+ * ods2_create_directory().
  * The volume must be mounted for write.
  */
 ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,

@@ -35,6 +35,12 @@
  *   ods2 <disk-image> @<script-file>        run commands from a file,
  *                                            one per line
  *
+ * Exit status: 0 on success; 1 if the disk image couldn't be mounted,
+ * or if the command (single-shot) or any command in the script failed
+ * - i.e. reported a %ODS2-E- error. A script runs to the end either
+ * way. Warnings (%ODS2-W-, e.g. DIR finding no files) don't count as
+ * failure.
+ *
  * Commands (case-insensitive; VMS bracket-notation paths throughout,
  * e.g. [DECUS.NETLIB020]FILE.TXT):
  *   DIR [path] [wildcard]         list a directory
@@ -91,6 +97,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdarg.h>
 #include "ods2_volume.h"
 #include "ods2_path.h"
 #include "ods2_wildcard.h"
@@ -108,6 +115,24 @@
 static char g_default_dir[ODS2_PATH_MAX] = "";
 
 /* Case-insensitive prefix/equality check. */
+/* Set by report_error(): some command since the last reset failed.
+   main() turns it into the exit status of a single-shot command or an
+   @script, so scripts and automation can tell success from failure
+   without parsing messages. */
+static bool g_command_failed = false;
+
+/* Prints an error message (%ODS2-E-...) to stderr and records that the
+   current command failed. Every error a command reports goes through
+   here; warnings (-W-) and informational messages (-I-) do not. */
+static void report_error(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    g_command_failed = true;
+}
+
 static bool matches(const char *token, const char *name)
 {
     size_t i;
@@ -149,7 +174,7 @@ static void format_file_spec(const ods2_parsed_path_t *p, char *out, size_t out_
 static bool refuse_wild_dir(const ods2_parsed_path_t *p, const char *command, const char *arg)
 {
     if (!p->dir_wildcard) return false;
-    fprintf(stderr, "%%ODS2-E-WILDDIR, %s: %s does not accept a wildcard or \"...\" "
+    report_error("%%ODS2-E-WILDDIR, %s: %s does not accept a wildcard or \"...\" "
                     "in the directory\n", arg, command);
     return true;
 }
@@ -345,7 +370,7 @@ static void walk_directories(dir_walk_t *w, const char *abs_path, const char *re
 
     if (!here && !deeper) return;
     if (depth > MAX_RECURSION_DEPTH) {
-        fprintf(stderr, "%%ODS2-E-TOODEEP, recursion limit reached, skipping "
+        report_error("%%ODS2-E-TOODEEP, recursion limit reached, skipping "
                         "subtree under [%s]\n", abs_path);
         w->errors++;
         return;
@@ -353,13 +378,13 @@ static void walk_directories(dir_walk_t *w, const char *abs_path, const char *re
 
     r = resolve_dir(w->vol, abs_path, dir_header, &dir_fid);
     if (!r.ok) {
-        fprintf(stderr, "%%ODS2-E-DIRERR, [%s]: %s\n", abs_path, r.problem);
+        report_error("%%ODS2-E-DIRERR, [%s]: %s\n", abs_path, r.problem);
         w->errors++;
         return;
     }
     r = ods2_list_directory_alloc(w->vol, dir_header, &entries, &count);
     if (!r.ok) {
-        fprintf(stderr, "%%ODS2-E-LISTERR, [%s]: %s\n", abs_path, r.problem);
+        report_error("%%ODS2-E-LISTERR, [%s]: %s\n", abs_path, r.problem);
         w->errors++;
         return;
     }
@@ -407,7 +432,7 @@ static void walk_directories(dir_walk_t *w, const char *abs_path, const char *re
                      rel_path[0] ? "." : "", name);
         if (a < 0 || (size_t) a >= sizeof(child_abs) || b < 0 ||
             (size_t) b >= sizeof(child_rel)) {
-            fprintf(stderr, "%%ODS2-E-PATHTOOLONG, path too deep to represent, "
+            report_error("%%ODS2-E-PATHTOOLONG, path too deep to represent, "
                             "skipping subtree under [%s]\n", abs_path);
             w->errors++;
             continue;
@@ -453,7 +478,7 @@ static void cmd_dir(ods2_volume_t *vol, const ods2_parsed_path_t *p)
        as such - and match only what follows it. */
     rest = ods2_dir_spec_split_prefix(spec, start, sizeof(start));
     if (rest == NULL) {
-        fprintf(stderr, "%%ODS2-E-BADPATH, [%s]: invalid directory specification\n", spec);
+        report_error("%%ODS2-E-BADPATH, [%s]: invalid directory specification\n", spec);
         return;
     }
 
@@ -499,38 +524,88 @@ static void cmd_create_directory(ods2_volume_t *vol, const ods2_parsed_path_t *p
 
     resolve_effective_path(p, effective_path, sizeof(effective_path));
     if (effective_path[0] == '\0') {
-        fprintf(stderr, "%%ODS2-E-BADPATH, no directory name given\n");
+        report_error("%%ODS2-E-BADPATH, no directory name given\n");
         return;
     }
     split_last_component(effective_path, dir_copy, &parent_path, &new_name);
 
     r = resolve_dir(vol, parent_path, parent_header, &parent_fid);
     if (!r.ok) {
-        fprintf(stderr, "%%ODS2-E-DIRERR, %s\n", r.problem);
+        report_error("%%ODS2-E-DIRERR, %s\n", r.problem);
         return;
     }
     r = ods2_create_directory(vol, parent_header, new_name, &new_fid);
     if (!r.ok) {
-        fprintf(stderr, "%%ODS2-E-CREATEERR, %s\n", r.problem);
+        report_error("%%ODS2-E-CREATEERR, %s\n", r.problem);
         return;
     }
     printf("%%ODS2-I-CREATED, created [%s]\n", effective_path);
+}
+
+/* Reads all of `path` into a malloc'd buffer (*buf_out, *len_out),
+   however large: sized from the file's own length, growing as needed
+   for something without one (a pipe). Returns false and prints why
+   on failure. */
+static bool read_whole_file(const char *path, uint8_t **buf_out, size_t *len_out)
+{
+    FILE *f = fopen(path, "rb");
+    uint8_t *buf = NULL;
+    size_t cap = 0, len = 0;
+    long size;
+
+    if (f == NULL) {
+        report_error("%%ODS2-E-OPENIN, could not open %s\n", path);
+        return false;
+    }
+    if (fseek(f, 0, SEEK_END) == 0 && (size = ftell(f)) >= 0 && fseek(f, 0, SEEK_SET) == 0) {
+        cap = (size_t) size + 1; /* +1: a read that fills it means the file grew */
+    } else {
+        clearerr(f);
+        cap = 1u << 20;
+    }
+    for (;;) {
+        size_t n;
+        if (len == cap || buf == NULL) {
+            uint8_t *grown;
+            if (buf != NULL) cap *= 2;
+            grown = realloc(buf, cap);
+            if (grown == NULL) {
+                report_error("%%ODS2-E-NOMEM, could not allocate %zu bytes to read %s\n",
+                        cap, path);
+                free(buf);
+                fclose(f);
+                return false;
+            }
+            buf = grown;
+        }
+        n = fread(buf + len, 1, cap - len, f);
+        len += n;
+        if (n == 0) break;
+    }
+    if (ferror(f)) {
+        report_error("%%ODS2-E-READERR, error reading %s\n", path);
+        free(buf);
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+    *buf_out = buf;
+    *len_out = len;
+    return true;
 }
 
 static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_parsed_path_t *p)
 {
     uint8_t dir_header[512];
     ods2_fid_t dir_fid, new_fid;
-    FILE *f;
     uint8_t *buf;
-    size_t buf_size = 12u * 1024u * 1024u;
     size_t content_len;
     ods2_result_t r;
     const char *name;
     uint8_t rtype = 5; /* FAB$C_STMLF - reasonable default for COPY */
 
     if (p->filename[0] == '\0') {
-        fprintf(stderr, "%%ODS2-E-BADPATH, no destination filename given\n");
+        report_error("%%ODS2-E-BADPATH, no destination filename given\n");
         return;
     }
     /* A new file is always created as version 1 here. Accept the
@@ -541,32 +616,15 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
         (p->version_wildcard || p->version < 0 || p->version > 1)) {
         char spec[ODS2_PATH_MAX + 16];
         format_file_spec(p, spec, sizeof(spec));
-        fprintf(stderr, "%%ODS2-E-BADVER, %s: COPY creates version 1 only - "
+        report_error("%%ODS2-E-BADVER, %s: COPY creates version 1 only - "
                         "give NAME, NAME; or NAME;1\n", spec);
         return;
     }
     name = p->filename;
 
-    f = fopen(local_file, "rb");
-    if (f == NULL) {
-        fprintf(stderr, "%%ODS2-E-OPENIN, could not open %s\n", local_file);
+    if (!read_whole_file(local_file, &buf, &content_len)) {
         return;
     }
-    buf = malloc(buf_size);
-    if (buf == NULL) {
-        fprintf(stderr, "%%ODS2-E-NOMEM, could not allocate read buffer\n");
-        fclose(f);
-        return;
-    }
-    content_len = fread(buf, 1, buf_size, f);
-    if (!feof(f)) {
-        fprintf(stderr, "%%ODS2-E-TOOBIG, %s is too large for a single header's map area\n",
-                local_file);
-        free(buf);
-        fclose(f);
-        return;
-    }
-    fclose(f);
 
     {
         char effective_dir[ODS2_PATH_MAX];
@@ -574,13 +632,13 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
         r = resolve_dir(vol, effective_dir, dir_header, &dir_fid);
     }
     if (!r.ok) {
-        fprintf(stderr, "%%ODS2-E-DIRERR, %s\n", r.problem);
+        report_error("%%ODS2-E-DIRERR, %s\n", r.problem);
         free(buf);
         return;
     }
     r = ods2_create_file(vol, dir_header, name, buf, content_len, rtype, &new_fid);
     if (!r.ok) {
-        fprintf(stderr, "%%ODS2-E-COPYERR, %s\n", r.problem);
+        report_error("%%ODS2-E-COPYERR, %s\n", r.problem);
         free(buf);
         return;
     }
@@ -607,12 +665,12 @@ static void cmd_type(ods2_volume_t *vol, const ods2_parsed_path_t *p)
     char spec[ODS2_PATH_MAX + 16];
 
     if (p->filename[0] == '\0') {
-        fprintf(stderr, "%%ODS2-E-BADPATH, no filename given\n");
+        report_error("%%ODS2-E-BADPATH, no filename given\n");
         return;
     }
     format_file_spec(p, spec, sizeof(spec));
     if (p->version_wildcard) {
-        fprintf(stderr, "%%ODS2-E-BADVER, %s: TYPE takes one version, not ;*\n", spec);
+        report_error("%%ODS2-E-BADVER, %s: TYPE takes one version, not ;*\n", spec);
         return;
     }
     {
@@ -621,40 +679,45 @@ static void cmd_type(ods2_volume_t *vol, const ods2_parsed_path_t *p)
         r = resolve_dir(vol, effective_dir, dir_header, &dir_fid);
     }
     if (!r.ok) {
-        fprintf(stderr, "%%ODS2-E-DIRERR, %s\n", r.problem);
+        report_error("%%ODS2-E-DIRERR, %s\n", r.problem);
         return;
     }
     /* p->version is 0 (highest) when no version was given. */
     r = ods2_lookup_name_version(vol, dir_header, p->filename, p->version, &file_fid, NULL);
     if (!r.ok) {
-        fprintf(stderr, "%%ODS2-E-FNF, %s not found\n", spec);
+        report_error("%%ODS2-E-FNF, %s not found\n", spec);
         return;
     }
     r = ods2_read_header(vol, file_fid.fid_num, file_header);
     if (!r.ok) {
-        fprintf(stderr, "%%ODS2-E-READERR, %s\n", r.problem);
+        report_error("%%ODS2-E-READERR, %s\n", r.problem);
         return;
     }
     /* Sized from the file's own end-of-file mark rather than a fixed
        guess, so any size of file can be typed. */
     buf_size = ods2_file_content_length(file_header);
     if (buf_size > ods2_file_allocated_bytes(file_header)) {
-        fprintf(stderr, "%%ODS2-E-READERR, %s: end-of-file mark lies beyond the "
+        report_error("%%ODS2-E-READERR, %s: end-of-file mark lies beyond the "
                         "file's allocated blocks (corrupt header?)\n", spec);
         return;
     }
     buf = malloc(buf_size > 0 ? buf_size : 1);
     if (buf == NULL) {
-        fprintf(stderr, "%%ODS2-E-NOMEM, could not allocate %zu-byte read buffer\n", buf_size);
+        report_error("%%ODS2-E-NOMEM, could not allocate %zu-byte read buffer\n", buf_size);
         return;
     }
     r = ods2_read_file(vol, file_header, buf, buf_size, &bytes_read);
     if (!r.ok) {
-        fprintf(stderr, "%%ODS2-E-READERR, %s\n", r.problem);
+        report_error("%%ODS2-E-READERR, %s\n", r.problem);
         free(buf);
         return;
     }
-    fwrite(buf, 1, bytes_read, stdout);
+    /* A short write (a full disk, a closed pipe) is a failed TYPE:
+       whatever was extracting the file got less than all of it. */
+    if (fwrite(buf, 1, bytes_read, stdout) != bytes_read || fflush(stdout) != 0) {
+        report_error("%%ODS2-E-WRITEERR, %s: could not write all %zu bytes to output\n",
+                     spec, bytes_read);
+    }
     free(buf);
 }
 
@@ -688,7 +751,7 @@ static void cmd_delete(ods2_volume_t *vol, const ods2_parsed_path_t *p)
         const char *parent_path;
         const char *last_name;
         if (effective_path[0] == '\0') {
-            fprintf(stderr, "%%ODS2-E-BADPATH, cannot delete the root directory\n");
+            report_error("%%ODS2-E-BADPATH, cannot delete the root directory\n");
             return;
         }
         split_last_component(effective_path, split_buf, &parent_path, &last_name);
@@ -699,7 +762,7 @@ static void cmd_delete(ods2_volume_t *vol, const ods2_parsed_path_t *p)
 
     r = resolve_dir(vol, dir_path, dir_header, &dir_fid);
     if (!r.ok) {
-        fprintf(stderr, "%%ODS2-E-DIRERR, %s\n", r.problem);
+        report_error("%%ODS2-E-DIRERR, %s\n", r.problem);
         return;
     }
 
@@ -721,7 +784,7 @@ static void cmd_delete(ods2_volume_t *vol, const ods2_parsed_path_t *p)
         } else {
             snprintf(spec, sizeof(spec), "%s", name);
         }
-        fprintf(stderr, "%%ODS2-E-DELETEERR, %s: %s\n", spec, r.problem);
+        report_error("%%ODS2-E-DELETEERR, %s: %s\n", spec, r.problem);
     }
 }
 
@@ -792,16 +855,16 @@ static bool execute_line(ods2_volume_t *vol, char *line)
         ods2_fid_t fid;
         ods2_result_t r;
         if (n < 3) {
-            fprintf(stderr, "%%ODS2-E-NOPARM, usage: SET DEFAULT <path>\n");
+            report_error("%%ODS2-E-NOPARM, usage: SET DEFAULT <path>\n");
             return true;
         }
         if (!ods2_parse_path(tokens[2], &p)) {
-            fprintf(stderr, "%%ODS2-E-BADPATH, could not parse %s\n", tokens[2]);
+            report_error("%%ODS2-E-BADPATH, could not parse %s\n", tokens[2]);
             return true;
         }
         if (refuse_wild_dir(&p, "SET DEFAULT", tokens[2])) return true;
         if (p.filename[0] != '\0') {
-            fprintf(stderr, "%%ODS2-E-BADPATH, SET DEFAULT takes a directory, "
+            report_error("%%ODS2-E-BADPATH, SET DEFAULT takes a directory, "
                             "not a file (%s)\n", tokens[2]);
             return true;
         }
@@ -811,12 +874,12 @@ static bool execute_line(ods2_volume_t *vol, char *line)
            session pointed at a directory that doesn't exist. */
         r = ods2_lookup_path(vol, effective, &fid);
         if (!r.ok) {
-            fprintf(stderr, "%%ODS2-E-DIRERR, %s\n", r.problem);
+            report_error("%%ODS2-E-DIRERR, %s\n", r.problem);
             return true;
         }
         r = ods2_read_header(vol, fid.fid_num, header);
         if (r.ok && !(((ods2_head_core_t *) header)->filechar & 0x2000u)) {
-            fprintf(stderr, "%%ODS2-E-NOTDIR, %s is not a directory\n", tokens[2]);
+            report_error("%%ODS2-E-NOTDIR, %s is not a directory\n", tokens[2]);
             return true;
         }
         strncpy(g_default_dir, effective, sizeof(g_default_dir) - 1);
@@ -839,7 +902,7 @@ static bool execute_line(ods2_volume_t *vol, char *line)
                                                          logic as a bare
                                                          filename */
         if (!ods2_parse_path(arg, &p)) {
-            fprintf(stderr, "%%ODS2-E-BADPATH, could not parse %s\n", arg);
+            report_error("%%ODS2-E-BADPATH, could not parse %s\n", arg);
             return true;
         }
         /* An explicit third token overrides any wildcard already
@@ -850,7 +913,7 @@ static bool execute_line(ods2_volume_t *vol, char *line)
             p.filename[sizeof(p.filename) - 1] = '\0';
             if (!ods2_split_version(p.filename, &p.has_version,
                                     &p.version_wildcard, &p.version)) {
-                fprintf(stderr, "%%ODS2-E-BADPATH, could not parse %s\n", tokens[2]);
+                report_error("%%ODS2-E-BADPATH, could not parse %s\n", tokens[2]);
                 return true;
             }
         }
@@ -861,11 +924,11 @@ static bool execute_line(ods2_volume_t *vol, char *line)
         matches(tokens[0], "MKDIR")) {
         ods2_parsed_path_t p;
         if (n < 2) {
-            fprintf(stderr, "%%ODS2-E-NOPARM, usage: CREATE/DIRECTORY <path>\n");
+            report_error("%%ODS2-E-NOPARM, usage: CREATE/DIRECTORY <path>\n");
             return true;
         }
         if (!ods2_parse_path(tokens[1], &p)) {
-            fprintf(stderr, "%%ODS2-E-BADPATH, could not parse %s\n", tokens[1]);
+            report_error("%%ODS2-E-BADPATH, could not parse %s\n", tokens[1]);
             return true;
         }
         if (refuse_wild_dir(&p, "CREATE/DIRECTORY", tokens[1])) return true;
@@ -875,11 +938,11 @@ static bool execute_line(ods2_volume_t *vol, char *line)
     if (matches(tokens[0], "COPY") || matches(tokens[0], "PUT") || matches(tokens[0], "IMPORT")) {
         ods2_parsed_path_t p;
         if (n < 3) {
-            fprintf(stderr, "%%ODS2-E-NOPARM, usage: COPY <local-file> <path>\n");
+            report_error("%%ODS2-E-NOPARM, usage: COPY <local-file> <path>\n");
             return true;
         }
         if (!ods2_parse_path(tokens[2], &p)) {
-            fprintf(stderr, "%%ODS2-E-BADPATH, could not parse %s\n", tokens[2]);
+            report_error("%%ODS2-E-BADPATH, could not parse %s\n", tokens[2]);
             return true;
         }
         if (refuse_wild_dir(&p, "COPY", tokens[2])) return true;
@@ -889,11 +952,11 @@ static bool execute_line(ods2_volume_t *vol, char *line)
     if (matches(tokens[0], "TYPE") || matches(tokens[0], "CAT")) {
         ods2_parsed_path_t p;
         if (n < 2) {
-            fprintf(stderr, "%%ODS2-E-NOPARM, usage: TYPE <path>\n");
+            report_error("%%ODS2-E-NOPARM, usage: TYPE <path>\n");
             return true;
         }
         if (!ods2_parse_path(tokens[1], &p)) {
-            fprintf(stderr, "%%ODS2-E-BADPATH, could not parse %s\n", tokens[1]);
+            report_error("%%ODS2-E-BADPATH, could not parse %s\n", tokens[1]);
             return true;
         }
         if (refuse_wild_dir(&p, "TYPE", tokens[1])) return true;
@@ -903,11 +966,11 @@ static bool execute_line(ods2_volume_t *vol, char *line)
     if (matches(tokens[0], "DELETE") || matches(tokens[0], "RM")) {
         ods2_parsed_path_t p;
         if (n < 2) {
-            fprintf(stderr, "%%ODS2-E-NOPARM, usage: DELETE <path>\n");
+            report_error("%%ODS2-E-NOPARM, usage: DELETE <path>\n");
             return true;
         }
         if (!ods2_parse_path(tokens[1], &p)) {
-            fprintf(stderr, "%%ODS2-E-BADPATH, could not parse %s\n", tokens[1]);
+            report_error("%%ODS2-E-BADPATH, could not parse %s\n", tokens[1]);
             return true;
         }
         if (refuse_wild_dir(&p, "DELETE", tokens[1])) return true;
@@ -915,7 +978,7 @@ static bool execute_line(ods2_volume_t *vol, char *line)
         return true;
     }
 
-    fprintf(stderr, "%%ODS2-E-ILLCMD, unrecognized command \"%s\" - try HELP\n", tokens[0]);
+    report_error("%%ODS2-E-ILLCMD, unrecognized command \"%s\" - try HELP\n", tokens[0]);
     return true;
 }
 
@@ -924,7 +987,7 @@ static int run_script(ods2_volume_t *vol, const char *script_path)
     FILE *f = fopen(script_path, "r");
     char line[MAX_LINE];
     if (f == NULL) {
-        fprintf(stderr, "%%ODS2-E-OPENIN, could not open script %s\n", script_path);
+        report_error("%%ODS2-E-OPENIN, could not open script %s\n", script_path);
         return 1;
     }
     while (fgets(line, sizeof(line), f) != NULL) {
@@ -937,7 +1000,9 @@ static int run_script(ods2_volume_t *vol, const char *script_path)
         if (!execute_line(vol, line)) break;
     }
     fclose(f);
-    return 0;
+    /* Every line runs, as before, but the script as a whole failed if
+       any command in it did. */
+    return g_command_failed ? 1 : 0;
 }
 
 int main(int argc, char **argv)
@@ -991,6 +1056,7 @@ int main(int argc, char **argv)
             strncat(line, argv[i], sizeof(line) - strlen(line) - 1);
         }
         execute_line(&vol, line);
+        exit_code = g_command_failed ? 1 : 0;
     }
 
     ods2_dismount(&vol);

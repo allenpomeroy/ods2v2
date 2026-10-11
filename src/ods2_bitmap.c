@@ -55,6 +55,41 @@ bool ods2_bitmap_mark(uint8_t *bitmap, size_t total_bits,
     return true;
 }
 
+bool ods2_bitmap_find_run(const uint8_t *bitmap, size_t total_bits,
+                           size_t count, size_t *start_bit, size_t *found_count)
+{
+    size_t i;
+    size_t run_start = 0, run_len = 0;
+    size_t best_start = 0, best_len = 0;
+
+    if (count == 0) {
+        return false;
+    }
+    for (i = 0; i < total_bits; i++) {
+        if (bit_is_set(bitmap, i)) {
+            if (run_len == 0) run_start = i;
+            run_len++;
+            if (run_len >= count) {
+                *start_bit = run_start;
+                *found_count = count;
+                return true;
+            }
+            if (run_len > best_len) {
+                best_start = run_start;
+                best_len = run_len;
+            }
+        } else {
+            run_len = 0;
+        }
+    }
+    if (best_len == 0) {
+        return false;
+    }
+    *start_bit = best_start;
+    *found_count = best_len;
+    return true;
+}
+
 bool ods2_bitmap_find_free(const uint8_t *bitmap, size_t total_bits,
                             size_t count, size_t *start_bit, size_t *found_count)
 {

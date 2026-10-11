@@ -53,6 +53,58 @@ bool ods2_encode_retrieval_pointer_format1(uint8_t *out, uint32_t lbn, uint32_t 
     return true;
 }
 
+size_t ods2_retrieval_pointer_size(uint32_t lbn, uint32_t block_count)
+{
+    if (block_count == 0 || block_count > (1u << 30)) {
+        return 0; /* count field is n+1: Format 3's 30 bits top out at 2^30 */
+    }
+    if (block_count <= 256 && lbn < 0x3fffffu) {
+        return 4; /* Format 1; LBN 2^22-1 would read as a sparse range */
+    }
+    if (lbn == 0xffffffffu) {
+        return 0; /* 2^32-1 marks a sparse range in Formats 2 and 3 */
+    }
+    return (block_count <= 16384) ? 6 : 8;
+}
+
+size_t ods2_encode_retrieval_pointer(uint8_t *out, uint32_t lbn, uint32_t block_count)
+{
+    size_t size = ods2_retrieval_pointer_size(lbn, block_count);
+    uint32_t n = block_count - 1; /* every format stores n for n+1 blocks */
+
+    if (size == 4) {
+        return ods2_encode_retrieval_pointer_format1(out, lbn, block_count) ? 4 : 0;
+    }
+    if (size == 6) {
+        /* Format 2 (spec 3.5.4.3): [10][count:14], then the 32-bit LBN
+           as two little-endian words, low word first. */
+        uint16_t word0 = (uint16_t) ((2u << 14) | (n & 0x3fffu));
+        out[0] = (uint8_t) (word0 & 0xff);
+        out[1] = (uint8_t) (word0 >> 8);
+        out[2] = (uint8_t) (lbn & 0xff);
+        out[3] = (uint8_t) ((lbn >> 8) & 0xff);
+        out[4] = (uint8_t) ((lbn >> 16) & 0xff);
+        out[5] = (uint8_t) ((lbn >> 24) & 0xff);
+        return 6;
+    }
+    if (size == 8) {
+        /* Format 3 (spec 3.5.4.4): [11][high count:14], low count word,
+           then the 32-bit LBN as two little-endian words. */
+        uint16_t word0 = (uint16_t) ((3u << 14) | ((n >> 16) & 0x3fffu));
+        uint16_t low_count = (uint16_t) (n & 0xffffu);
+        out[0] = (uint8_t) (word0 & 0xff);
+        out[1] = (uint8_t) (word0 >> 8);
+        out[2] = (uint8_t) (low_count & 0xff);
+        out[3] = (uint8_t) (low_count >> 8);
+        out[4] = (uint8_t) (lbn & 0xff);
+        out[5] = (uint8_t) ((lbn >> 8) & 0xff);
+        out[6] = (uint8_t) ((lbn >> 16) & 0xff);
+        out[7] = (uint8_t) ((lbn >> 24) & 0xff);
+        return 8;
+    }
+    return 0;
+}
+
 int ods2_decode_retrieval_pointers(const uint8_t *map_area, size_t word_count,
                                     ods2_extent_t *extents_out, size_t max_extents)
 {

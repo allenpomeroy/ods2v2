@@ -88,7 +88,8 @@ ods2_validate_result_t ods2_validate_head(const uint8_t *raw_header)
 {
     const ods2_head_core_t *core = (const ods2_head_core_t *) raw_header;
     uint16_t checksum_stored, checksum_computed;
-    ods2_extent_t extents[64];
+    ods2_extent_t extents[128]; /* more than one map area can hold
+                                   (310 bytes / 4 = 77 Format 1) */
     int n;
     uint64_t total_blocks; /* wider than uint32_t: sum could legitimately
                                overflow 32 bits while still being a
@@ -106,8 +107,16 @@ ods2_validate_result_t ods2_validate_head(const uint8_t *raw_header)
     }
 
     /* Cross-validate FAT$L_HIBLK against the header's own retrieval
-       pointers, if any are present. map_inuse is a word count. */
+       pointers, if any are present. map_inuse is a word count. Only
+       for a file wholly described by this one header: HIBLK is the
+       whole file's allocation, so in a multi-header file (spec 3.3) -
+       an extension header (SEG_NUM > 0), or a primary header with an
+       extension (EXT_FID non-zero) - one header's pointers map just
+       part of it. */
     map_word_count = core->map_inuse;
+    if (core->seg_num != 0 || core->ext_fid.fid_num != 0 || core->ext_fid.fid_nmx != 0) {
+        map_word_count = 0;
+    }
     if (map_word_count > 0 && (size_t) core->mpoffset * 2 + map_word_count * 2 <= 512) {
         n = ods2_decode_retrieval_pointers(raw_header + (size_t) core->mpoffset * 2,
                                             map_word_count, extents,

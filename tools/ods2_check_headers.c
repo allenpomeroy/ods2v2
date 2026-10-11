@@ -31,6 +31,7 @@
  *   block alone, per spec 5.1.7).
  */
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include "ods2_volume.h"
 #include "ods2_validate.h"
@@ -94,13 +95,19 @@ int main(int argc, char **argv)
             uint32_t hiblk_fixed = ods2_word_swap32(core->recattr.hiblk);
             uint32_t efblk_fixed = ods2_word_swap32(core->recattr.efblk);
 
+            /* An extension header (SEG_NUM > 0) maps only the tail of
+               its file, so its sum is not expected to match HIBLK; its
+               file is checked through the primary header, whose sum
+               covers the whole chain. */
+            bool extension = core->seg_num != 0;
+
             printf("%-4u %-14u %-10u %-14llu %-10s %s\n",
                    n, hiblk_fixed, efblk_fixed,
                    (unsigned long long) extent_sum,
-                   (extent_sum == hiblk_fixed) ? "YES" : "NO",
+                   extension ? "(ext hdr)" : (extent_sum == hiblk_fixed) ? "YES" : "NO",
                    vr.ok ? "checksum OK" : vr.problem);
 
-            if (extent_sum != hiblk_fixed) mismatches++;
+            if (!extension && extent_sum != hiblk_fixed) mismatches++;
         }
     }
 

@@ -567,14 +567,14 @@ int main(void)
         }
     }
 
-    /* --- Multi-extent file test: content large enough that a --- */
-    /* --- single Format 1 extent (256 blocks / 128KB) can't    --- */
-    /* --- hold it, forcing genuine multiple extents             --- */
+    /* --- Past Format 1: content larger than one Format 1 pointer --- */
+    /* --- (256 blocks / 128KB) is still one extent, described by  --- */
+    /* --- a Format 2 pointer, not chopped into 256-block pieces    --- */
     {
         ods2_volume_t wvol;
         uint8_t root_header[512];
         ods2_fid_t big_fid;
-        size_t big_len = 300u * 512u; /* 300 blocks - past the 256-block single-extent cap */
+        size_t big_len = 300u * 512u; /* 300 blocks - past the 256-block Format 1 cap */
         uint8_t *big_content = malloc(big_len);
         size_t i;
 
@@ -590,27 +590,28 @@ int main(void)
 
         r = ods2_create_file(&wvol, root_header, "BIGFILE.BIN", big_content, big_len, 1, &big_fid);
         assert(r.ok);
-        printf("PASS: created a 300-block (%zu byte) file, past the old 256-block "
-               "single-extent limit\n", big_len);
+        printf("PASS: created a 300-block (%zu byte) file, past Format 1's "
+               "256-block single-pointer limit\n", big_len);
 
         {
             uint8_t big_header[512];
+            const ods2_head_core_t *core = (const ods2_head_core_t *) big_header;
             ods2_extent_t extents[ODS2_MAX_EXTENTS];
             int extent_count;
+            unsigned word0;
             r = ods2_read_header(&wvol, big_fid.fid_num, big_header);
             assert(r.ok);
             r = ods2_decode_all_extents(&wvol, big_header, extents, ODS2_MAX_EXTENTS, &extent_count);
             assert(r.ok);
-            assert(extent_count >= 2);
-            printf("PASS: file header genuinely has %d extents (each capped at "
-                   "256 blocks, confirming real multi-extent encoding, not just "
-                   "one oversized pointer)\n", extent_count);
-            {
-                int j;
-                for (j = 0; j < extent_count; j++) {
-                    assert(extents[j].block_count <= 256);
-                }
-            }
+            assert(extent_count == 1);
+            assert(extents[0].block_count >= 300);
+            word0 = big_header[core->mpoffset * 2] | (big_header[core->mpoffset * 2 + 1] << 8);
+            assert((word0 >> 14) == 2);      /* Format 2 */
+            assert(core->map_inuse == 3);    /* 6 bytes */
+            assert(core->filechar & 0x0080); /* FH2$M_CONTIG: one piece */
+            assert(core->ext_fid.fid_num == 0 && core->seg_num == 0);
+            printf("PASS: file is one contiguous extent of %u blocks, described by a "
+                   "single Format 2 retrieval pointer\n", (unsigned) extents[0].block_count);
         }
 
         ods2_dismount(&wvol);
@@ -631,7 +632,7 @@ int main(void)
             assert(r.ok);
             assert(bytes_read == big_len);
             assert(memcmp(readback, big_content, big_len) == 0);
-            printf("PASS: 300-block multi-extent file reads back byte-for-byte "
+            printf("PASS: 300-block Format 2 file reads back byte-for-byte "
                    "identical after a fresh, independent mount\n");
 
             free(readback);

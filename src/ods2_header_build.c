@@ -45,16 +45,35 @@
 #define ODS2_HEADER_IDENT_BYTES 120
 #define ODS2_HEADER_MPOFFSET_BYTES (ODS2_HEADER_IDOFFSET_BYTES + ODS2_HEADER_IDENT_BYTES)
 
+int ods2_header_extents_that_fit(const ods2_extent_t *extents, int count)
+{
+    size_t used = 0;
+    int i;
+
+    for (i = 0; i < count; i++) {
+        size_t n = ods2_retrieval_pointer_size(extents[i].lbn, extents[i].block_count);
+        if (n == 0) return -1;
+        if (ODS2_HEADER_MPOFFSET_BYTES + used + n > 510) break;
+        used += n;
+    }
+    return i;
+}
+
 bool ods2_build_file_header(uint8_t *header_out, const ods2_header_spec_t *spec)
 {
     ods2_head_core_t *core;
     size_t map_offset_bytes = ODS2_HEADER_MPOFFSET_BYTES;
-    size_t map_bytes = (size_t) spec->extent_count * 4; /* Format 1: 2 words = 4 bytes each */
+    size_t map_bytes = 0;
     int i;
     uint16_t checksum;
 
-    if (map_offset_bytes + map_bytes > 510) {
-        return false; /* wouldn't leave room for the checksum word */
+    if (spec->extent_count < 0 ||
+        ods2_header_extents_that_fit(spec->extents, spec->extent_count) != spec->extent_count) {
+        return false; /* unrepresentable, or no room before the checksum word */
+    }
+    for (i = 0; i < spec->extent_count; i++) {
+        map_bytes += ods2_retrieval_pointer_size(spec->extents[i].lbn,
+                                                 spec->extents[i].block_count);
     }
 
     memset(header_out, 0, 512);
@@ -64,10 +83,10 @@ bool ods2_build_file_header(uint8_t *header_out, const ods2_header_spec_t *spec)
     core->mpoffset = (uint8_t) (map_offset_bytes / 2);
     core->acoffset = 0xff; /* no ACL area */
     core->rsoffset = 0xff; /* no reserved area */
-    core->seg_num = 0;
+    core->seg_num = spec->seg_num;
     core->struclev = 0x0201; /* level 2, version 1 - confirmed convention */
     core->fid = spec->fid;
-    /* ext_fid stays zero (memset above) - no extension header. */
+    core->ext_fid = spec->ext_fid; /* all zero: no extension header */
     core->recattr.rtype = spec->rtype;
     core->recattr.rattrib = spec->rattrib;
     core->recattr.rsize = spec->rsize;
@@ -144,11 +163,13 @@ bool ods2_build_file_header(uint8_t *header_out, const ods2_header_spec_t *spec)
         }
     }
 
-    for (i = 0; i < spec->extent_count; i++) {
-        uint8_t *dest = header_out + map_offset_bytes + (size_t) i * 4;
-        if (!ods2_encode_retrieval_pointer_format1(dest, spec->extents[i].lbn,
-                                                     spec->extents[i].block_count)) {
-            return false;
+    {
+        uint8_t *dest = header_out + map_offset_bytes;
+        for (i = 0; i < spec->extent_count; i++) {
+            size_t n = ods2_encode_retrieval_pointer(dest, spec->extents[i].lbn,
+                                                     spec->extents[i].block_count);
+            if (n == 0) return false; /* unreachable: checked above */
+            dest += n;
         }
     }
 

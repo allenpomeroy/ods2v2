@@ -23,6 +23,7 @@
  */
 
 #include <stdio.h>
+#include <string.h>
 #include <assert.h>
 #include "ods2_retrieval.h"
 
@@ -136,6 +137,79 @@ int main(void)
         assert(ods2_decode_retrieval_pointers(encoded, 2, decoded, 1) == 1);
         assert(decoded[0].lbn == max_lbn);
         printf("PASS: maximum representable LBN (0x3fffff) round-trips correctly\n");
+    }
+
+    /* --- Formats 2 and 3 (spec 3.5.4.3/3.5.4.4) on the write side --- */
+
+    /* The smallest fitting format is chosen, at each boundary. */
+    {
+        assert(ods2_retrieval_pointer_size(0, 256) == 4);
+        assert(ods2_retrieval_pointer_size(0x3ffffe, 256) == 4);
+        assert(ods2_retrieval_pointer_size(0x3fffff, 1) == 6);   /* F1's all-ones LBN = sparse */
+        assert(ods2_retrieval_pointer_size(0, 257) == 6);
+        assert(ods2_retrieval_pointer_size(0x400000, 1) == 6);
+        assert(ods2_retrieval_pointer_size(0, 16384) == 6);
+        assert(ods2_retrieval_pointer_size(0, 16385) == 8);
+        assert(ods2_retrieval_pointer_size(0, 1u << 30) == 8);
+        assert(ods2_retrieval_pointer_size(0, (1u << 30) + 1) == 0);
+        assert(ods2_retrieval_pointer_size(0, 0) == 0);
+        assert(ods2_retrieval_pointer_size(0xffffffffu, 300) == 0); /* sparse marker */
+        printf("PASS: smallest retrieval pointer format chosen at every boundary\n");
+    }
+
+    /* Hand-checked bytes: Format 2, 300 blocks at LBN 0x12345678 is
+       word0 = 0x8000|299 = 0x812b, then LBN low word, high word. */
+    {
+        uint8_t encoded[8];
+        static const uint8_t expect[6] = { 0x2b, 0x81, 0x78, 0x56, 0x34, 0x12 };
+        assert(ods2_encode_retrieval_pointer(encoded, 0x12345678u, 300) == 6);
+        assert(memcmp(encoded, expect, 6) == 0);
+        printf("PASS: Format 2 pointer encodes to the spec's exact byte layout\n");
+    }
+
+    /* Format 3, 1,217,303 blocks (the ~600MB ISO of issue #2) at LBN
+       0x00abcdef: n = 1217302 = 0x00129316 -> word0 = 0xc000|0x0012,
+       low count 0x9316, then the LBN. */
+    {
+        uint8_t encoded[8];
+        static const uint8_t expect[8] = { 0x12, 0xc0, 0x16, 0x93, 0xef, 0xcd, 0xab, 0x00 };
+        assert(ods2_encode_retrieval_pointer(encoded, 0x00abcdefu, 1217303) == 8);
+        assert(memcmp(encoded, expect, 8) == 0);
+        printf("PASS: Format 3 pointer encodes to the spec's exact byte layout\n");
+    }
+
+    /* Mixed formats in one map area decode back to the same extents. */
+    {
+        static const ods2_extent_t in[5] = {
+            { 1000, 256 }, { 0x3fffff, 7 }, { 5000, 16384 }, { 70000, 16385 },
+            { 0xfffffffeu, 1u << 30 }
+        };
+        uint8_t map[64];
+        ods2_extent_t out[5];
+        size_t used = 0;
+        int i;
+        for (i = 0; i < 5; i++) {
+            size_t n = ods2_encode_retrieval_pointer(map + used, in[i].lbn, in[i].block_count);
+            assert(n == ods2_retrieval_pointer_size(in[i].lbn, in[i].block_count));
+            used += n;
+        }
+        assert(used == 4 + 6 + 6 + 8 + 8);
+        assert(ods2_decode_retrieval_pointers(map, used / 2, out, 5) == 5);
+        for (i = 0; i < 5; i++) {
+            assert(out[i].lbn == in[i].lbn);
+            assert(out[i].block_count == in[i].block_count);
+        }
+        printf("PASS: Formats 1, 2 and 3 mixed in one map area round-trip exactly\n");
+    }
+
+    /* Unrepresentable extents write nothing. */
+    {
+        uint8_t encoded[8] = { 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa };
+        assert(ods2_encode_retrieval_pointer(encoded, 0, 0) == 0);
+        assert(ods2_encode_retrieval_pointer(encoded, 0, (1u << 30) + 1) == 0);
+        assert(ods2_encode_retrieval_pointer(encoded, 0xffffffffu, 2) == 0);
+        assert(encoded[0] == 0xaa && encoded[7] == 0xaa);
+        printf("PASS: unrepresentable extents are rejected without writing\n");
     }
 
     printf("\nods2_retrieval_selftest: all checks passed\n");

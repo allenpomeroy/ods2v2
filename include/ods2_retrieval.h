@@ -46,8 +46,7 @@ typedef struct {
  * of extents actually decoded, or -1 on a format it doesn't recognize
  * (Format 0 - placement data - is skipped, not decoded as an extent,
  * since it describes allocation hints, not an extent itself; Formats
- * 2 and 3 are not yet implemented - only Format 1 has been verified
- * against real data so far).
+ * 1, 2 and 3 are all decoded).
  */
 int ods2_decode_retrieval_pointers(const uint8_t *map_area, size_t word_count,
                                     ods2_extent_t *extents_out, size_t max_extents);
@@ -58,10 +57,25 @@ int ods2_decode_retrieval_pointers(const uint8_t *map_area, size_t word_count,
    2^22-1 (6-bit high word + 16-bit low word) - sufficient for disks
    up to ~4.19 million blocks, comfortably covering our RA92-class
    test volume (2,940,951 blocks) and most hobbyist-scale ODS-2
-   volumes. Larger extents or LBNs need Format 2/3, not yet
-   implemented on the write side. Returns false (and writes nothing)
+   volumes. Larger extents or LBNs need Format 2/3 - see
+   ods2_encode_retrieval_pointer(). Returns false (and writes nothing)
    if `block_count` or `lbn` don't fit in Format 1's range - callers
    must check this rather than silently truncating. */
 bool ods2_encode_retrieval_pointer_format1(uint8_t *out, uint32_t lbn, uint32_t block_count);
+
+/* Bytes the smallest retrieval pointer able to describe this extent
+   takes (spec 3.5.4.2-3.5.4.4): 4 for Format 1 (up to 256 blocks,
+   LBN below 2^22-1), 6 for Format 2 (up to 16384 blocks), 8 for
+   Format 3 (up to 2^30 blocks). Returns 0 if no format can: a zero
+   or over-2^30 count, or an all-ones LBN, which the spec reserves to
+   mark an unallocated (sparse) range. VMS itself picks the smallest
+   format that fits, so the same rule is used here. */
+size_t ods2_retrieval_pointer_size(uint32_t lbn, uint32_t block_count);
+
+/* Encodes the extent as the smallest fitting retrieval pointer (see
+   ods2_retrieval_pointer_size()) into `out`, which must have room for
+   8 bytes. Returns the bytes written, or 0 (writing nothing) if the
+   extent cannot be represented. */
+size_t ods2_encode_retrieval_pointer(uint8_t *out, uint32_t lbn, uint32_t block_count);
 
 #endif /* ODS2_RETRIEVAL_H */

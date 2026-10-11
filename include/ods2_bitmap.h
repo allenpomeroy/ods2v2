@@ -49,6 +49,15 @@
 bool ods2_bitmap_find_free(const uint8_t *bitmap, size_t total_bits,
                             size_t count, size_t *start_bit, size_t *found_count);
 
+/* Like ods2_bitmap_find_free(), but settles for less when no run of
+   `count` free bits exists: returns the first run of at least `count`
+   (reporting *found_count = count), otherwise the longest free run
+   anywhere (*found_count < count; the earliest one on a tie). Used to
+   allocate a large file in as few, as large pieces as the volume's
+   free space allows. Returns false only if no bit is free at all. */
+bool ods2_bitmap_find_run(const uint8_t *bitmap, size_t total_bits,
+                           size_t count, size_t *start_bit, size_t *found_count);
+
 /* Marks `count` bits starting at `start_bit` as either free (set,
    `used=false`) or allocated (clear, `used=true`). Returns false if
    the range would run past total_bits (caller error - never silently

@@ -64,7 +64,11 @@ ods2_validate_result_t ods2_validate_home(const ods2_home_t *home);
  * this specific check is what caught a real, genuine data-corruption
  * bug on an old test disk during development (FAT$L_HIBLK claimed
  * ~7.8 million blocks; the header's own retrieval pointers, decoded
- * independently, summed to 120).
+ * independently, summed to 120). That cross-check is made only for a
+ * single-header file; a header that is part of a multi-header file
+ * (SEG_NUM > 0 or EXT_FID set) maps only part of the file, so for it
+ * just the checksum is verified - checking the whole chain needs the
+ * volume (see ods2_decode_all_extents()).
  *
  * `raw_header` must point to the full 512-byte header block (not just
  * the ods2_head_core_t portion) - the checksum covers the whole

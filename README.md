@@ -46,7 +46,7 @@ make starter-volume              # creates an empty ODS2 RA92 volume
 
 ```bash
 tar xzf ods2v2.tgz && cd ods2v2  # expand and cd into ods2v2 cwd
-make clean && make test          # builds everything, runs the full test suite
+make clean && make all           # builds everything, runs the full test suite
 make starter-volume              # creates an empty ODS2 RA92 volume
                                  # by decompressing a real VMS
                                  # INITIALIZEd disk file: transfer.dsk
@@ -218,7 +218,7 @@ third_party/linenoise/  BSD licensed - interactive-mode command history
 
 ## Testing
 
-`make test` builds and runs 18 test suites and two scripts that check
+`make test` builds and runs 19 test suites and four scripts that check
 the `ods2` command line, with `-fsanitize=address,undefined` on by default for development
 builds (`make release` builds without them once things are stable).
 Most tests run entirely offline against a synthetic disk
@@ -228,15 +228,15 @@ in every structural test.
 
 ## Known limitations
 
-- Files/directories needing more than roughly 77 retrieval-pointer
-  extents in a single header (extension headers) aren't yet
-  implemented - very large or badly fragmented files/directories
-  would need this eventually.
+- `COPY` takes any size of file the volume has room for. Its content
+  goes in as few pieces as the free space allows (one, on a volume
+  with a long enough free run), described by Format 1, 2 or 3
+  retrieval pointers, continuing into extension headers on fragmented
+  free space - up to 1,024 pieces. The whole file is read into memory
+  first. Directories still grow only within one header.
 - No INITIALIZE command (formatting a *new* volume from scratch) - see
   `samples/README.md` for why that's a deliberate choice (it's complicated)
   and how to get a real, ready-to-use volume instead.
-- Files are capped around 9.5MB (a consequence of the extension-header
-  limitation above).
 - `COPY` can't add a new version of an existing file - it creates
   version 1 of a new name only.
 - `TYPE` and `DELETE` don't take wildcards yet, in file names or

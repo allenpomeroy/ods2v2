@@ -292,6 +292,53 @@ ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,
                                 const char *name, const uint8_t *content, size_t content_len,
                                 uint8_t rtype, ods2_fid_t *new_fid_out);
 
+/* RMS record attributes for a new file (FH2$W_RECATTR, spec 3.5.2.9).
+   Record formats (FAT$B_RTYPE, sequential organization): */
+#define ODS2_RFM_UDF   0 /* FAB$C_UDF: undefined - a stream of bytes */
+#define ODS2_RFM_FIX   1 /* FAB$C_FIX: fixed-length records */
+#define ODS2_RFM_VAR   2 /* FAB$C_VAR: variable-length (not importable) */
+#define ODS2_RFM_VFC   3 /* FAB$C_VFC: variable with control (not importable) */
+#define ODS2_RFM_STM   4 /* FAB$C_STM: stream, CR-LF terminated */
+#define ODS2_RFM_STMLF 5 /* FAB$C_STMLF: stream, LF terminated */
+#define ODS2_RFM_STMCR 6 /* FAB$C_STMCR: stream, CR terminated */
+/* Record attributes (FAT$B_RATTRIB), combinable as bits: */
+#define ODS2_RAT_FTN   0x01 /* FAB$M_FTN: FORTRAN carriage control */
+#define ODS2_RAT_CR    0x02 /* FAB$M_CR: implied carriage return */
+#define ODS2_RAT_PRN   0x04 /* FAB$M_PRN: print-file carriage control */
+#define ODS2_RAT_BLK   0x08 /* FAB$M_BLK: records don't span blocks */
+
+typedef struct {
+    uint8_t  rtype;   /* ODS2_RFM_* */
+    uint8_t  rattrib; /* ODS2_RAT_* bits; at most one of FTN/CR/PRN */
+    uint16_t rsize;   /* FAT$W_RSIZE: the record size of a fixed file,
+                         otherwise the longest record (LRL) */
+    uint16_t maxrec;  /* FAT$W_MAXREC (MRS): maximum record size; for a
+                         fixed file always equal to rsize, as VMS sets
+                         it (e.g. INDEXF.SYS: FIX, RSIZE = MRS = 512) */
+} ods2_record_attrs_t;
+
+/* Checks `attrs` as the record attributes of a new file holding
+ * `content_len` bytes taken from the host as they are. Returns NULL if
+ * they're acceptable, else why not:
+ *  - only UDF, FIX and the stream formats: VAR and VFC files carry a
+ *    count word before each record on disk, which host bytes don't;
+ *  - a fixed record size is 2..32766 bytes and even (RMS pads an odd
+ *    fixed record to a word boundary on disk - not supported), MRS
+ *    equals it, and the content is a whole number of records;
+ *  - other sizes are at most 32767; unknown RAT bits, or more than one
+ *    carriage control, are refused. */
+const char *ods2_check_record_attrs(const ods2_record_attrs_t *attrs, size_t content_len);
+
+/* ods2_create_file() with chosen record attributes, checked first by
+ * ods2_check_record_attrs() - a file whose attributes don't fit its
+ * content is refused, not created. ods2_create_file(..., rtype, ...)
+ * is this with rattrib 0 and RSIZE = MRS = 512, unchecked, as before.
+ */
+ods2_result_t ods2_create_file_attrs(ods2_volume_t *vol, const uint8_t *parent_header,
+                                      const char *name, const uint8_t *content,
+                                      size_t content_len, const ods2_record_attrs_t *attrs,
+                                      ods2_fid_t *new_fid_out);
+
 /* Inserts (name, version, fid) into the directory whose header is at
  * `dir_file_number`, trying each of its existing content blocks
  * first; if none have room, allocates a new block, extends the

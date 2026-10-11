@@ -1,0 +1,1073 @@
+From 16455d96008b9e8dae3c3e694e1c3280f272fcba Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 11 Oct 2026 08:49:55 -0500
+Subject: [PATCH] Record format and fixed record size for host imports (PCSI
+ kits)
+
+Imported files could only be Stream_LF (ods2 COPY) or carry a bare
+rtype (ods2_put), always with RSIZE = MRS = 512 and no record
+attributes. OpenVMS PCSI kit files are sequential files of fixed
+8192-byte records; a Stream_LF or fixed-512 copy of the same bytes is
+not a kit to PRODUCT, so a kit disk couldn't be prepared with ods2v2
+alone.
+
+Library: ods2_create_file_attrs() takes the record format, record
+attributes (carriage control, BLK), record size and MRS, checked by
+ods2_check_record_attrs() before anything is allocated:
+- UDF, FIX and the stream formats only: VAR and VFC records start
+  with a byte count on disk that host bytes don't have;
+- a fixed record size is even, 2..32766, MRS equals it (as on VMS's
+  own fixed files: INDEXF.SYS is FIX, RSIZE = MRS = 512), and the
+  content is a whole number of records. Odd sizes are refused rather
+  than written without the pad byte RMS puts after each odd record;
+- valid RAT bits, at most one carriage control.
+ods2_create_file() is unchanged.
+
+ods2 COPY: /ATTRIBUTES on the command word, in SET FILE/ATTRIBUTES
+syntax - COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) kit.pcsi [KITS]KIT.PCSI;
+RFM, MRS, LRL, RAT, VMS-style abbreviations. Not on the arguments,
+since host paths contain '/'. Plain COPY is still Stream_LF.
+
+ods2_put: optional record size and record attributes after rtype
+(ods2_put disk kit.pcsi KITS KIT.PCSI 1 8192), all validated - a bad
+rtype number was previously written as given. A fixed-record import
+that isn't whole records is now refused instead of written malformed.
+
+Tests: ods2_record_attrs_selftest (validation matrix; FIX 8192 header
+and EOF; FIX 512 matching VMS's INDEXF.SYS; other formats; refusal
+allocates nothing; legacy call unchanged) and cli_record_attrs_check.sh
+(COPY/ATTRIBUTES and ods2_put variants, headers read back with
+ods2_dump_header, refusals exit 1 and create nothing).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZqVjHFvXKcJm8prtYVbsY
+---
+ Makefile                           |  13 +-
+ README.md                          |  31 +++-
+ include/ods2_volume.h              |  47 ++++++
+ src/ods2_volume.c                  |  84 +++++++++-
+ tests/cli_record_attrs_check.sh    | 119 ++++++++++++++
+ tests/ods2_record_attrs_selftest.c | 242 +++++++++++++++++++++++++++++
+ tools/ods2.c                       | 204 +++++++++++++++++++++++-
+ tools/ods2_put.c                   |  49 +++++-
+ 8 files changed, 765 insertions(+), 24 deletions(-)
+ create mode 100644 tests/cli_record_attrs_check.sh
+ create mode 100644 tests/ods2_record_attrs_selftest.c
+
+diff --git a/Makefile b/Makefile
+index 089237c..b26dc30 100644
+--- a/Makefile
++++ b/Makefile
+@@ -40,7 +40,7 @@ MAIN_TOOLS = ods2
+ DEV_TOOLS = read_home_block read_file_header ods2_ls ods2_cat ods2_mkdir \
+             ods2_put ods2_check_headers ods2_dump_root ods2_dump_header ods2_rm
+ 
+-TESTS = $(BUILD)/ods2_ondisk_selftest $(BUILD)/ods2_checksum_selftest $(BUILD)/ods2_validate_selftest $(BUILD)/ods2_bitmap_selftest $(BUILD)/ods2_indexf_selftest $(BUILD)/ods2_retrieval_selftest $(BUILD)/ods2_root_header_selftest $(BUILD)/ods2_directory_selftest $(BUILD)/ods2_volume_selftest $(BUILD)/ods2_wildcard_selftest $(BUILD)/ods2_read_file_selftest $(BUILD)/ods2_header_build_selftest $(BUILD)/ods2_directory_write_selftest $(BUILD)/ods2_path_selftest $(BUILD)/ods2_versions_selftest $(BUILD)/ods2_time_selftest $(BUILD)/ods2_file_alloc_selftest $(BUILD)/ods2_dir_order_selftest $(BUILD)/ods2_large_file_selftest
++TESTS = $(BUILD)/ods2_ondisk_selftest $(BUILD)/ods2_checksum_selftest $(BUILD)/ods2_validate_selftest $(BUILD)/ods2_bitmap_selftest $(BUILD)/ods2_indexf_selftest $(BUILD)/ods2_retrieval_selftest $(BUILD)/ods2_root_header_selftest $(BUILD)/ods2_directory_selftest $(BUILD)/ods2_volume_selftest $(BUILD)/ods2_wildcard_selftest $(BUILD)/ods2_read_file_selftest $(BUILD)/ods2_header_build_selftest $(BUILD)/ods2_directory_write_selftest $(BUILD)/ods2_path_selftest $(BUILD)/ods2_versions_selftest $(BUILD)/ods2_time_selftest $(BUILD)/ods2_file_alloc_selftest $(BUILD)/ods2_dir_order_selftest $(BUILD)/ods2_large_file_selftest $(BUILD)/ods2_record_attrs_selftest
+ 
+ .PHONY: all test tools dev-tools release clean starter-volume
+ 
+@@ -125,6 +125,9 @@ $(BUILD)/ods2_dir_order_selftest: tests/ods2_dir_order_selftest.c $(VOLUME_SRCS)
+ $(BUILD)/ods2_large_file_selftest: tests/ods2_large_file_selftest.c $(VOLUME_SRCS) include/ods2_volume.h include/ods2_header_build.h samples/synthetic_disk.img | $(BUILD)
+ 	$(CC) $(CFLAGS) $(SANFLAGS) tests/ods2_large_file_selftest.c $(VOLUME_SRCS) -o $@
+ 
++$(BUILD)/ods2_record_attrs_selftest: tests/ods2_record_attrs_selftest.c $(VOLUME_SRCS) include/ods2_volume.h samples/synthetic_disk.img | $(BUILD)
++	$(CC) $(CFLAGS) $(SANFLAGS) tests/ods2_record_attrs_selftest.c $(VOLUME_SRCS) -o $@
++
+ # --- CLI tools (built directly into the project root, e.g. ./ods2_ls,
+ #     not into build/, since that's where they're actually run from) ---
+ 
+@@ -165,7 +168,7 @@ ods2_rm: tools/ods2_rm.c $(VOLUME_SRCS) src/ods2_path.c src/ods2_wildcard.c incl
+ ods2: tools/ods2.c $(VOLUME_SRCS) src/ods2_path.c src/ods2_wildcard.c third_party/linenoise/linenoise.c include/ods2_volume.h include/ods2_path.h include/ods2_wildcard.h third_party/linenoise/linenoise.h
+ 	$(CC) $(CFLAGS) -D_DEFAULT_SOURCE -Ithird_party/linenoise $(SANFLAGS) tools/ods2.c $(VOLUME_SRCS) src/ods2_path.c src/ods2_wildcard.c third_party/linenoise/linenoise.c -o $@
+ 
+-test: $(TESTS) tools
++test: $(TESTS) tools ods2_put ods2_dump_header
+ 	@echo "--- ods2_ondisk_selftest ---"
+ 	@$(BUILD)/ods2_ondisk_selftest
+ 	@echo "--- ods2_checksum_selftest ---"
+@@ -204,6 +207,8 @@ test: $(TESTS) tools
+ 	@$(BUILD)/ods2_dir_order_selftest
+ 	@echo "--- ods2_large_file_selftest ---"
+ 	@$(BUILD)/ods2_large_file_selftest
++	@echo "--- ods2_record_attrs_selftest ---"
++	@$(BUILD)/ods2_record_attrs_selftest
+ 	@echo "--- CLI file version checks ---"
+ 	@sh tests/cli_versions_check.sh
+ 	@echo "--- CLI directory wildcard checks ---"
+@@ -212,6 +217,8 @@ test: $(TESTS) tools
+ 	@sh tests/cli_large_file_check.sh
+ 	@echo "--- CLI exit status checks ---"
+ 	@sh tests/cli_exit_status_check.sh
++	@echo "--- CLI record attribute checks ---"
++	@sh tests/cli_record_attrs_check.sh
+ 	@echo "--- CLI recursive DIR regression check ---"
+ 	@if command -v timeout >/dev/null 2>&1; then \
+ 		rm -f samples/cli_regression_disk.img; \
+@@ -250,5 +257,5 @@ release: test
+ clean:
+ 	rm -rf $(BUILD)
+ 	rm -f samples/synthetic_disk.img samples/synthetic_disk_working.img
+-	rm -f samples/versions_disk.img samples/versions_cli_disk.img samples/cli_wildcard_disk.img samples/file_alloc_disk.img samples/dir_order_disk.img samples/large_file_disk.img samples/cli_status_disk.img
++	rm -f samples/versions_disk.img samples/versions_cli_disk.img samples/cli_wildcard_disk.img samples/file_alloc_disk.img samples/dir_order_disk.img samples/large_file_disk.img samples/cli_status_disk.img samples/cli_attrs_disk.img samples/record_attrs_disk.img
+ 	rm -f $(TOOLS)
+diff --git a/README.md b/README.md
+index 543c528..68a70b1 100644
+--- a/README.md
++++ b/README.md
+@@ -79,6 +79,7 @@ implements basic command recall to ease repetitive command sequences.
+ | `DIR [*...] [wildcard]` | `DIR [*...]*.COM` — wildcards in directory names (see below) |
+ | `CREATE/DIRECTORY path` | `CREATE/DIRECTORY [DECUS.NETLIB020]` |
+ | `COPY <local-file> <path>` | `COPY readme.txt [DECUS]README.TXT` |
++| `COPY/ATTRIBUTES=(...) <local-file> <path>` | `COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) kit.pcsi [KITS]KIT.PCSI` |
+ | `TYPE path` | `TYPE [DECUS]README.TXT;2` |
+ | `DELETE path` | `DELETE [DECUS]OLDFILE.TXT;1` |
+ | `SET DEFAULT path` | `SET DEFAULT [DECUS.NETLIB020]` |
+@@ -135,6 +136,34 @@ removes one version - the one given, or the highest if none is - and
+ `DELETE NAME;*` removes them all. `COPY` onto the disk always creates
+ version 1 and refuses a name that already exists.
+ 
++### Record formats
++
++`COPY` makes a Stream_LF file, which suits text. Some files must have a
++particular RMS record format - OpenVMS PCSI kit files, for one, are
++sequential files of fixed 8192-byte records, and `PRODUCT` won't treat
++a Stream_LF copy of the same bytes as a kit. Give the attributes with
++`/ATTRIBUTES` on `COPY`, in the syntax of VMS's `SET FILE/ATTRIBUTES`:
++
++```
++COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) dec-axpvms-foo-v0100--1.pcsi [KITS]DEC-AXPVMS-FOO-V0100--1.PCSI
++COPY/ATTRIBUTES=(RFM:FIX) backup.bck [SAVE]BACKUP.BCK          ! fixed 512-byte records
++COPY/ATTRIBUTES=(RFM:STMLF,RAT:CR) notes.txt [DOC]NOTES.TXT
++```
++
++- `RFM:` record format - `FIX`, `STMLF`, `STM`, `STMCR` or `UDF`.
++  `VAR` and `VFC` can't be imported: on disk each of their records
++  starts with a byte count a host file doesn't have.
++- `MRS:` the record size (for `FIX`; `LRL:` means the same there).
++  `RFM:FIX` with no size is 512-byte records. The file must be a whole
++  number of records, and the size even (2-32766).
++- `RAT:` record attributes - `NONE`, `CR`, `FTN`, `PRN`, `BLK`, `NOBLK`;
++  repeat `RAT:` for more than one.
++
++The qualifier goes on `COPY` itself, not after the file names (a host
++path has `/` in it too). `ods2_put` takes the same as numbers:
++`ods2_put disk kit.pcsi KITS KIT.PCSI 1 8192` (record format, record
++size, record attributes).
++
+ ### File dates and time zones
+ 
+ VMS keeps file dates in local time, so `ods2` stamps new files (and
+@@ -218,7 +247,7 @@ third_party/linenoise/  BSD licensed - interactive-mode command history
+ 
+ ## Testing
+ 
+-`make test` builds and runs 19 test suites and four scripts that check
++`make test` builds and runs 20 test suites and five scripts that check
+ the `ods2` command line, with `-fsanitize=address,undefined` on by default for development
+ builds (`make release` builds without them once things are stable).
+ Most tests run entirely offline against a synthetic disk
+diff --git a/include/ods2_volume.h b/include/ods2_volume.h
+index de7c194..f79e47f 100644
+--- a/include/ods2_volume.h
++++ b/include/ods2_volume.h
+@@ -292,6 +292,53 @@ ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,
+                                 const char *name, const uint8_t *content, size_t content_len,
+                                 uint8_t rtype, ods2_fid_t *new_fid_out);
+ 
++/* RMS record attributes for a new file (FH2$W_RECATTR, spec 3.5.2.9).
++   Record formats (FAT$B_RTYPE, sequential organization): */
++#define ODS2_RFM_UDF   0 /* FAB$C_UDF: undefined - a stream of bytes */
++#define ODS2_RFM_FIX   1 /* FAB$C_FIX: fixed-length records */
++#define ODS2_RFM_VAR   2 /* FAB$C_VAR: variable-length (not importable) */
++#define ODS2_RFM_VFC   3 /* FAB$C_VFC: variable with control (not importable) */
++#define ODS2_RFM_STM   4 /* FAB$C_STM: stream, CR-LF terminated */
++#define ODS2_RFM_STMLF 5 /* FAB$C_STMLF: stream, LF terminated */
++#define ODS2_RFM_STMCR 6 /* FAB$C_STMCR: stream, CR terminated */
++/* Record attributes (FAT$B_RATTRIB), combinable as bits: */
++#define ODS2_RAT_FTN   0x01 /* FAB$M_FTN: FORTRAN carriage control */
++#define ODS2_RAT_CR    0x02 /* FAB$M_CR: implied carriage return */
++#define ODS2_RAT_PRN   0x04 /* FAB$M_PRN: print-file carriage control */
++#define ODS2_RAT_BLK   0x08 /* FAB$M_BLK: records don't span blocks */
++
++typedef struct {
++    uint8_t  rtype;   /* ODS2_RFM_* */
++    uint8_t  rattrib; /* ODS2_RAT_* bits; at most one of FTN/CR/PRN */
++    uint16_t rsize;   /* FAT$W_RSIZE: the record size of a fixed file,
++                         otherwise the longest record (LRL) */
++    uint16_t maxrec;  /* FAT$W_MAXREC (MRS): maximum record size; for a
++                         fixed file always equal to rsize, as VMS sets
++                         it (e.g. INDEXF.SYS: FIX, RSIZE = MRS = 512) */
++} ods2_record_attrs_t;
++
++/* Checks `attrs` as the record attributes of a new file holding
++ * `content_len` bytes taken from the host as they are. Returns NULL if
++ * they're acceptable, else why not:
++ *  - only UDF, FIX and the stream formats: VAR and VFC files carry a
++ *    count word before each record on disk, which host bytes don't;
++ *  - a fixed record size is 2..32766 bytes and even (RMS pads an odd
++ *    fixed record to a word boundary on disk - not supported), MRS
++ *    equals it, and the content is a whole number of records;
++ *  - other sizes are at most 32767; unknown RAT bits, or more than one
++ *    carriage control, are refused. */
++const char *ods2_check_record_attrs(const ods2_record_attrs_t *attrs, size_t content_len);
++
++/* ods2_create_file() with chosen record attributes, checked first by
++ * ods2_check_record_attrs() - a file whose attributes don't fit its
++ * content is refused, not created. ods2_create_file(..., rtype, ...)
++ * is this with rattrib 0 and RSIZE = MRS = 512, unchecked, as before.
++ */
++ods2_result_t ods2_create_file_attrs(ods2_volume_t *vol, const uint8_t *parent_header,
++                                      const char *name, const uint8_t *content,
++                                      size_t content_len, const ods2_record_attrs_t *attrs,
++                                      ods2_fid_t *new_fid_out);
++
+ /* Inserts (name, version, fid) into the directory whose header is at
+  * `dir_file_number`, trying each of its existing content blocks
+  * first; if none have room, allocates a new block, extends the
+diff --git a/src/ods2_volume.c b/src/ods2_volume.c
+index 5a71e94..6842630 100644
+--- a/src/ods2_volume.c
++++ b/src/ods2_volume.c
+@@ -1326,9 +1326,85 @@ static ods2_result_t write_extents(ods2_volume_t *vol, const ods2_extent_t *exte
+     return ok();
+ }
+ 
++static ods2_result_t create_file(ods2_volume_t *vol, const uint8_t *parent_header,
++                                 const char *name, const uint8_t *content, size_t content_len,
++                                 const ods2_record_attrs_t *attrs, ods2_fid_t *new_fid_out);
++
++const char *ods2_check_record_attrs(const ods2_record_attrs_t *attrs, size_t content_len)
++{
++    unsigned cc = attrs->rattrib & (ODS2_RAT_FTN | ODS2_RAT_CR | ODS2_RAT_PRN);
++
++    switch (attrs->rtype) {
++    case ODS2_RFM_FIX:
++        if (attrs->rsize == 0) {
++            return "a fixed-length record format needs a record size";
++        }
++        if (attrs->rsize > 32766) {
++            return "fixed record size is too large (at most 32766 bytes)";
++        }
++        if (attrs->rsize % 2 != 0) {
++            return "odd fixed record sizes are not supported (RMS pads each such "
++                   "record to an even length on disk)";
++        }
++        if (attrs->maxrec != attrs->rsize) {
++            return "for fixed-length records the maximum record size (MRS) must "
++                   "equal the record size";
++        }
++        if (content_len % attrs->rsize != 0) {
++            return "content length is not a whole number of fixed-length records";
++        }
++        break;
++    case ODS2_RFM_UDF:
++    case ODS2_RFM_STM:
++    case ODS2_RFM_STMLF:
++    case ODS2_RFM_STMCR:
++        if (attrs->rsize > 32767 || attrs->maxrec > 32767) {
++            return "record size is too large (at most 32767 bytes)";
++        }
++        break;
++    case ODS2_RFM_VAR:
++    case ODS2_RFM_VFC:
++        return "variable-length record formats (VAR, VFC) can't be imported: on "
++               "disk each record starts with a byte count the host file doesn't have";
++    default:
++        return "unknown record format";
++    }
++    if (attrs->rattrib & ~0x0fu) {
++        return "unknown record attribute bits";
++    }
++    if (cc != 0 && (cc & (cc - 1)) != 0) {
++        return "only one carriage control (FTN, CR or PRN) can be given";
++    }
++    return NULL;
++}
++
++ods2_result_t ods2_create_file_attrs(ods2_volume_t *vol, const uint8_t *parent_header,
++                                      const char *name, const uint8_t *content,
++                                      size_t content_len, const ods2_record_attrs_t *attrs,
++                                      ods2_fid_t *new_fid_out)
++{
++    const char *why = ods2_check_record_attrs(attrs, content_len);
++    if (why != NULL) {
++        return fail(why);
++    }
++    return create_file(vol, parent_header, name, content, content_len, attrs, new_fid_out);
++}
++
+ ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,
+                                 const char *name, const uint8_t *content, size_t content_len,
+                                 uint8_t rtype, ods2_fid_t *new_fid_out)
++{
++    ods2_record_attrs_t attrs;
++    attrs.rtype = rtype;
++    attrs.rattrib = 0;
++    attrs.rsize = 512;
++    attrs.maxrec = 512;
++    return create_file(vol, parent_header, name, content, content_len, &attrs, new_fid_out);
++}
++
++static ods2_result_t create_file(ods2_volume_t *vol, const uint8_t *parent_header,
++                                 const char *name, const uint8_t *content, size_t content_len,
++                                 const ods2_record_attrs_t *attrs, ods2_fid_t *new_fid_out)
+ {
+     const ods2_head_core_t *parent_core = (const ods2_head_core_t *) parent_header;
+     ods2_fid_t existing;
+@@ -1462,10 +1538,10 @@ ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,
+     if (!r.ok) goto undo;
+ 
+     memset(&spec, 0, sizeof(spec));
+-    spec.rtype = rtype;
+-    spec.rattrib = 0;
+-    spec.rsize = 512;
+-    spec.maxrec = 512;
++    spec.rtype = attrs->rtype;
++    spec.rattrib = attrs->rattrib;
++    spec.rsize = attrs->rsize;
++    spec.maxrec = attrs->maxrec;
+     /* Records the whole file's size in every header, as the record
+        attributes are copied into extension headers too. */
+     spec.hiblk = (uint32_t) total_allocated;
+diff --git a/tests/cli_record_attrs_check.sh b/tests/cli_record_attrs_check.sh
+new file mode 100644
+index 0000000..367d1d6
+--- /dev/null
++++ b/tests/cli_record_attrs_check.sh
+@@ -0,0 +1,119 @@
++#!/bin/sh
++# MIT License - Copyright (c) 2026 Allen Pomeroy (see LICENSE)
++#
++# cli_record_attrs_check.sh - RMS record attributes of host imports:
++# `ods2 COPY/ATTRIBUTES=(...)` and `ods2_put ... rtype rsize rattrib`
++# set the record format, record size and record attributes in the new
++# file's header (read back with ods2_dump_header), e.g. the fixed
++# 8192-byte records OpenVMS PCSI kit files need; plain COPY is still
++# Stream_LF; attributes that don't fit the content are refused with
++# exit status 1 and no file. Called by `make test`; run from the
++# project root.
++
++SRC_DISK=samples/synthetic_disk.img
++DISK=samples/cli_attrs_disk.img
++ODS2=./ods2
++PUT=./ods2_put
++DUMP=./ods2_dump_header
++TMP=samples/cli_attrs_tmp
++fails=0
++
++check() { # check <description> <expected> <actual>
++    if [ "$2" = "$3" ]; then
++        echo "PASS: $1"
++    else
++        echo "FAIL: $1"
++        echo "      expected: $2"
++        echo "      got:      $3"
++        fails=$((fails + 1))
++    fi
++}
++
++status() { "$@" >/dev/null 2>&1; echo $?; }
++
++[ -f "$SRC_DISK" ] || { echo "FAIL: $SRC_DISK missing"; exit 1; }
++for t in $PUT $DUMP; do [ -x $t ] || { echo "FAIL: $t not built"; exit 1; }; done
++rm -f "$DISK"
++cp "$SRC_DISK" "$DISK"
++mkdir -p "$TMP"
++
++head -c 16384 /dev/zero | tr '\0' 'K' > "$TMP/kit.pcsi"     # 2 records of 8192
++head -c 16000 /dev/zero | tr '\0' 'S' > "$TMP/short.pcsi"   # not whole records
++printf 'line one\nline two\n' > "$TMP/notes.txt"
++
++# File numbers are handed out in order on this fresh disk, so each
++# successful create below takes the next one; read them from the COPY
++# itself where possible: ods2_put prints FID=(num,...).
++next_fid() { $PUT "$@" | sed -n 's/.*FID=(\([0-9]*\),.*/\1/p'; }
++hdr() { $DUMP $DISK "$1" | tr -s ' ' '\n' | grep -E '^(rtype|rattrib|rsize|maxrec)=' | tr '\n' ' ' | sed 's/ $//'; }
++
++# --- ods2_put ---
++n=$(next_fid $DISK $TMP/kit.pcsi '' PUT8192.PCSI 1 8192)
++check "ods2_put 1 8192: fixed 8192-byte records" \
++    "rtype=0x01 rattrib=0x00 rsize=8192 maxrec=8192" "$(hdr $n)"
++n=$(next_fid $DISK $TMP/kit.pcsi '' PUT512.DAT 1)
++check "ods2_put 1: fixed 512-byte records by default" \
++    "rtype=0x01 rattrib=0x00 rsize=512 maxrec=512" "$(hdr $n)"
++n=$(next_fid $DISK $TMP/notes.txt '' PUTCR.TXT 5 512 2)
++check "ods2_put 5 512 2: Stream_LF with CR carriage control" \
++    "rtype=0x05 rattrib=0x02 rsize=512 maxrec=512" "$(hdr $n)"
++check "ods2_put refuses content that isn't whole records (exit 1)" 1 \
++    "$(status $PUT $DISK $TMP/short.pcsi '' SHORT.PCSI 1 8192)"
++check "ods2_put refuses VAR (exit 1)" 1 "$(status $PUT $DISK $TMP/notes.txt '' V.TXT 2)"
++check "ods2_put refuses a non-numeric size (exit 1)" 1 \
++    "$(status $PUT $DISK $TMP/kit.pcsi '' X.PCSI 1 8k)"
++
++# --- ods2 COPY ---
++# Each successful COPY takes the next file number after the last one.
++check "COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) succeeds" \
++    "%ODS2-I-COPIED, 16384 bytes to KIT.PCSI;1" \
++    "$($ODS2 $DISK "COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) $TMP/kit.pcsi [000000]KIT.PCSI" 2>&1)"
++n=$((n + 1))
++check "...with fixed 8192-byte records in the header" \
++    "rtype=0x01 rattrib=0x00 rsize=8192 maxrec=8192" "$(hdr $n)"
++$ODS2 $DISK "TYPE [000000]KIT.PCSI" > "$TMP/out.bin" 2>/dev/null
++if cmp -s "$TMP/kit.pcsi" "$TMP/out.bin"; then same=identical; else same=different; fi
++check "...and reads back byte for byte" identical "$same"
++
++$ODS2 $DISK "COPY/ATTR=(RFM:FIXED,LRL:8192) $TMP/kit.pcsi [000000]LRL.PCSI" >/dev/null 2>&1
++n=$((n + 1))
++check "LRL alone sets a fixed record size too; /ATTR abbreviation" \
++    "rtype=0x01 rattrib=0x00 rsize=8192 maxrec=8192" "$(hdr $n)"
++$ODS2 $DISK "copy/attributes=rfm:fix $TMP/kit.pcsi [000000]F512.DAT" >/dev/null 2>&1
++n=$((n + 1))
++check "RFM:FIX with no size: 512-byte records; lowercase, no parentheses" \
++    "rtype=0x01 rattrib=0x00 rsize=512 maxrec=512" "$(hdr $n)"
++$ODS2 $DISK "COPY/ATTRIBUTES=(RFM:STMLF,RAT:CR) $TMP/notes.txt [000000]NOTES.TXT" >/dev/null 2>&1
++n=$((n + 1))
++check "RFM:STMLF,RAT:CR" "rtype=0x05 rattrib=0x02 rsize=512 maxrec=512" "$(hdr $n)"
++$ODS2 $DISK "COPY/ATTRIBUTES=(RFM:UDF,RAT:NONE,MRS:0,LRL:0) $TMP/notes.txt [000000]RAW.DAT" >/dev/null 2>&1
++n=$((n + 1))
++check "RFM:UDF with sizes 0" "rtype=0x00 rattrib=0x00 rsize=0 maxrec=0" "$(hdr $n)"
++$ODS2 $DISK "COPY $TMP/notes.txt [000000]PLAIN.TXT" >/dev/null 2>&1
++n=$((n + 1))
++check "plain COPY is still Stream_LF, 512, no RAT" \
++    "rtype=0x05 rattrib=0x00 rsize=512 maxrec=512" "$(hdr $n)"
++
++check "COPY of content that isn't whole records exits 1" 1 \
++    "$(status $ODS2 $DISK "COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) $TMP/short.pcsi [000000]SHORT.PCSI")"
++check "...and creates no file" "%ODS2-W-NOFILES, no files found" \
++    "$($ODS2 $DISK 'DIR [000000]SHORT.PCSI' 2>&1)"
++check "MRS different from LRL for FIX exits 1" 1 \
++    "$(status $ODS2 $DISK "COPY/ATTRIBUTES=(RFM:FIX,MRS:8192,LRL:512) $TMP/kit.pcsi [000000]REFUSED1.PCSI")"
++check "an odd fixed size exits 1" 1 \
++    "$(status $ODS2 $DISK "COPY/ATTRIBUTES=(RFM:FIX,MRS:8191) $TMP/kit.pcsi [000000]REFUSED2.PCSI")"
++check "RFM:VAR exits 1" 1 \
++    "$(status $ODS2 $DISK "COPY/ATTRIBUTES=(RFM:VAR) $TMP/notes.txt [000000]REFUSED3.TXT")"
++check "an unknown record format exits 1" 1 \
++    "$(status $ODS2 $DISK "COPY/ATTRIBUTES=(RFM:XYZ) $TMP/notes.txt [000000]REFUSED4.TXT")"
++check "an unknown qualifier exits 1" 1 \
++    "$(status $ODS2 $DISK "COPY/BOGUS $TMP/notes.txt [000000]REFUSED5.TXT")"
++check "two carriage controls exit 1" 1 \
++    "$(status $ODS2 $DISK "COPY/ATTRIBUTES=(RFM:STMLF,RAT:CR,RAT:FTN) $TMP/notes.txt [000000]REFUSED6.TXT")"
++check "a missing ')' exits 1" 1 \
++    "$(status $ODS2 $DISK "COPY/ATTRIBUTES=(RFM:FIX $TMP/kit.pcsi [000000]REFUSED7.PCSI")"
++check "none of the refused copies created a file" "%ODS2-W-NOFILES, no files found" \
++    "$($ODS2 $DISK 'DIR [000000]REFUSED*.*' 2>&1)"
++
++rm -rf "$TMP" "$DISK"
++[ "$fails" -eq 0 ] || { echo "$fails CLI record attribute check(s) failed"; exit 1; }
+diff --git a/tests/ods2_record_attrs_selftest.c b/tests/ods2_record_attrs_selftest.c
+new file mode 100644
+index 0000000..3e91b72
+--- /dev/null
++++ b/tests/ods2_record_attrs_selftest.c
+@@ -0,0 +1,242 @@
++/*
++ * MIT License
++ *
++ * Copyright (c) 2026 Allen Pomeroy
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++/* ods2_record_attrs_selftest - RMS record attributes of imported files
++ * (FH2$W_RECATTR, spec 3.5.2.9), on a copy of the synthetic disk:
++ *
++ *  - ods2_check_record_attrs() accepts fixed records of any even size
++ *    the content is a whole number of, and refuses the rest (odd sizes,
++ *    MRS != record size, partial last record, VAR/VFC, bad RAT bits);
++ *  - a file created with fixed 8192-byte records - as OpenVMS PCSI kit
++ *    files are - has RTYPE FIX, RSIZE = MRS = 8192 in its header, the
++ *    same shape VMS gives its own fixed files (INDEXF.SYS: FIX, 512,
++ *    512), a correct end-of-file mark, and reads back unchanged;
++ *  - other formats and record attributes land in the header as given;
++ *  - refused attributes create nothing and allocate nothing;
++ *  - ods2_create_file() is unchanged: RSIZE = MRS = 512, RAT 0. */
++
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++#include <assert.h>
++#include "ods2_volume.h"
++#include "ods2_validate.h"
++
++#define SOURCE_DISK_PATH "samples/synthetic_disk.img"
++#define DISK_PATH        "samples/record_attrs_disk.img"
++
++static void copy_sparse(const char *src, const char *dst)
++{
++    FILE *in = fopen(src, "rb");
++    FILE *out = fopen(dst, "wb");
++    static char buf[1 << 20];
++    static const char zero[1 << 20];
++    size_t n;
++    long total = 0;
++    char last;
++    assert(in != NULL && out != NULL);
++    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
++        if (n == sizeof(buf) && memcmp(buf, zero, n) == 0) {
++            assert(fseek(out, (long) n, SEEK_CUR) == 0);
++        } else {
++            assert(fwrite(buf, 1, n, out) == n);
++        }
++        total += (long) n;
++    }
++    assert(fseek(in, total - 1, SEEK_SET) == 0 && fread(&last, 1, 1, in) == 1);
++    assert(fseek(out, total - 1, SEEK_SET) == 0 && fwrite(&last, 1, 1, out) == 1);
++    fclose(in);
++    fclose(out);
++}
++
++static ods2_record_attrs_t attrs(uint8_t rtype, uint8_t rattrib, uint16_t rsize, uint16_t maxrec)
++{
++    ods2_record_attrs_t a;
++    a.rtype = rtype;
++    a.rattrib = rattrib;
++    a.rsize = rsize;
++    a.maxrec = maxrec;
++    return a;
++}
++
++static bool accepted(uint8_t rtype, uint8_t rattrib, uint16_t rsize, uint16_t maxrec, size_t len)
++{
++    ods2_record_attrs_t a = attrs(rtype, rattrib, rsize, maxrec);
++    return ods2_check_record_attrs(&a, len) == NULL;
++}
++
++static uint32_t swap32(uint32_t v) { return (v << 16) | (v >> 16); }
++
++/* Creates `name` in the root with `a`, and checks its header carries
++   exactly those attributes and the right end-of-file mark. */
++static ods2_fid_t create_and_check(ods2_volume_t *vol, const char *name,
++                                   const uint8_t *content, size_t len, ods2_record_attrs_t a)
++{
++    uint8_t root[512], h[512], *back;
++    const ods2_head_core_t *core = (const ods2_head_core_t *) h;
++    ods2_fid_t fid;
++    size_t got;
++    ods2_result_t r;
++
++    assert(ods2_read_header(vol, 4, root).ok);
++    r = ods2_create_file_attrs(vol, root, name, content, len, &a, &fid);
++    if (!r.ok) printf("create %s: %s\n", name, r.problem);
++    assert(r.ok);
++    assert(ods2_read_header(vol, fid.fid_num, h).ok);
++    assert(ods2_validate_head(h).ok);
++    assert(core->recattr.rtype == a.rtype);
++    assert(core->recattr.rattrib == a.rattrib);
++    assert(core->recattr.rsize == a.rsize);
++    assert(core->recattr.maxrec == a.maxrec);
++    assert(swap32(core->recattr.efblk) == len / 512 + 1);
++    assert(core->recattr.ffbyte == len % 512);
++    back = malloc(len + 1);
++    assert(back != NULL);
++    assert(ods2_read_file(vol, h, back, len + 1, &got).ok && got == len);
++    assert(memcmp(back, content, len) == 0);
++    free(back);
++    return fid;
++}
++
++int main(void)
++{
++    ods2_volume_t vol;
++    uint8_t *kit;
++    size_t kit_len = 3u * 8192u;
++    size_t i;
++
++    setvbuf(stdout, NULL, _IONBF, 0);
++
++    /* --- What ods2_check_record_attrs() accepts --- */
++    assert(accepted(ODS2_RFM_FIX, 0, 8192, 8192, 16384));
++    assert(accepted(ODS2_RFM_FIX, 0, 8192, 8192, 0));          /* empty: zero records */
++    assert(accepted(ODS2_RFM_FIX, 0, 512, 512, 1024));
++    assert(accepted(ODS2_RFM_FIX, 0, 80, 80, 800));
++    assert(accepted(ODS2_RFM_FIX, ODS2_RAT_CR, 80, 80, 160));
++    assert(accepted(ODS2_RFM_FIX, 0, 32766, 32766, 32766));
++    assert(!accepted(ODS2_RFM_FIX, 0, 8192, 8192, 16000));     /* partial last record */
++    assert(!accepted(ODS2_RFM_FIX, 0, 8192, 512, 16384));      /* MRS != record size */
++    assert(!accepted(ODS2_RFM_FIX, 0, 133, 133, 133));         /* odd: RMS pads it */
++    assert(!accepted(ODS2_RFM_FIX, 0, 0, 0, 0));               /* no size */
++    assert(!accepted(ODS2_RFM_FIX, 0, 32768, 32768, 32768));   /* too big */
++    assert(accepted(ODS2_RFM_STMLF, ODS2_RAT_CR, 0, 0, 123));
++    assert(accepted(ODS2_RFM_STMLF, 0, 512, 512, 123));
++    assert(accepted(ODS2_RFM_UDF, 0, 512, 512, 7));
++    assert(accepted(ODS2_RFM_STM, ODS2_RAT_CR, 0, 0, 7));
++    assert(accepted(ODS2_RFM_STMCR, ODS2_RAT_CR | ODS2_RAT_BLK, 0, 0, 7));
++    assert(!accepted(ODS2_RFM_VAR, ODS2_RAT_CR, 0, 0, 7));     /* needs count words */
++    assert(!accepted(ODS2_RFM_VFC, ODS2_RAT_PRN, 0, 0, 7));
++    assert(!accepted(7, 0, 0, 0, 7));                          /* no such format */
++    assert(!accepted(0x11, 0, 512, 512, 512));                 /* not sequential */
++    assert(!accepted(ODS2_RFM_STMLF, ODS2_RAT_CR | ODS2_RAT_FTN, 0, 0, 7));
++    assert(!accepted(ODS2_RFM_STMLF, 0x10, 0, 0, 7));          /* unknown RAT bit */
++    assert(!accepted(ODS2_RFM_STMLF, 0, 40000, 0, 7));
++    printf("PASS: record attributes are checked against the content: fixed records "
++           "whole and even-sized, MRS = record size, no VAR/VFC, valid RAT\n");
++
++    copy_sparse(SOURCE_DISK_PATH, DISK_PATH);
++    assert(ods2_mount_write(DISK_PATH, &vol).ok);
++
++    /* --- Fixed 8192-byte records, as in a PCSI kit --- */
++    kit = malloc(kit_len);
++    assert(kit != NULL);
++    for (i = 0; i < kit_len; i++) kit[i] = (uint8_t) (i * 7 + i / 8192);
++    create_and_check(&vol, "KIT.PCSI", kit, kit_len, attrs(ODS2_RFM_FIX, 0, 8192, 8192));
++    printf("PASS: KIT.PCSI created with fixed 8192-byte records: RTYPE FIX, "
++           "RSIZE = MRS = 8192, RAT none, EOF after 3 records, content intact\n");
++
++    /* --- The shape VMS gives its own fixed files --- */
++    {
++        uint8_t ix[512], h[512];
++        const ods2_head_core_t *vms = (const ods2_head_core_t *) ix;
++        const ods2_head_core_t *ours = (const ods2_head_core_t *) h;
++        create_and_check(&vol, "FIX512.DAT", kit, 1024, attrs(ODS2_RFM_FIX, 0, 512, 512));
++        assert(ods2_read_header(&vol, 1, ix).ok); /* INDEXF.SYS, written by VMS */
++        assert(vms->recattr.rtype == ODS2_RFM_FIX && vms->recattr.rsize == 512 &&
++               vms->recattr.maxrec == 512 && vms->recattr.rattrib == 0);
++        {
++            uint8_t root[512];
++            ods2_fid_t fid;
++            assert(ods2_read_header(&vol, 4, root).ok);
++            assert(ods2_lookup_name(&vol, root, "FIX512.DAT", &fid).ok);
++            assert(ods2_read_header(&vol, fid.fid_num, h).ok);
++        }
++        assert(ours->recattr.rtype == vms->recattr.rtype);
++        assert(ours->recattr.rattrib == vms->recattr.rattrib);
++        assert(ours->recattr.rsize == vms->recattr.rsize);
++        assert(ours->recattr.maxrec == vms->recattr.maxrec);
++        printf("PASS: a fixed 512-byte import has the same record attributes as "
++               "VMS's own INDEXF.SYS\n");
++    }
++
++    /* --- Other formats and attributes, as given --- */
++    create_and_check(&vol, "NOTES.TXT", (const uint8_t *) "one\ntwo\n", 8,
++                     attrs(ODS2_RFM_STMLF, ODS2_RAT_CR, 0, 0));
++    create_and_check(&vol, "RAW.DAT", kit, 777, attrs(ODS2_RFM_UDF, 0, 512, 512));
++    create_and_check(&vol, "CARDS.DAT", kit, 800, attrs(ODS2_RFM_FIX, ODS2_RAT_CR, 80, 80));
++    create_and_check(&vol, "EMPTY.PCSI", kit, 0, attrs(ODS2_RFM_FIX, 0, 8192, 8192));
++    printf("PASS: Stream_LF with CR, UDF, fixed 80 with CR and an empty fixed 8192 "
++           "file all get exactly the attributes asked for\n");
++
++    /* --- Refused attributes create and allocate nothing --- */
++    {
++        uint8_t root[512];
++        ods2_fid_t fid;
++        ods2_record_attrs_t bad = attrs(ODS2_RFM_FIX, 0, 8192, 8192);
++        uint8_t bitmap_before[512], bitmap_after[512];
++        ods2_result_t r;
++        assert(ods2_read_header(&vol, 4, root).ok);
++        assert(fseek(vol.fp, (long) vol.home.ibmaplbn * 512, SEEK_SET) == 0);
++        assert(fread(bitmap_before, 1, 512, vol.fp) == 512);
++        r = ods2_create_file_attrs(&vol, root, "SHORT.PCSI", kit, 8192 + 100, &bad, &fid);
++        assert(!r.ok);
++        assert(strstr(r.problem, "whole number") != NULL);
++        assert(ods2_read_header(&vol, 4, root).ok);
++        assert(!ods2_lookup_name(&vol, root, "SHORT.PCSI", &fid).ok);
++        assert(fseek(vol.fp, (long) vol.home.ibmaplbn * 512, SEEK_SET) == 0);
++        assert(fread(bitmap_after, 1, 512, vol.fp) == 512);
++        assert(memcmp(bitmap_before, bitmap_after, 512) == 0);
++        printf("PASS: a file that isn't a whole number of records is refused before "
++               "anything is allocated (%s)\n", r.problem);
++    }
++
++    /* --- ods2_create_file() unchanged --- */
++    {
++        uint8_t root[512], h[512];
++        const ods2_head_core_t *core = (const ods2_head_core_t *) h;
++        ods2_fid_t fid;
++        assert(ods2_read_header(&vol, 4, root).ok);
++        assert(ods2_create_file(&vol, root, "LEGACY.TXT", kit, 10, ODS2_RFM_STMLF, &fid).ok);
++        assert(ods2_read_header(&vol, fid.fid_num, h).ok);
++        assert(core->recattr.rtype == ODS2_RFM_STMLF && core->recattr.rattrib == 0 &&
++               core->recattr.rsize == 512 && core->recattr.maxrec == 512);
++        printf("PASS: ods2_create_file() still writes RSIZE = MRS = 512, RAT none\n");
++    }
++
++    ods2_dismount(&vol);
++    free(kit);
++    remove(DISK_PATH);
++    printf("\nods2_record_attrs_selftest: all checks passed\n");
++    return 0;
++}
+diff --git a/tools/ods2.c b/tools/ods2.c
+index 932f8a7..daf93bc 100644
+--- a/tools/ods2.c
++++ b/tools/ods2.c
+@@ -52,7 +52,12 @@
+  *                                 (e.g. [*], [*.SRC], [...SALES],
+  *                                 [DECUS...SRC]) - as VMS DIRECTORY
+  *   CREATE/DIRECTORY path         create a directory
+- *   COPY <local-file> <path>      write a local file onto the disk
++ *   COPY <local-file> <path>      write a local file onto the disk,
++ *                                 as a Stream_LF file
++ *   COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) <local-file> <path>
++ *                                 ... with chosen RMS record attributes,
++ *                                 in SET FILE/ATTRIBUTES syntax (see
++ *                                 parse_copy_qualifiers())
+  *   TYPE path                     print a file's content
+  *   DELETE path                   delete a file (one version) or an
+  *                                 empty directory
+@@ -114,7 +119,6 @@
+    one "current session" for it to belong to. */
+ static char g_default_dir[ODS2_PATH_MAX] = "";
+ 
+-/* Case-insensitive prefix/equality check. */
+ /* Set by report_error(): some command since the last reset failed.
+    main() turns it into the exit status of a single-shot command or an
+    @script, so scripts and automation can tell success from failure
+@@ -133,6 +137,7 @@ static void report_error(const char *fmt, ...)
+     g_command_failed = true;
+ }
+ 
++/* Case-insensitive equality check. */
+ static bool matches(const char *token, const char *name)
+ {
+     size_t i;
+@@ -594,7 +599,166 @@ static bool read_whole_file(const char *path, uint8_t **buf_out, size_t *len_out
+     return true;
+ }
+ 
+-static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_parsed_path_t *p)
++/* Case-insensitive: is `word` (length `len`) `name`, or an
++   abbreviation of it at least `min` characters long, as VMS allows? */
++static bool keyword(const char *word, size_t len, const char *name, size_t min)
++{
++    size_t i;
++    if (len < min || len > strlen(name)) return false;
++    for (i = 0; i < len; i++) {
++        if (toupper((unsigned char) word[i]) != toupper((unsigned char) name[i])) return false;
++    }
++    return true;
++}
++
++/* Parses COPY's qualifiers - everything after "COPY" in the command
++ * word - into the record attributes of the new file. The one qualifier
++ * is /ATTRIBUTES, in the syntax of VMS's SET FILE/ATTRIBUTES:
++ *
++ *   COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) kit.pcsi [000000]KIT.PCSI
++ *
++ *   RFM:fmt   record format - FIX, STMLF, STM, STMCR or UDF
++ *   MRS:n     maximum record size; for FIX, the record size
++ *   LRL:n     longest record length (for FIX, the same as MRS)
++ *   RAT:x     record attributes - NONE, CR, FTN, PRN, BLK, NOBLK;
++ *             repeat RAT for more than one (RAT:CR,RAT:BLK)
++ *
++ * With no qualifier the file is Stream_LF, as always. A fixed format
++ * with no size given is 512-byte records. Returns false after
++ * reporting the problem. */
++static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a)
++{
++    bool mrs_given = false, lrl_given = false;
++    const char *q = quals;
++
++    while (*q == '/') {
++        const char *name = ++q;
++        const char *value, *end;
++        size_t name_len;
++
++        while (*q && *q != '=' && *q != '/') q++;
++        name_len = (size_t) (q - name);
++        if (!keyword(name, name_len, "ATTRIBUTES", 4)) {
++            report_error("%%ODS2-E-IVQUAL, unrecognized qualifier /%.*s - COPY takes "
++                         "/ATTRIBUTES=(RFM:fmt,MRS:size,RAT:attr)\n", (int) name_len, name);
++            return false;
++        }
++        if (*q != '=') {
++            report_error("%%ODS2-E-VALREQ, /ATTRIBUTES needs a value, e.g. "
++                         "/ATTRIBUTES=(RFM:FIX,MRS:8192)\n");
++            return false;
++        }
++        value = ++q;
++        if (*value == '(') {
++            end = strchr(value, ')');
++            if (end == NULL) {
++                report_error("%%ODS2-E-BADVALUE, /ATTRIBUTES: missing ')'\n");
++                return false;
++            }
++            value++;
++            q = end + 1;
++        } else {
++            end = value;
++            while (*end && *end != '/') end++;
++            q = end;
++        }
++
++        /* comma-separated KEY:VALUE items between value and end */
++        while (value < end) {
++            const char *item = value, *colon, *item_end = value;
++            size_t key_len, val_len;
++            while (item_end < end && *item_end != ',') item_end++;
++            value = (item_end < end) ? item_end + 1 : end;
++            colon = memchr(item, ':', (size_t) (item_end - item));
++            if (colon == NULL) colon = memchr(item, '=', (size_t) (item_end - item));
++            if (colon == NULL) {
++                report_error("%%ODS2-E-BADVALUE, /ATTRIBUTES: \"%.*s\" is not KEY:VALUE\n",
++                             (int) (item_end - item), item);
++                return false;
++            }
++            key_len = (size_t) (colon - item);
++            val_len = (size_t) (item_end - colon - 1);
++
++            if (keyword(item, key_len, "RFM", 3)) {
++                const char *v = colon + 1;
++                if (keyword(v, val_len, "FIXED", 3)) a->rtype = ODS2_RFM_FIX;
++                else if (keyword(v, val_len, "STMLF", 5) || keyword(v, val_len, "STREAM_LF", 8))
++                    a->rtype = ODS2_RFM_STMLF;
++                else if (keyword(v, val_len, "STMCR", 5) || keyword(v, val_len, "STREAM_CR", 8))
++                    a->rtype = ODS2_RFM_STMCR;
++                else if (keyword(v, val_len, "STM", 3) || keyword(v, val_len, "STREAM", 6))
++                    a->rtype = ODS2_RFM_STM;
++                else if (keyword(v, val_len, "UDF", 3) || keyword(v, val_len, "UNDEFINED", 3))
++                    a->rtype = ODS2_RFM_UDF;
++                else if (keyword(v, val_len, "VARIABLE", 3)) a->rtype = ODS2_RFM_VAR;
++                else if (keyword(v, val_len, "VFC", 3)) a->rtype = ODS2_RFM_VFC;
++                else {
++                    report_error("%%ODS2-E-BADVALUE, RFM:%.*s - record format must be FIX, "
++                                 "STMLF, STM, STMCR or UDF\n", (int) val_len, v);
++                    return false;
++                }
++            } else if (keyword(item, key_len, "MRS", 3) || keyword(item, key_len, "LRL", 3)) {
++                char digits[16];
++                char *stop;
++                unsigned long n;
++                if (val_len == 0 || val_len >= sizeof(digits)) {
++                    n = 0;
++                    stop = digits;
++                    digits[0] = 'x';
++                } else {
++                    memcpy(digits, colon + 1, val_len);
++                    digits[val_len] = '\0';
++                    n = strtoul(digits, &stop, 10);
++                }
++                if (*stop != '\0' || digits[0] == '-' || n > 65535) {
++                    report_error("%%ODS2-E-BADVALUE, %.*s needs a record size in bytes\n",
++                                 (int) (item_end - item), item);
++                    return false;
++                }
++                if (toupper((unsigned char) item[0]) == 'M') {
++                    a->maxrec = (uint16_t) n;
++                    mrs_given = true;
++                } else {
++                    a->rsize = (uint16_t) n;
++                    lrl_given = true;
++                }
++            } else if (keyword(item, key_len, "RAT", 3)) {
++                const char *v = colon + 1;
++                if (keyword(v, val_len, "NONE", 4)) a->rattrib &= (uint8_t) ~0x07u;
++                else if (keyword(v, val_len, "CR", 2)) a->rattrib |= ODS2_RAT_CR;
++                else if (keyword(v, val_len, "FTN", 3)) a->rattrib |= ODS2_RAT_FTN;
++                else if (keyword(v, val_len, "PRN", 3)) a->rattrib |= ODS2_RAT_PRN;
++                else if (keyword(v, val_len, "BLK", 3)) a->rattrib |= ODS2_RAT_BLK;
++                else if (keyword(v, val_len, "NOBLK", 5)) a->rattrib &= (uint8_t) ~ODS2_RAT_BLK;
++                else {
++                    report_error("%%ODS2-E-BADVALUE, RAT:%.*s - record attributes are NONE, "
++                                 "CR, FTN, PRN, BLK or NOBLK\n", (int) val_len, v);
++                    return false;
++                }
++            } else {
++                report_error("%%ODS2-E-BADVALUE, /ATTRIBUTES: unknown keyword \"%.*s\" - "
++                             "use RFM, MRS, LRL or RAT\n", (int) key_len, item);
++                return false;
++            }
++        }
++    }
++    if (*q != '\0') {
++        report_error("%%ODS2-E-IVQUAL, could not parse qualifiers \"%s\"\n", quals);
++        return false;
++    }
++
++    /* A fixed record's size is both RSIZE and MRS: either one sets
++       both, as VMS keeps them equal; neither means 512. */
++    if (a->rtype == ODS2_RFM_FIX) {
++        if (mrs_given && !lrl_given) a->rsize = a->maxrec;
++        else if (lrl_given && !mrs_given) a->maxrec = a->rsize;
++        else if (!mrs_given && !lrl_given) a->rsize = a->maxrec = 512;
++    }
++    return true;
++}
++
++static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_parsed_path_t *p,
++                     const ods2_record_attrs_t *attrs)
+ {
+     uint8_t dir_header[512];
+     ods2_fid_t dir_fid, new_fid;
+@@ -602,7 +766,6 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
+     size_t content_len;
+     ods2_result_t r;
+     const char *name;
+-    uint8_t rtype = 5; /* FAB$C_STMLF - reasonable default for COPY */
+ 
+     if (p->filename[0] == '\0') {
+         report_error("%%ODS2-E-BADPATH, no destination filename given\n");
+@@ -636,7 +799,7 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
+         free(buf);
+         return;
+     }
+-    r = ods2_create_file(vol, dir_header, name, buf, content_len, rtype, &new_fid);
++    r = ods2_create_file_attrs(vol, dir_header, name, buf, content_len, attrs, &new_fid);
+     if (!r.ok) {
+         report_error("%%ODS2-E-COPYERR, %s\n", r.problem);
+         free(buf);
+@@ -796,7 +959,11 @@ static void print_help(void)
+            "  DIR [*...] [wildcard]      '*' '%%' in directory names, '...' anywhere\n"
+            "                             ([*], [*.SRC], [...SALES], [DECUS...SRC])\n"
+            "  CREATE/DIRECTORY path      create a directory\n"
+-           "  COPY <local-file> <path>   write a local file onto the disk\n"
++           "  COPY <local-file> <path>   write a local file onto the disk (Stream_LF)\n"
++           "  COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) <local-file> <path>\n"
++           "                             ... with chosen record attributes: RFM: FIX,\n"
++           "                             STMLF, STM, STMCR or UDF; MRS: record size;\n"
++           "                             RAT: NONE, CR, FTN, PRN, BLK (one per RAT:)\n"
+            "  TYPE path                  print a file's content\n"
+            "  DELETE path                delete a file (one version) or empty directory\n"
+            "  SET DEFAULT path           set the current default directory\n"
+@@ -837,9 +1004,21 @@ static int tokenize(char *line, char *tokens[MAX_TOKENS])
+ static bool execute_line(ods2_volume_t *vol, char *line)
+ {
+     char *tokens[MAX_TOKENS];
++    char verb[32];          /* the command word without qualifiers */
++    const char *quals;      /* its qualifiers ("/ATTRIBUTES=..."), or NULL */
++    size_t verb_len;
+     int n = tokenize(line, tokens);
+     if (n == 0) return true; /* blank line */
+ 
++    /* COPY takes qualifiers on the command word itself
++       (COPY/ATTRIBUTES=...) - not on its arguments, since a host path
++       contains '/' too. CREATE/DIRECTORY is matched whole, below. */
++    quals = strchr(tokens[0], '/');
++    verb_len = quals ? (size_t) (quals - tokens[0]) : strlen(tokens[0]);
++    if (verb_len >= sizeof(verb)) verb_len = 0; /* too long to be any command */
++    memcpy(verb, tokens[0], verb_len);
++    verb[verb_len] = '\0';
++
+     if (matches(tokens[0], "EXIT") || matches(tokens[0], "QUIT")) {
+         return false;
+     }
+@@ -935,8 +1114,17 @@ static bool execute_line(ods2_volume_t *vol, char *line)
+         cmd_create_directory(vol, &p);
+         return true;
+     }
+-    if (matches(tokens[0], "COPY") || matches(tokens[0], "PUT") || matches(tokens[0], "IMPORT")) {
++    if (matches(verb, "COPY") || matches(verb, "PUT") || matches(verb, "IMPORT")) {
+         ods2_parsed_path_t p;
++        ods2_record_attrs_t attrs;
++        /* COPY's default: Stream_LF, as before qualifiers existed. */
++        attrs.rtype = ODS2_RFM_STMLF;
++        attrs.rattrib = 0;
++        attrs.rsize = 512;
++        attrs.maxrec = 512;
++        if (quals != NULL && !parse_copy_qualifiers(quals, &attrs)) {
++            return true;
++        }
+         if (n < 3) {
+             report_error("%%ODS2-E-NOPARM, usage: COPY <local-file> <path>\n");
+             return true;
+@@ -946,7 +1134,7 @@ static bool execute_line(ods2_volume_t *vol, char *line)
+             return true;
+         }
+         if (refuse_wild_dir(&p, "COPY", tokens[2])) return true;
+-        cmd_copy(vol, tokens[1], &p);
++        cmd_copy(vol, tokens[1], &p, &attrs);
+         return true;
+     }
+     if (matches(tokens[0], "TYPE") || matches(tokens[0], "CAT")) {
+diff --git a/tools/ods2_put.c b/tools/ods2_put.c
+index de5285a..2476fe8 100644
+--- a/tools/ods2_put.c
++++ b/tools/ods2_put.c
+@@ -25,10 +25,15 @@
+ /* ods2_put.c - writes a local file's content onto a real ODS-2 disk
+  * image (an IMPORT/COPY-in equivalent).
+  *
+- * Usage: ods2_put <disk-image> <local-file> <dir-path> <name> [rtype]
++ * Usage: ods2_put <disk-image> <local-file> <dir-path> <name> [rtype [rsize [rattrib]]]
+  *   ods2_put transfer.dsk readme.txt DECUS.NETLIB020 AAAREADME.DOC
++ *   ods2_put transfer.dsk kit.pcsi '' KIT.PCSI 1 8192
+  *   rtype defaults to 5 (FAB$C_STMLF, stream-LF - typical for text);
+- *   pass 1 (FAB$C_FIX) for binary content.
++ *   1 (FAB$C_FIX) is fixed-length records of rsize bytes (default
++ *   512), and the file must be a whole number of them; 0 (UDF), 4
++ *   (STM) and 6 (STMCR) are the other formats. rattrib is the RMS
++ *   record attributes byte (default 0; 2 = CR carriage control).
++ *   See ods2_check_record_attrs() for what is accepted.
+  *
+  * Any size of file the volume has room for - see ods2_create_file().
+  */
+@@ -97,19 +102,47 @@ int main(int argc, char **argv)
+     uint8_t dir_header[512];
+     uint8_t *buf;
+     size_t content_len;
+-    uint8_t rtype;
++    ods2_record_attrs_t attrs;
++    unsigned long values[3] = { ODS2_RFM_STMLF, 512, 0 }; /* rtype, rsize, rattrib */
++    const char *why;
++    int i;
+ 
+-    if (argc < 5 || argc > 6) {
+-        fprintf(stderr, "usage: %s <disk-image> <local-file> <dir-path> <name> [rtype]\n", argv[0]);
++    if (argc < 5 || argc > 8) {
++        fprintf(stderr, "usage: %s <disk-image> <local-file> <dir-path> <name> "
++                        "[rtype [rsize [rattrib]]]\n", argv[0]);
+         fprintf(stderr, "  dir-path is dot-separated, no brackets (empty string for root)\n");
+-        fprintf(stderr, "  rtype: 5=FAB$C_STMLF (default, text), 1=FAB$C_FIX (binary)\n");
++        fprintf(stderr, "  rtype: 5=FAB$C_STMLF (default, text), 1=FAB$C_FIX (fixed-length\n"
++                        "         records, e.g. binary), 0=UDF, 4=STM, 6=STMCR\n");
++        fprintf(stderr, "  rsize: record size in bytes (default 512); for FIX the file must\n"
++                        "         be a whole number of records - e.g. 1 8192 for a PCSI kit\n");
++        fprintf(stderr, "  rattrib: RMS record attributes (default 0; 2=CR carriage control)\n");
+         return 1;
+     }
+-    rtype = (argc == 6) ? (uint8_t) atoi(argv[5]) : 5;
++    for (i = 5; i < argc; i++) {
++        char *stop;
++        values[i - 5] = strtoul(argv[i], &stop, 10);
++        if (argv[i][0] == '\0' || argv[i][0] == '-' || *stop != '\0' ||
++            values[i - 5] > (i == 6 ? 65535ul : 255ul)) {
++            fprintf(stderr, "%s: not a valid %s\n", argv[i],
++                    (i == 5) ? "rtype" : (i == 6) ? "rsize" : "rattrib");
++            return 1;
++        }
++    }
++    attrs.rtype = (uint8_t) values[0];
++    attrs.rsize = (uint16_t) values[1];
++    attrs.maxrec = (uint16_t) values[1]; /* MRS = record size, as VMS sets it */
++    attrs.rattrib = (uint8_t) values[2];
+ 
+     if (!read_whole_file(argv[2], &buf, &content_len)) {
+         return 1;
+     }
++    /* Checked before touching the volume. */
++    why = ods2_check_record_attrs(&attrs, content_len);
++    if (why != NULL) {
++        fprintf(stderr, "%s: %s\n", argv[2], why);
++        free(buf);
++        return 1;
++    }
+ 
+     r = ods2_mount_write(argv[1], &vol);
+     if (!r.ok) {
+@@ -134,7 +167,7 @@ int main(int argc, char **argv)
+         return 1;
+     }
+ 
+-    r = ods2_create_file(&vol, dir_header, argv[4], buf, content_len, rtype, &new_fid);
++    r = ods2_create_file_attrs(&vol, dir_header, argv[4], buf, content_len, &attrs, &new_fid);
+     if (!r.ok) {
+         fprintf(stderr, "could not create file: %s\n", r.problem);
+         free(buf);
+-- 
+2.43.0

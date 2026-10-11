@@ -1326,9 +1326,85 @@ static ods2_result_t write_extents(ods2_volume_t *vol, const ods2_extent_t *exte
     return ok();
 }
 
+static ods2_result_t create_file(ods2_volume_t *vol, const uint8_t *parent_header,
+                                 const char *name, const uint8_t *content, size_t content_len,
+                                 const ods2_record_attrs_t *attrs, ods2_fid_t *new_fid_out);
+
+const char *ods2_check_record_attrs(const ods2_record_attrs_t *attrs, size_t content_len)
+{
+    unsigned cc = attrs->rattrib & (ODS2_RAT_FTN | ODS2_RAT_CR | ODS2_RAT_PRN);
+
+    switch (attrs->rtype) {
+    case ODS2_RFM_FIX:
+        if (attrs->rsize == 0) {
+            return "a fixed-length record format needs a record size";
+        }
+        if (attrs->rsize > 32766) {
+            return "fixed record size is too large (at most 32766 bytes)";
+        }
+        if (attrs->rsize % 2 != 0) {
+            return "odd fixed record sizes are not supported (RMS pads each such "
+                   "record to an even length on disk)";
+        }
+        if (attrs->maxrec != attrs->rsize) {
+            return "for fixed-length records the maximum record size (MRS) must "
+                   "equal the record size";
+        }
+        if (content_len % attrs->rsize != 0) {
+            return "content length is not a whole number of fixed-length records";
+        }
+        break;
+    case ODS2_RFM_UDF:
+    case ODS2_RFM_STM:
+    case ODS2_RFM_STMLF:
+    case ODS2_RFM_STMCR:
+        if (attrs->rsize > 32767 || attrs->maxrec > 32767) {
+            return "record size is too large (at most 32767 bytes)";
+        }
+        break;
+    case ODS2_RFM_VAR:
+    case ODS2_RFM_VFC:
+        return "variable-length record formats (VAR, VFC) can't be imported: on "
+               "disk each record starts with a byte count the host file doesn't have";
+    default:
+        return "unknown record format";
+    }
+    if (attrs->rattrib & ~0x0fu) {
+        return "unknown record attribute bits";
+    }
+    if (cc != 0 && (cc & (cc - 1)) != 0) {
+        return "only one carriage control (FTN, CR or PRN) can be given";
+    }
+    return NULL;
+}
+
+ods2_result_t ods2_create_file_attrs(ods2_volume_t *vol, const uint8_t *parent_header,
+                                      const char *name, const uint8_t *content,
+                                      size_t content_len, const ods2_record_attrs_t *attrs,
+                                      ods2_fid_t *new_fid_out)
+{
+    const char *why = ods2_check_record_attrs(attrs, content_len);
+    if (why != NULL) {
+        return fail(why);
+    }
+    return create_file(vol, parent_header, name, content, content_len, attrs, new_fid_out);
+}
+
 ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,
                                 const char *name, const uint8_t *content, size_t content_len,
                                 uint8_t rtype, ods2_fid_t *new_fid_out)
+{
+    ods2_record_attrs_t attrs;
+    attrs.rtype = rtype;
+    attrs.rattrib = 0;
+    attrs.rsize = 512;
+    attrs.maxrec = 512;
+    return create_file(vol, parent_header, name, content, content_len, &attrs, new_fid_out);
+}
+
+static ods2_result_t create_file(ods2_volume_t *vol, const uint8_t *parent_header,
+                                 const char *name, const uint8_t *content, size_t content_len,
+                                 const ods2_record_attrs_t *attrs, ods2_fid_t *new_fid_out)
 {
     const ods2_head_core_t *parent_core = (const ods2_head_core_t *) parent_header;
     ods2_fid_t existing;
@@ -1462,10 +1538,10 @@ ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,
     if (!r.ok) goto undo;
 
     memset(&spec, 0, sizeof(spec));
-    spec.rtype = rtype;
-    spec.rattrib = 0;
-    spec.rsize = 512;
-    spec.maxrec = 512;
+    spec.rtype = attrs->rtype;
+    spec.rattrib = attrs->rattrib;
+    spec.rsize = attrs->rsize;
+    spec.maxrec = attrs->maxrec;
     /* Records the whole file's size in every header, as the record
        attributes are copied into extension headers too. */
     spec.hiblk = (uint32_t) total_allocated;

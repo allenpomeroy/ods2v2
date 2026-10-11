@@ -25,10 +25,15 @@
 /* ods2_put.c - writes a local file's content onto a real ODS-2 disk
  * image (an IMPORT/COPY-in equivalent).
  *
- * Usage: ods2_put <disk-image> <local-file> <dir-path> <name> [rtype]
+ * Usage: ods2_put <disk-image> <local-file> <dir-path> <name> [rtype [rsize [rattrib]]]
  *   ods2_put transfer.dsk readme.txt DECUS.NETLIB020 AAAREADME.DOC
+ *   ods2_put transfer.dsk kit.pcsi '' KIT.PCSI 1 8192
  *   rtype defaults to 5 (FAB$C_STMLF, stream-LF - typical for text);
- *   pass 1 (FAB$C_FIX) for binary content.
+ *   1 (FAB$C_FIX) is fixed-length records of rsize bytes (default
+ *   512), and the file must be a whole number of them; 0 (UDF), 4
+ *   (STM) and 6 (STMCR) are the other formats. rattrib is the RMS
+ *   record attributes byte (default 0; 2 = CR carriage control).
+ *   See ods2_check_record_attrs() for what is accepted.
  *
  * Any size of file the volume has room for - see ods2_create_file().
  */
@@ -97,17 +102,45 @@ int main(int argc, char **argv)
     uint8_t dir_header[512];
     uint8_t *buf;
     size_t content_len;
-    uint8_t rtype;
+    ods2_record_attrs_t attrs;
+    unsigned long values[3] = { ODS2_RFM_STMLF, 512, 0 }; /* rtype, rsize, rattrib */
+    const char *why;
+    int i;
 
-    if (argc < 5 || argc > 6) {
-        fprintf(stderr, "usage: %s <disk-image> <local-file> <dir-path> <name> [rtype]\n", argv[0]);
+    if (argc < 5 || argc > 8) {
+        fprintf(stderr, "usage: %s <disk-image> <local-file> <dir-path> <name> "
+                        "[rtype [rsize [rattrib]]]\n", argv[0]);
         fprintf(stderr, "  dir-path is dot-separated, no brackets (empty string for root)\n");
-        fprintf(stderr, "  rtype: 5=FAB$C_STMLF (default, text), 1=FAB$C_FIX (binary)\n");
+        fprintf(stderr, "  rtype: 5=FAB$C_STMLF (default, text), 1=FAB$C_FIX (fixed-length\n"
+                        "         records, e.g. binary), 0=UDF, 4=STM, 6=STMCR\n");
+        fprintf(stderr, "  rsize: record size in bytes (default 512); for FIX the file must\n"
+                        "         be a whole number of records - e.g. 1 8192 for a PCSI kit\n");
+        fprintf(stderr, "  rattrib: RMS record attributes (default 0; 2=CR carriage control)\n");
         return 1;
     }
-    rtype = (argc == 6) ? (uint8_t) atoi(argv[5]) : 5;
+    for (i = 5; i < argc; i++) {
+        char *stop;
+        values[i - 5] = strtoul(argv[i], &stop, 10);
+        if (argv[i][0] == '\0' || argv[i][0] == '-' || *stop != '\0' ||
+            values[i - 5] > (i == 6 ? 65535ul : 255ul)) {
+            fprintf(stderr, "%s: not a valid %s\n", argv[i],
+                    (i == 5) ? "rtype" : (i == 6) ? "rsize" : "rattrib");
+            return 1;
+        }
+    }
+    attrs.rtype = (uint8_t) values[0];
+    attrs.rsize = (uint16_t) values[1];
+    attrs.maxrec = (uint16_t) values[1]; /* MRS = record size, as VMS sets it */
+    attrs.rattrib = (uint8_t) values[2];
 
     if (!read_whole_file(argv[2], &buf, &content_len)) {
+        return 1;
+    }
+    /* Checked before touching the volume. */
+    why = ods2_check_record_attrs(&attrs, content_len);
+    if (why != NULL) {
+        fprintf(stderr, "%s: %s\n", argv[2], why);
+        free(buf);
         return 1;
     }
 
@@ -134,7 +167,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    r = ods2_create_file(&vol, dir_header, argv[4], buf, content_len, rtype, &new_fid);
+    r = ods2_create_file_attrs(&vol, dir_header, argv[4], buf, content_len, &attrs, &new_fid);
     if (!r.ok) {
         fprintf(stderr, "could not create file: %s\n", r.problem);
         free(buf);

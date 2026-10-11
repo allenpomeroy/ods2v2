@@ -79,6 +79,7 @@ implements basic command recall to ease repetitive command sequences.
 | `DIR [*...] [wildcard]` | `DIR [*...]*.COM` — wildcards in directory names (see below) |
 | `CREATE/DIRECTORY path` | `CREATE/DIRECTORY [DECUS.NETLIB020]` |
 | `COPY <local-file> <path>` | `COPY readme.txt [DECUS]README.TXT` |
+| `COPY/ATTRIBUTES=(...) <local-file> <path>` | `COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) kit.pcsi [KITS]KIT.PCSI` |
 | `TYPE path` | `TYPE [DECUS]README.TXT;2` |
 | `DELETE path` | `DELETE [DECUS]OLDFILE.TXT;1` |
 | `SET DEFAULT path` | `SET DEFAULT [DECUS.NETLIB020]` |
@@ -134,6 +135,34 @@ version (`DIR [DECUS]*.*;` shows just the newest of each). `DELETE`
 removes one version - the one given, or the highest if none is - and
 `DELETE NAME;*` removes them all. `COPY` onto the disk always creates
 version 1 and refuses a name that already exists.
+
+### Record formats
+
+`COPY` makes a Stream_LF file, which suits text. Some files must have a
+particular RMS record format - OpenVMS PCSI kit files, for one, are
+sequential files of fixed 8192-byte records, and `PRODUCT` won't treat
+a Stream_LF copy of the same bytes as a kit. Give the attributes with
+`/ATTRIBUTES` on `COPY`, in the syntax of VMS's `SET FILE/ATTRIBUTES`:
+
+```
+COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) dec-axpvms-foo-v0100--1.pcsi [KITS]DEC-AXPVMS-FOO-V0100--1.PCSI
+COPY/ATTRIBUTES=(RFM:FIX) backup.bck [SAVE]BACKUP.BCK          ! fixed 512-byte records
+COPY/ATTRIBUTES=(RFM:STMLF,RAT:CR) notes.txt [DOC]NOTES.TXT
+```
+
+- `RFM:` record format - `FIX`, `STMLF`, `STM`, `STMCR` or `UDF`.
+  `VAR` and `VFC` can't be imported: on disk each of their records
+  starts with a byte count a host file doesn't have.
+- `MRS:` the record size (for `FIX`; `LRL:` means the same there).
+  `RFM:FIX` with no size is 512-byte records. The file must be a whole
+  number of records, and the size even (2-32766).
+- `RAT:` record attributes - `NONE`, `CR`, `FTN`, `PRN`, `BLK`, `NOBLK`;
+  repeat `RAT:` for more than one.
+
+The qualifier goes on `COPY` itself, not after the file names (a host
+path has `/` in it too). `ods2_put` takes the same as numbers:
+`ods2_put disk kit.pcsi KITS KIT.PCSI 1 8192` (record format, record
+size, record attributes).
 
 ### File dates and time zones
 
@@ -218,7 +247,7 @@ third_party/linenoise/  BSD licensed - interactive-mode command history
 
 ## Testing
 
-`make test` builds and runs 19 test suites and four scripts that check
+`make test` builds and runs 20 test suites and five scripts that check
 the `ods2` command line, with `-fsanitize=address,undefined` on by default for development
 builds (`make release` builds without them once things are stable).
 Most tests run entirely offline against a synthetic disk

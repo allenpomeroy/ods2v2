@@ -52,7 +52,12 @@
  *                                 (e.g. [*], [*.SRC], [...SALES],
  *                                 [DECUS...SRC]) - as VMS DIRECTORY
  *   CREATE/DIRECTORY path         create a directory
- *   COPY <local-file> <path>      write a local file onto the disk
+ *   COPY <local-file> <path>      write a local file onto the disk,
+ *                                 as a Stream_LF file
+ *   COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) <local-file> <path>
+ *                                 ... with chosen RMS record attributes,
+ *                                 in SET FILE/ATTRIBUTES syntax (see
+ *                                 parse_copy_qualifiers())
  *   TYPE path                     print a file's content
  *   DELETE path                   delete a file (one version) or an
  *                                 empty directory
@@ -114,7 +119,6 @@
    one "current session" for it to belong to. */
 static char g_default_dir[ODS2_PATH_MAX] = "";
 
-/* Case-insensitive prefix/equality check. */
 /* Set by report_error(): some command since the last reset failed.
    main() turns it into the exit status of a single-shot command or an
    @script, so scripts and automation can tell success from failure
@@ -133,6 +137,7 @@ static void report_error(const char *fmt, ...)
     g_command_failed = true;
 }
 
+/* Case-insensitive equality check. */
 static bool matches(const char *token, const char *name)
 {
     size_t i;
@@ -594,7 +599,166 @@ static bool read_whole_file(const char *path, uint8_t **buf_out, size_t *len_out
     return true;
 }
 
-static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_parsed_path_t *p)
+/* Case-insensitive: is `word` (length `len`) `name`, or an
+   abbreviation of it at least `min` characters long, as VMS allows? */
+static bool keyword(const char *word, size_t len, const char *name, size_t min)
+{
+    size_t i;
+    if (len < min || len > strlen(name)) return false;
+    for (i = 0; i < len; i++) {
+        if (toupper((unsigned char) word[i]) != toupper((unsigned char) name[i])) return false;
+    }
+    return true;
+}
+
+/* Parses COPY's qualifiers - everything after "COPY" in the command
+ * word - into the record attributes of the new file. The one qualifier
+ * is /ATTRIBUTES, in the syntax of VMS's SET FILE/ATTRIBUTES:
+ *
+ *   COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) kit.pcsi [000000]KIT.PCSI
+ *
+ *   RFM:fmt   record format - FIX, STMLF, STM, STMCR or UDF
+ *   MRS:n     maximum record size; for FIX, the record size
+ *   LRL:n     longest record length (for FIX, the same as MRS)
+ *   RAT:x     record attributes - NONE, CR, FTN, PRN, BLK, NOBLK;
+ *             repeat RAT for more than one (RAT:CR,RAT:BLK)
+ *
+ * With no qualifier the file is Stream_LF, as always. A fixed format
+ * with no size given is 512-byte records. Returns false after
+ * reporting the problem. */
+static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a)
+{
+    bool mrs_given = false, lrl_given = false;
+    const char *q = quals;
+
+    while (*q == '/') {
+        const char *name = ++q;
+        const char *value, *end;
+        size_t name_len;
+
+        while (*q && *q != '=' && *q != '/') q++;
+        name_len = (size_t) (q - name);
+        if (!keyword(name, name_len, "ATTRIBUTES", 4)) {
+            report_error("%%ODS2-E-IVQUAL, unrecognized qualifier /%.*s - COPY takes "
+                         "/ATTRIBUTES=(RFM:fmt,MRS:size,RAT:attr)\n", (int) name_len, name);
+            return false;
+        }
+        if (*q != '=') {
+            report_error("%%ODS2-E-VALREQ, /ATTRIBUTES needs a value, e.g. "
+                         "/ATTRIBUTES=(RFM:FIX,MRS:8192)\n");
+            return false;
+        }
+        value = ++q;
+        if (*value == '(') {
+            end = strchr(value, ')');
+            if (end == NULL) {
+                report_error("%%ODS2-E-BADVALUE, /ATTRIBUTES: missing ')'\n");
+                return false;
+            }
+            value++;
+            q = end + 1;
+        } else {
+            end = value;
+            while (*end && *end != '/') end++;
+            q = end;
+        }
+
+        /* comma-separated KEY:VALUE items between value and end */
+        while (value < end) {
+            const char *item = value, *colon, *item_end = value;
+            size_t key_len, val_len;
+            while (item_end < end && *item_end != ',') item_end++;
+            value = (item_end < end) ? item_end + 1 : end;
+            colon = memchr(item, ':', (size_t) (item_end - item));
+            if (colon == NULL) colon = memchr(item, '=', (size_t) (item_end - item));
+            if (colon == NULL) {
+                report_error("%%ODS2-E-BADVALUE, /ATTRIBUTES: \"%.*s\" is not KEY:VALUE\n",
+                             (int) (item_end - item), item);
+                return false;
+            }
+            key_len = (size_t) (colon - item);
+            val_len = (size_t) (item_end - colon - 1);
+
+            if (keyword(item, key_len, "RFM", 3)) {
+                const char *v = colon + 1;
+                if (keyword(v, val_len, "FIXED", 3)) a->rtype = ODS2_RFM_FIX;
+                else if (keyword(v, val_len, "STMLF", 5) || keyword(v, val_len, "STREAM_LF", 8))
+                    a->rtype = ODS2_RFM_STMLF;
+                else if (keyword(v, val_len, "STMCR", 5) || keyword(v, val_len, "STREAM_CR", 8))
+                    a->rtype = ODS2_RFM_STMCR;
+                else if (keyword(v, val_len, "STM", 3) || keyword(v, val_len, "STREAM", 6))
+                    a->rtype = ODS2_RFM_STM;
+                else if (keyword(v, val_len, "UDF", 3) || keyword(v, val_len, "UNDEFINED", 3))
+                    a->rtype = ODS2_RFM_UDF;
+                else if (keyword(v, val_len, "VARIABLE", 3)) a->rtype = ODS2_RFM_VAR;
+                else if (keyword(v, val_len, "VFC", 3)) a->rtype = ODS2_RFM_VFC;
+                else {
+                    report_error("%%ODS2-E-BADVALUE, RFM:%.*s - record format must be FIX, "
+                                 "STMLF, STM, STMCR or UDF\n", (int) val_len, v);
+                    return false;
+                }
+            } else if (keyword(item, key_len, "MRS", 3) || keyword(item, key_len, "LRL", 3)) {
+                char digits[16];
+                char *stop;
+                unsigned long n;
+                if (val_len == 0 || val_len >= sizeof(digits)) {
+                    n = 0;
+                    stop = digits;
+                    digits[0] = 'x';
+                } else {
+                    memcpy(digits, colon + 1, val_len);
+                    digits[val_len] = '\0';
+                    n = strtoul(digits, &stop, 10);
+                }
+                if (*stop != '\0' || digits[0] == '-' || n > 65535) {
+                    report_error("%%ODS2-E-BADVALUE, %.*s needs a record size in bytes\n",
+                                 (int) (item_end - item), item);
+                    return false;
+                }
+                if (toupper((unsigned char) item[0]) == 'M') {
+                    a->maxrec = (uint16_t) n;
+                    mrs_given = true;
+                } else {
+                    a->rsize = (uint16_t) n;
+                    lrl_given = true;
+                }
+            } else if (keyword(item, key_len, "RAT", 3)) {
+                const char *v = colon + 1;
+                if (keyword(v, val_len, "NONE", 4)) a->rattrib &= (uint8_t) ~0x07u;
+                else if (keyword(v, val_len, "CR", 2)) a->rattrib |= ODS2_RAT_CR;
+                else if (keyword(v, val_len, "FTN", 3)) a->rattrib |= ODS2_RAT_FTN;
+                else if (keyword(v, val_len, "PRN", 3)) a->rattrib |= ODS2_RAT_PRN;
+                else if (keyword(v, val_len, "BLK", 3)) a->rattrib |= ODS2_RAT_BLK;
+                else if (keyword(v, val_len, "NOBLK", 5)) a->rattrib &= (uint8_t) ~ODS2_RAT_BLK;
+                else {
+                    report_error("%%ODS2-E-BADVALUE, RAT:%.*s - record attributes are NONE, "
+                                 "CR, FTN, PRN, BLK or NOBLK\n", (int) val_len, v);
+                    return false;
+                }
+            } else {
+                report_error("%%ODS2-E-BADVALUE, /ATTRIBUTES: unknown keyword \"%.*s\" - "
+                             "use RFM, MRS, LRL or RAT\n", (int) key_len, item);
+                return false;
+            }
+        }
+    }
+    if (*q != '\0') {
+        report_error("%%ODS2-E-IVQUAL, could not parse qualifiers \"%s\"\n", quals);
+        return false;
+    }
+
+    /* A fixed record's size is both RSIZE and MRS: either one sets
+       both, as VMS keeps them equal; neither means 512. */
+    if (a->rtype == ODS2_RFM_FIX) {
+        if (mrs_given && !lrl_given) a->rsize = a->maxrec;
+        else if (lrl_given && !mrs_given) a->maxrec = a->rsize;
+        else if (!mrs_given && !lrl_given) a->rsize = a->maxrec = 512;
+    }
+    return true;
+}
+
+static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_parsed_path_t *p,
+                     const ods2_record_attrs_t *attrs)
 {
     uint8_t dir_header[512];
     ods2_fid_t dir_fid, new_fid;
@@ -602,7 +766,6 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
     size_t content_len;
     ods2_result_t r;
     const char *name;
-    uint8_t rtype = 5; /* FAB$C_STMLF - reasonable default for COPY */
 
     if (p->filename[0] == '\0') {
         report_error("%%ODS2-E-BADPATH, no destination filename given\n");
@@ -636,7 +799,7 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
         free(buf);
         return;
     }
-    r = ods2_create_file(vol, dir_header, name, buf, content_len, rtype, &new_fid);
+    r = ods2_create_file_attrs(vol, dir_header, name, buf, content_len, attrs, &new_fid);
     if (!r.ok) {
         report_error("%%ODS2-E-COPYERR, %s\n", r.problem);
         free(buf);
@@ -796,7 +959,11 @@ static void print_help(void)
            "  DIR [*...] [wildcard]      '*' '%%' in directory names, '...' anywhere\n"
            "                             ([*], [*.SRC], [...SALES], [DECUS...SRC])\n"
            "  CREATE/DIRECTORY path      create a directory\n"
-           "  COPY <local-file> <path>   write a local file onto the disk\n"
+           "  COPY <local-file> <path>   write a local file onto the disk (Stream_LF)\n"
+           "  COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) <local-file> <path>\n"
+           "                             ... with chosen record attributes: RFM: FIX,\n"
+           "                             STMLF, STM, STMCR or UDF; MRS: record size;\n"
+           "                             RAT: NONE, CR, FTN, PRN, BLK (one per RAT:)\n"
            "  TYPE path                  print a file's content\n"
            "  DELETE path                delete a file (one version) or empty directory\n"
            "  SET DEFAULT path           set the current default directory\n"
@@ -837,8 +1004,20 @@ static int tokenize(char *line, char *tokens[MAX_TOKENS])
 static bool execute_line(ods2_volume_t *vol, char *line)
 {
     char *tokens[MAX_TOKENS];
+    char verb[32];          /* the command word without qualifiers */
+    const char *quals;      /* its qualifiers ("/ATTRIBUTES=..."), or NULL */
+    size_t verb_len;
     int n = tokenize(line, tokens);
     if (n == 0) return true; /* blank line */
+
+    /* COPY takes qualifiers on the command word itself
+       (COPY/ATTRIBUTES=...) - not on its arguments, since a host path
+       contains '/' too. CREATE/DIRECTORY is matched whole, below. */
+    quals = strchr(tokens[0], '/');
+    verb_len = quals ? (size_t) (quals - tokens[0]) : strlen(tokens[0]);
+    if (verb_len >= sizeof(verb)) verb_len = 0; /* too long to be any command */
+    memcpy(verb, tokens[0], verb_len);
+    verb[verb_len] = '\0';
 
     if (matches(tokens[0], "EXIT") || matches(tokens[0], "QUIT")) {
         return false;
@@ -935,8 +1114,17 @@ static bool execute_line(ods2_volume_t *vol, char *line)
         cmd_create_directory(vol, &p);
         return true;
     }
-    if (matches(tokens[0], "COPY") || matches(tokens[0], "PUT") || matches(tokens[0], "IMPORT")) {
+    if (matches(verb, "COPY") || matches(verb, "PUT") || matches(verb, "IMPORT")) {
         ods2_parsed_path_t p;
+        ods2_record_attrs_t attrs;
+        /* COPY's default: Stream_LF, as before qualifiers existed. */
+        attrs.rtype = ODS2_RFM_STMLF;
+        attrs.rattrib = 0;
+        attrs.rsize = 512;
+        attrs.maxrec = 512;
+        if (quals != NULL && !parse_copy_qualifiers(quals, &attrs)) {
+            return true;
+        }
         if (n < 3) {
             report_error("%%ODS2-E-NOPARM, usage: COPY <local-file> <path>\n");
             return true;
@@ -946,7 +1134,7 @@ static bool execute_line(ods2_volume_t *vol, char *line)
             return true;
         }
         if (refuse_wild_dir(&p, "COPY", tokens[2])) return true;
-        cmd_copy(vol, tokens[1], &p);
+        cmd_copy(vol, tokens[1], &p, &attrs);
         return true;
     }
     if (matches(tokens[0], "TYPE") || matches(tokens[0], "CAT")) {

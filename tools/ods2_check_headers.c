@@ -26,6 +26,11 @@
  * disk image and reports, for each, whether FAT$L_HIBLK matches the
  * sum of that header's own retrieval pointer extents. 
  *
+ * It also flags a FH2$L_HIGHWATER below the end-of-file: on a volume
+ * with high-water marking, VMS reads every block at or past the mark
+ * as zeros, so content there is invisible to VMS (a directory shows
+ * BADIRECTORY / BAD_NAMEORDER "[empty]").
+ *
  * Usage: ods2_check_headers <disk-image> [count]
  *   count defaults to 16 (the range locatable directly from the home
  *   block alone, per spec 5.1.7).
@@ -42,7 +47,7 @@ int main(int argc, char **argv)
     ods2_result_t r;
     unsigned count = 16;
     unsigned n;
-    int mismatches = 0, checked = 0;
+    int mismatches = 0, checked = 0, below_hw = 0;
 
     if (argc < 2) {
         fprintf(stderr, "usage: %s <disk-image> [count]\n", argv[0]);
@@ -108,11 +113,23 @@ int main(int argc, char **argv)
                    vr.ok ? "checksum OK" : vr.problem);
 
             if (!extension && extent_sum != hiblk_fixed) mismatches++;
+
+            /* Last block holding data: EFBLK-1 when FFBYTE is 0. */
+            if (!extension && core->highwater != 0 && efblk_fixed != 0) {
+                uint32_t last = (core->recattr.ffbyte == 0) ? efblk_fixed - 1 : efblk_fixed;
+                if (last >= core->highwater) {
+                    printf("     ^ HIGHWATER %u is below the end-of-file: VMS reads "
+                           "VBN %u-%u as zeros\n", (unsigned) core->highwater,
+                           (unsigned) core->highwater, (unsigned) last);
+                    below_hw++;
+                }
+            }
         }
     }
 
-    printf("\n%d header(s) checked, %d hiblk/extent-sum mismatch(es)\n",
-           checked, mismatches);
+    printf("\n%d header(s) checked, %d hiblk/extent-sum mismatch(es), "
+           "%d high-water mark(s) below end-of-file\n",
+           checked, mismatches, below_hw);
 
     ods2_dismount(&vol);
     return 0;

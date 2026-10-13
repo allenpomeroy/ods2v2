@@ -76,6 +76,9 @@ static unsigned check_directory(ods2_volume_t *vol, unsigned dir_num, int expect
     assert(core->filechar & 0x0080u);                /* FH2$M_CONTIG */
     used = (unsigned) ((ods2_file_content_length(h) + 511) / 512);
     assert(used >= 1 && used <= extents[0].block_count);
+    /* VMS reads blocks at or past FH2$L_HIGHWATER as zeros: every
+       block inside the EOF must be below it (0 = not marked). */
+    assert(core->highwater == 0 || used < core->highwater);
     for (v = 1; v <= used; v++) {
         ods2_dir_entry_t e[ODS2_DIR_MAX_ENTRIES_PER_BLOCK];
         int n, i;
@@ -181,6 +184,48 @@ int main(void)
         assert(used == before - 1);
         printf("PASS: deleting all %d entries of block 2 removed the block "
                "(%u -> %u in use), order and EOF intact\n", n, before, used);
+    }
+
+    /* The root as INITIALIZE made it: HIGHWATER 2, only VBN 1 ever
+       written. Six long names (the ones from the report) split it into
+       two blocks; VBN 2 must be below the high-water mark or VMS reads
+       it as zeros (BAD_NAMEORDER "[empty]", BADIRECTORY). More names
+       then outgrow its three blocks, moving it. */
+    {
+        static const char *kits[] = {
+            "DEC-AXPVMS-DNVOSIECO03-V0703-2-4.PCSI",
+            "DEC-AXPVMS-DNVOSIMUP01-V0703-2-4.PCSI",
+            "DEC-AXPVMS-TCPIP-V0504-15ECO7-1.PCSI",
+            "DEC-AXPVMS-VMS732_PCSI-V0600--4.PCSI$COMPRESSED",
+            "DEC-AXPVMS-VMS732_TZ-V0300--4.PCSI$COMPRESSED",
+            "DEC-AXPVMS-VMS732_UPDATE-V2200--4.PCSI$COMPRESSED",
+        };
+        uint8_t h[512];
+        const ods2_head_core_t *core = (const ods2_head_core_t *) h;
+        int entries, k;
+        assert(ods2_read_header(&vol, 4, h).ok);
+        assert(core->highwater == 2);       /* as INITIALIZE left it */
+        assert(ods2_count_directory_entries(&vol, h, &entries).ok);
+        for (k = 0; k < 6; k++) {
+            create_in(&vol, 4, kits[k]);
+            entries++;
+            used = check_directory(&vol, 4, entries, NULL);
+        }
+        assert(used == 2);
+        assert(ods2_read_header(&vol, 4, h).ok);
+        printf("PASS: six long names split INITIALIZE's root into %u blocks; "
+               "HIGHWATER moved 2 -> %u with the EOF\n", used,
+               (unsigned) core->highwater);
+        for (k = 0; k < 40; k++) {
+            snprintf(name, sizeof name, "DEC-AXPVMS-FILLER%02d-V0100--1.PCSI$COMPRESSED", k);
+            create_in(&vol, 4, name);
+            entries++;
+            used = check_directory(&vol, 4, entries, NULL);
+        }
+        assert(used > 3);
+        assert(ods2_read_header(&vol, 4, h).ok);
+        printf("PASS: root grown to %u blocks, moved past its 3, HIGHWATER %u "
+               "covers them all\n", used, (unsigned) core->highwater);
     }
 
     /* MAKEFILE is stored as MAKEFILE. and found either way. */

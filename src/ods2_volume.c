@@ -1640,6 +1640,14 @@ undo:
  *
  * The end-of-file becomes EFBLK used+1 / FFBYTE 0, as VMS writes it,
  * and the directory's revision count and date go up. */
+/* True when VMS will read back what is written at `vbn`: the file is
+   not high-water marked, or `vbn` is below its high-water mark. */
+static bool below_highwater(const uint8_t *header, unsigned vbn)
+{
+    const ods2_head_core_t *core = (const ods2_head_core_t *) header;
+    return core->highwater == 0 || vbn < core->highwater;
+}
+
 static ods2_result_t store_directory(ods2_volume_t *vol, unsigned dir_file_number,
                                      uint8_t *dir_header, const uint8_t *blocks,
                                      unsigned used, unsigned old_used, unsigned first_changed)
@@ -1706,6 +1714,17 @@ static ods2_result_t store_directory(ods2_volume_t *vol, unsigned dir_file_numbe
 
     core->recattr.efblk = ods2_word_swap32(used + 1);
     core->recattr.ffbyte = 0;
+    /* FH2$L_HIGHWATER: the first VBN never written. On a volume with
+       high-water marking (the INITIALIZE default), VMS returns zeros
+       for any read at or past it, whatever is on the disk. A directory
+       INITIALIZE made carries HIGHWATER 2 (only VBN 1 written), so a
+       block added past it reads back on VMS as a zero record:
+       BAD_NAMEORDER "[empty]", BAD_DIRSIZE, BADIRECTORY. Zero means
+       the file isn't high-water marked, and stays zero. */
+    if (core->highwater != 0) {
+        uint32_t written = moved ? ods2_word_swap32(core->recattr.hiblk) : used;
+        if (core->highwater < written + 1) core->highwater = written + 1;
+    }
     {
         /* FI2$W_REVISION / FI2$Q_REVDATE; FI2$Q_CREDATE stays. */
         uint8_t *ident = dir_header + (size_t) core->idoffset * 2;
@@ -1790,8 +1809,10 @@ ods2_result_t ods2_insert_into_directory(ods2_volume_t *vol, unsigned dir_file_n
 
     t = ods2_dir_choose_block(blocks, used, name);
     if (ods2_insert_dir_entry(blocks + (size_t) t * 512, 512, name, version, fid)) {
-        if (ods2_file_content_length(dir_header) == 0) {
-            /* An end-of-file that didn't cover even block 1 */
+        if (ods2_file_content_length(dir_header) == 0 ||
+            !below_highwater(dir_header, t + 1)) {
+            /* An end-of-file that didn't cover even block 1, or a block
+               VMS would read as zeros until the high-water mark moves */
             r = store_directory(vol, dir_file_number, dir_header, blocks, used, used, t);
         } else {
             r = ods2_write_file_block(vol, dir_header, t + 1, blocks + (size_t) t * 512);
@@ -2029,6 +2050,9 @@ ods2_result_t ods2_delete_version(ods2_volume_t *vol, unsigned dir_file_number,
             if (used > 1 && ods2_dir_block_is_empty(block)) {
                 memmove(block, block + 512, (size_t) (used - v - 1) * 512);
                 r = store_directory(vol, dir_file_number, dir_header, blocks, used - 1,
+                                    used, v);
+            } else if (!below_highwater(dir_header, v + 1)) {
+                r = store_directory(vol, dir_file_number, dir_header, blocks, used,
                                     used, v);
             } else {
                 r = ods2_write_file_block(vol, dir_header, v + 1, block);

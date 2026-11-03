@@ -80,10 +80,13 @@ implements basic command recall to ease repetitive command sequences.
 | `CREATE/DIRECTORY path` | `CREATE/DIRECTORY [DECUS.NETLIB020]` |
 | `COPY <local-file> <path>` | `COPY readme.txt [DECUS]README.TXT` |
 | `COPY/ATTRIBUTES=(...) <local-file> <path>` | `COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) kit.pcsi [KITS]KIT.PCSI` |
+| `COPY/CONVERT <local-file> <path>` | `COPY/CONVERT notes.txt [DOC]NOTES.TXT` — text as VAR records |
 | `TYPE path` | `TYPE [DECUS]README.TXT;2` |
 | `DELETE path` | `DELETE [DECUS]OLDFILE.TXT;1` |
 | `SET DEFAULT path` | `SET DEFAULT [DECUS.NETLIB020]` |
 | `SHOW DEFAULT` | |
+| `SET VOLUME/LABEL=name` | `SET VOLUME/LABEL=ITANKITS` — relabel the volume |
+| `SHOW VOLUME` | label, owner, cluster size, maximum files, free blocks |
 | `HELP` | |
 | `EXIT` / `QUIT` | |
 
@@ -150,19 +153,63 @@ COPY/ATTRIBUTES=(RFM:FIX) backup.bck [SAVE]BACKUP.BCK          ! fixed 512-byte 
 COPY/ATTRIBUTES=(RFM:STMLF,RAT:CR) notes.txt [DOC]NOTES.TXT
 ```
 
-- `RFM:` record format - `FIX`, `STMLF`, `STM`, `STMCR` or `UDF`.
-  `VAR` and `VFC` can't be imported: on disk each of their records
-  starts with a byte count a host file doesn't have.
+- `RFM:` record format - `FIX`, `STMLF`, `STM`, `STMCR` or `UDF`, or
+  `VAR` with `/CONVERT` (below). On disk each `VAR` or `VFC` record
+  starts with a byte count a host file doesn't have, so `VAR` needs the
+  conversion; `VFC` can't be imported.
 - `MRS:` the record size (for `FIX`; `LRL:` means the same there).
   `RFM:FIX` with no size is 512-byte records. The file must be a whole
   number of records, and the size even (2-32766).
 - `RAT:` record attributes - `NONE`, `CR`, `FTN`, `PRN`, `BLK`, `NOBLK`;
   repeat `RAT:` for more than one.
 
+VMS's native text format is variable-length records with carriage-return
+carriage control (`RFM:VAR`, `RAT:CR`) - what VMS FTP writes in ASCII
+mode, and what some older utilities and kit procedures expect.
+`/CONVERT` makes that from a host text file, one record per line:
+
+```
+COPY/CONVERT notes.txt [DOC]NOTES.TXT
+COPY/ATTRIBUTES=(RFM:VAR,RAT:CR)/CONVERT notes.txt [DOC]NOTES.TXT   ! the same
+```
+
+- Lines end at LF; a CR just before the LF is dropped, so CRLF text
+  converts the same. A last line with no LF is still a record.
+- The longest record length (`LRL`) is set from the file; `MRS` is 0
+  (no limit) unless given. A line over 32,767 bytes is refused.
+- `RAT:` defaults to `CR`; `RAT:NONE`, `FTN` or `PRN` can be given
+  instead. `RAT:BLK` isn't supported (the records run on across
+  blocks, as VMS FTP writes them).
+- `TYPE` of such a file shows the records as they are on disk, byte
+  counts included.
+
 The qualifier goes on `COPY` itself, not after the file names (a host
 path has `/` in it too). `ods2_put` takes the same as numbers:
 `ods2_put disk kit.pcsi KITS KIT.PCSI 1 8192` (record format, record
 size, record attributes).
+
+### Volume labels
+
+A copy of a blank volume carries the blank's label, and two volumes
+with the same label can't both be mounted `/SYSTEM` on one node - they
+clash on the `DISK$label` logical name. Relabel a copy on the host, as
+VMS's `SET VOLUME/LABEL` would, while VMS doesn't have it mounted:
+
+```
+./ods2 kits.dsk SET VOLUME/LABEL=ITANKITS
+./ods2 kits.dsk SHOW VOLUME
+```
+
+- The label is 1-12 characters - letters, digits, `$`, `_` and `-` -
+  and is uppercased.
+- Every copy of the home block is rewritten: the home block and its
+  cluster fillers, and the backup home block's cluster (8 blocks on
+  the starter volume, cluster factor 3). Each keeps its own position
+  fields, with both checksums recomputed; the primary is written last.
+- Nothing is written unless every one of those copies is first found
+  valid and consistent with the primary. A volume whose copies don't
+  agree should go through `ANALYZE/DISK` on VMS first.
+- A volume set member is refused: relabel a set on VMS.
 
 ### File dates and time zones
 
@@ -261,8 +308,11 @@ in every structural test.
   goes in as few pieces as the free space allows (one, on a volume
   with a long enough free run), described by Format 1, 2 or 3
   retrieval pointers, continuing into extension headers on fragmented
-  free space - up to 1,024 pieces. The whole file is read into memory
-  first. Directories still grow only within one header.
+  free space - up to 1,024 pieces. `COPY` and `TYPE` stream the
+  content in 1 MiB chunks, so memory use stays flat however large the
+  file. Input with no length to go by (a pipe, `/dev/stdin`) is first
+  copied to a temporary file (in `$TMPDIR`, or `/tmp`), so that needs
+  room for it. Directories still grow only within one header.
 - No INITIALIZE command (formatting a *new* volume from scratch) - see
   `samples/README.md` for why that's a deliberate choice (it's complicated)
   and how to get a real, ready-to-use volume instead.
@@ -270,11 +320,13 @@ in every structural test.
   version 1 of a new name only.
 - `TYPE` and `DELETE` don't take wildcards yet, in file names or
   directories (VMS's do); only `DIR` does.
-- INDEXF.SYS is extended as new files need it, but only into space
-  below LBN 4,194,304 (2 GB), since that's all a Format 1 retrieval
-  pointer can address. On a bigger volume whose free space starts
-  above that, creating a file fails with a clear message once the
-  headers INITIALIZE preallocated (`/HEADERS`) are used up.
+- INDEXF.SYS is extended as new files need it, anywhere on a volume
+  of any size (Format 1 retrieval pointers below LBN 4,194,304,
+  Format 2 above it), up to what its own header's map area holds -
+  a few dozen extensions of up to 256 blocks (one header each), so
+  on the order of ten thousand files beyond the headers INITIALIZE
+  preallocated (`/HEADERS`). INDEXF.SYS extension headers aren't
+  written.
 - File numbers stop at 65,535 (the FID_NMX extension isn't used).
 - A directory is limited to 256 blocks (a few thousand entries), the
   most one contiguous extent can map here.

@@ -1,0 +1,487 @@
+From 3d0d636940eab86106693abc782ead5e8c578425 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 13:03:24 -0600
+Subject: [PATCH] Extend INDEXF.SYS and directories above LBN 4,194,304 (#14)
+
+INDEXF.SYS was only ever extended with Format 1 retrieval pointers,
+which can't address an LBN past 4,194,302. On a large VMS-initialized
+volume (INITIALIZE's default /INDEX=MIDDLE puts INDEXF.SYS around LBN
+33 million on 32 GiB) creating a file failed once the /HEADERS
+INITIALIZE preallocated were used up and the free space found lay
+above that limit.
+
+The new ods2_indexf_map_extent() maps each new piece of INDEXF.SYS
+with the smallest pointer that describes it - Format 1 below the
+limit, Format 2 above - checking the map area against the pointer's
+real size, and leaving the header unchanged when it doesn't fit.
+extend_indexf() uses it and still gives the blocks back on failure.
+
+store_directory() had the same Format 1-only limit when a directory
+moves to a larger area; it now uses the smallest pointer too. The
+256-block directory cap is unchanged.
+
+ods2_indexf_large_selftest checks Format 1 below the limit, Format 2
+above it (decoding back to the same extent, HIBLK and HIGHWATER
+raised), refusal with the map area full, and end to end: an INDEXF.SYS
+extent at LBN 5,000,000 on a sparse copy of the synthetic disk, with
+new headers created there, read back at the expected LBN, valid, and
+INDEXF.SYS's header and backup identical.
+
+Not yet checked on VMS: a volume INITIALIZEd with default /INDEX and a
+small /HEADERS, filled past them, then ANALYZE/DISK.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WA1cTxSh5f8UrT87d9WhcQ
+---
+ Makefile                           |   7 +-
+ README.md                          |  12 +-
+ include/ods2_volume.h              |  11 ++
+ src/ods2_volume.c                  |  75 +++++++---
+ tests/ods2_indexf_large_selftest.c | 230 +++++++++++++++++++++++++++++
+ 5 files changed, 307 insertions(+), 28 deletions(-)
+ create mode 100644 tests/ods2_indexf_large_selftest.c
+
+diff --git a/Makefile b/Makefile
+index b26dc30..41468d9 100644
+--- a/Makefile
++++ b/Makefile
+@@ -40,7 +40,7 @@ MAIN_TOOLS = ods2
+ DEV_TOOLS = read_home_block read_file_header ods2_ls ods2_cat ods2_mkdir \
+             ods2_put ods2_check_headers ods2_dump_root ods2_dump_header ods2_rm
+ 
+-TESTS = $(BUILD)/ods2_ondisk_selftest $(BUILD)/ods2_checksum_selftest $(BUILD)/ods2_validate_selftest $(BUILD)/ods2_bitmap_selftest $(BUILD)/ods2_indexf_selftest $(BUILD)/ods2_retrieval_selftest $(BUILD)/ods2_root_header_selftest $(BUILD)/ods2_directory_selftest $(BUILD)/ods2_volume_selftest $(BUILD)/ods2_wildcard_selftest $(BUILD)/ods2_read_file_selftest $(BUILD)/ods2_header_build_selftest $(BUILD)/ods2_directory_write_selftest $(BUILD)/ods2_path_selftest $(BUILD)/ods2_versions_selftest $(BUILD)/ods2_time_selftest $(BUILD)/ods2_file_alloc_selftest $(BUILD)/ods2_dir_order_selftest $(BUILD)/ods2_large_file_selftest $(BUILD)/ods2_record_attrs_selftest
++TESTS = $(BUILD)/ods2_ondisk_selftest $(BUILD)/ods2_checksum_selftest $(BUILD)/ods2_validate_selftest $(BUILD)/ods2_bitmap_selftest $(BUILD)/ods2_indexf_selftest $(BUILD)/ods2_retrieval_selftest $(BUILD)/ods2_root_header_selftest $(BUILD)/ods2_directory_selftest $(BUILD)/ods2_volume_selftest $(BUILD)/ods2_wildcard_selftest $(BUILD)/ods2_read_file_selftest $(BUILD)/ods2_header_build_selftest $(BUILD)/ods2_directory_write_selftest $(BUILD)/ods2_path_selftest $(BUILD)/ods2_versions_selftest $(BUILD)/ods2_time_selftest $(BUILD)/ods2_file_alloc_selftest $(BUILD)/ods2_dir_order_selftest $(BUILD)/ods2_large_file_selftest $(BUILD)/ods2_record_attrs_selftest $(BUILD)/ods2_indexf_large_selftest
+ 
+ .PHONY: all test tools dev-tools release clean starter-volume
+ 
+@@ -128,6 +128,9 @@ $(BUILD)/ods2_large_file_selftest: tests/ods2_large_file_selftest.c $(VOLUME_SRC
+ $(BUILD)/ods2_record_attrs_selftest: tests/ods2_record_attrs_selftest.c $(VOLUME_SRCS) include/ods2_volume.h samples/synthetic_disk.img | $(BUILD)
+ 	$(CC) $(CFLAGS) $(SANFLAGS) tests/ods2_record_attrs_selftest.c $(VOLUME_SRCS) -o $@
+ 
++$(BUILD)/ods2_indexf_large_selftest: tests/ods2_indexf_large_selftest.c $(VOLUME_SRCS) include/ods2_volume.h samples/synthetic_disk.img | $(BUILD)
++	$(CC) $(CFLAGS) $(SANFLAGS) -D_DEFAULT_SOURCE tests/ods2_indexf_large_selftest.c $(VOLUME_SRCS) -o $@
++
+ # --- CLI tools (built directly into the project root, e.g. ./ods2_ls,
+ #     not into build/, since that's where they're actually run from) ---
+ 
+@@ -209,6 +212,8 @@ test: $(TESTS) tools ods2_put ods2_dump_header
+ 	@$(BUILD)/ods2_large_file_selftest
+ 	@echo "--- ods2_record_attrs_selftest ---"
+ 	@$(BUILD)/ods2_record_attrs_selftest
++	@echo "--- ods2_indexf_large_selftest ---"
++	@$(BUILD)/ods2_indexf_large_selftest
+ 	@echo "--- CLI file version checks ---"
+ 	@sh tests/cli_versions_check.sh
+ 	@echo "--- CLI directory wildcard checks ---"
+diff --git a/README.md b/README.md
+index 68a70b1..279bfcd 100644
+--- a/README.md
++++ b/README.md
+@@ -270,11 +270,13 @@ in every structural test.
+   version 1 of a new name only.
+ - `TYPE` and `DELETE` don't take wildcards yet, in file names or
+   directories (VMS's do); only `DIR` does.
+-- INDEXF.SYS is extended as new files need it, but only into space
+-  below LBN 4,194,304 (2 GB), since that's all a Format 1 retrieval
+-  pointer can address. On a bigger volume whose free space starts
+-  above that, creating a file fails with a clear message once the
+-  headers INITIALIZE preallocated (`/HEADERS`) are used up.
++- INDEXF.SYS is extended as new files need it, anywhere on a volume
++  of any size (Format 1 retrieval pointers below LBN 4,194,304,
++  Format 2 above it), up to what its own header's map area holds -
++  a few dozen extensions of up to 256 blocks (one header each), so
++  on the order of ten thousand files beyond the headers INITIALIZE
++  preallocated (`/HEADERS`). INDEXF.SYS extension headers aren't
++  written.
+ - File numbers stop at 65,535 (the FID_NMX extension isn't used).
+ - A directory is limited to 256 blocks (a few thousand entries), the
+   most one contiguous extent can map here.
+diff --git a/include/ods2_volume.h b/include/ods2_volume.h
+index f79e47f..8a4946c 100644
+--- a/include/ods2_volume.h
++++ b/include/ods2_volume.h
+@@ -250,6 +250,17 @@ ods2_result_t ods2_allocate_extent(ods2_volume_t *vol, unsigned max_blocks,
+  */
+ ods2_result_t ods2_free_blocks(ods2_volume_t *vol, uint32_t lbn, unsigned block_count);
+ 
++/* Appends one extent (`block_count` blocks at `lbn`) to INDEXF.SYS's
++ * own header (file 1) in memory: encodes it as the smallest retrieval
++ * pointer that fits - Format 1, or Format 2/3 above LBN 4,194,303 -
++ * after the pointers already in use, and raises HIBLK (and HIGHWATER,
++ * when set) by the same count. Writes nothing to disk and takes no
++ * blocks; the caller has allocated them and writes the header. Fails,
++ * changing nothing, when the header's map area has no room left for
++ * the pointer. Used when INDEXF.SYS grows to hold more headers.
++ */
++ods2_result_t ods2_indexf_map_extent(uint8_t *indexf_header, uint32_t lbn, unsigned block_count);
++
+ /* Creates a new, empty subdirectory named `name` (e.g. "NETLIB020",
+  * without ".DIR" - that's appended internally, matching VMS
+  * convention) within the directory described by `parent_header`.
+diff --git a/src/ods2_volume.c b/src/ods2_volume.c
+index a443057..79e22f2 100644
+--- a/src/ods2_volume.c
++++ b/src/ods2_volume.c
+@@ -906,22 +906,58 @@ static ods2_result_t write_indexf_header(ods2_volume_t *vol, uint8_t *indexf_hea
+     return ok();
+ }
+ 
++ods2_result_t ods2_indexf_map_extent(uint8_t *indexf_header, uint32_t lbn, unsigned block_count)
++{
++    ods2_head_core_t *core = (ods2_head_core_t *) indexf_header;
++    size_t map_offset = (size_t) core->mpoffset * 2;
++    size_t map_bytes = (size_t) core->map_inuse * 2;
++    size_t map_end = (size_t) core->acoffset * 2;
++    size_t size = ods2_retrieval_pointer_size(lbn, block_count);
++    uint32_t hiblk;
++
++    if (size == 0) {
++        return fail("internal error: INDEXF.SYS extent cannot be described by "
++                    "any retrieval pointer format");
++    }
++    if (map_end > 510 || map_offset + map_bytes + size > map_end) {
++        return fail("INDEXF.SYS's header has no room for another extent "
++                    "(would need an extension header - not yet implemented)");
++    }
++    if (ods2_encode_retrieval_pointer(indexf_header + map_offset + map_bytes,
++                                      lbn, block_count) != size) {
++        return fail("internal error: could not encode an INDEXF.SYS retrieval pointer");
++    }
++    core->map_inuse = (uint8_t) ((map_bytes + size) / 2);
++    hiblk = ods2_word_swap32(core->recattr.hiblk) + block_count;
++    core->recattr.hiblk = ods2_word_swap32(hiblk);
++    /* INITIALIZE leaves FH2$L_HIGHWATER at HIBLK + 1 on INDEXF.SYS;
++       keep that relationship. */
++    if (core->highwater != 0) core->highwater = hiblk + 1;
++    return ok();
++}
++
+ /* Allocates more blocks to INDEXF.SYS and maps them, so more headers
+-   fit. Up to 256 blocks at a time (one Format 1 retrieval pointer);
+-   falls back to a single cluster if no run that long is free. */
++   fit. Up to 256 blocks at a time; falls back to a single cluster if
++   no run that long is free. The new piece is mapped with the smallest
++   retrieval pointer that describes it - Format 1 below LBN 4,194,303,
++   Format 2 beyond (issue #14) - so INDEXF.SYS can grow anywhere on a
++   volume of any size. */
+ static ods2_result_t extend_indexf(ods2_volume_t *vol, uint8_t *indexf_header)
+ {
+-    ods2_head_core_t *core = (ods2_head_core_t *) indexf_header;
++    const ods2_head_core_t *core = (const ods2_head_core_t *) indexf_header;
+     size_t map_offset = (size_t) core->mpoffset * 2;
+     size_t map_bytes = (size_t) core->map_inuse * 2;
+     size_t map_end = (size_t) core->acoffset * 2;
+     unsigned want = (256u / vol->home.cluster) * vol->home.cluster;
+-    uint32_t lbn, hiblk;
++    uint32_t lbn;
+     unsigned got;
+     ods2_result_t r;
+ 
+     if (want == 0) want = vol->home.cluster;
+-    if (map_offset + map_bytes + 4 > map_end || map_end > 510) {
++    /* Check first, before taking any blocks, that the smallest pointer
++       (4 bytes) could still fit; the exact size is checked after
++       allocation, once the LBN is known. */
++    if (map_end > 510 || map_offset + map_bytes + 4 > map_end) {
+         return fail("INDEXF.SYS's header has no room for another extent "
+                     "(would need an extension header - not yet implemented)");
+     }
+@@ -931,21 +967,13 @@ static ods2_result_t extend_indexf(ods2_volume_t *vol, uint8_t *indexf_header)
+         r = ods2_allocate_blocks(vol, want, &lbn, &got);
+     }
+     if (!r.ok) return r;
+-    if (!ods2_encode_retrieval_pointer_format1(indexf_header + map_offset + map_bytes,
+-                                               lbn, got)) {
++    r = ods2_indexf_map_extent(indexf_header, lbn, got);
++    if (!r.ok) {
+         /* ods2_allocate_blocks() has already marked them used; give
+            them back rather than leak them. */
+         ods2_free_blocks(vol, lbn, got);
+-        return fail("cannot map more INDEXF.SYS blocks: the free space found lies "
+-                    "beyond LBN 4194303, which needs a Format 2 retrieval pointer "
+-                    "(not yet implemented)");
++        return r;
+     }
+-    core->map_inuse = (uint8_t) ((map_bytes + 4) / 2);
+-    hiblk = ods2_word_swap32(core->recattr.hiblk) + got;
+-    core->recattr.hiblk = ods2_word_swap32(hiblk);
+-    /* INITIALIZE leaves FH2$L_HIGHWATER at HIBLK + 1 on INDEXF.SYS;
+-       keep that relationship. */
+-    if (core->highwater != 0) core->highwater = hiblk + 1;
+     return ok();
+ }
+ 
+@@ -1671,6 +1699,7 @@ static ods2_result_t store_directory(ods2_volume_t *vol, unsigned dir_file_numbe
+         unsigned want = allocated * 2;
+         uint32_t lbn;
+         unsigned got;
++        size_t ptr_size;
+         size_t map_start = (size_t) core->mpoffset * 2;
+         size_t map_end = (size_t) core->acoffset * 2;
+ 
+@@ -1686,19 +1715,21 @@ static ods2_result_t store_directory(ods2_volume_t *vol, unsigned dir_file_numbe
+             r = ods2_allocate_blocks(vol, want, &lbn, &got);
+         }
+         if (!r.ok) return r;
+-        if (lbn + got - 1 > 0x3fffffu || map_end > 510 || map_end < map_start + 4) {
++        /* Format 1 below LBN 4,194,303, Format 2 beyond it (issue #14):
++           the new area may lie anywhere on a large volume. */
++        ptr_size = ods2_retrieval_pointer_size(lbn, got);
++        if (ptr_size == 0 || map_end > 510 || map_end < map_start + ptr_size) {
+             ods2_free_blocks(vol, lbn, got);
+-            return fail("cannot map the directory's new area: it lies beyond LBN "
+-                        "4194303, which needs a Format 2 retrieval pointer "
+-                        "(not yet implemented)");
++            return fail("cannot map the directory's new area: no room in its "
++                        "header's map area for the retrieval pointer");
+         }
+         for (v = 0; v < got; v++) {
+             r = ods2_write_block(vol, lbn + v, (v < used) ? blocks + (size_t) v * 512 : zero);
+             if (!r.ok) return r;
+         }
+         memset(dir_header + map_start, 0, map_end - map_start);
+-        ods2_encode_retrieval_pointer_format1(dir_header + map_start, lbn, got);
+-        core->map_inuse = 2;
++        ods2_encode_retrieval_pointer(dir_header + map_start, lbn, got);
++        core->map_inuse = (uint8_t) (ptr_size / 2);
+         core->recattr.hiblk = ods2_word_swap32(got);
+         moved = true;
+     } else {
+diff --git a/tests/ods2_indexf_large_selftest.c b/tests/ods2_indexf_large_selftest.c
+new file mode 100644
+index 0000000..0dc9edd
+--- /dev/null
++++ b/tests/ods2_indexf_large_selftest.c
+@@ -0,0 +1,230 @@
++/*
++ * MIT License
++ *
++ * Copyright (c) 2026 Allen Pomeroy
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++/* ods2_indexf_large_selftest - INDEXF.SYS above LBN 4,194,304
++ * (issue #14).
++ *
++ * A Format 1 retrieval pointer can't address an LBN past 4,194,302,
++ * so INDEXF.SYS used to stop growing on a large volume whose free
++ * space lay above that. ods2_indexf_map_extent() now uses the
++ * smallest pointer that fits:
++ *
++ *  - below the limit it is still Format 1 (2 words);
++ *  - above it, Format 2 (3 words), decoding back to the same extent,
++ *    with HIBLK and HIGHWATER raised;
++ *  - when the map area is full it fails and leaves the header as it
++ *    was.
++ *
++ * Then, end to end on a sparse copy of the synthetic disk grown past
++ * 5,000,256 blocks: INDEXF.SYS is given an extent at LBN 5,000,000
++ * (a test fixture - the synthetic disk's bitmap is too small for the
++ * allocator ever to return such an LBN itself), the volume is
++ * remounted, and new files are created until their headers must lie
++ * in that extent. Every one is found at the LBN expected, valid, and
++ * INDEXF.SYS's header and backup stay identical and valid. */
++
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++#include <assert.h>
++#include <unistd.h>
++#include "ods2_volume.h"
++#include "ods2_validate.h"
++#include "ods2_checksum.h"
++#include "ods2_retrieval.h"
++
++#define SOURCE_DISK_PATH "samples/synthetic_disk.img"
++#define DISK_PATH        "samples/indexf_large_disk.img"
++#define HIGH_LBN         5000000u
++#define HIGH_BLOCKS      256u
++
++static uint32_t word_swap(uint32_t v) { return (v << 16) | (v >> 16); }
++
++/* Copies the (mostly empty) image without writing its runs of zeros,
++   so the copy stays sparse and quick. */
++static void copy_sparse(const char *src, const char *dst)
++{
++    FILE *in = fopen(src, "rb");
++    FILE *out = fopen(dst, "wb");
++    static char buf[1 << 20];
++    static const char zero[1 << 20];
++    size_t n;
++    assert(in != NULL && out != NULL);
++    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
++        if (n == sizeof(buf) && memcmp(buf, zero, n) == 0) {
++            assert(fseek(out, (long) n, SEEK_CUR) == 0);
++        } else {
++            assert(fwrite(buf, 1, n, out) == n);
++        }
++    }
++    fclose(in);
++    fclose(out);
++}
++
++static void read_block(ods2_volume_t *vol, uint32_t lbn, uint8_t *block)
++{
++    assert(fseek(vol->fp, (long) lbn * 512, SEEK_SET) == 0);
++    assert(fread(block, 1, 512, vol->fp) == 512);
++}
++
++static uint32_t header_vbn(const ods2_volume_t *vol, unsigned n)
++{
++    return (uint32_t) vol->home.cluster * 4 + vol->home.ibmapsize + n;
++}
++
++static int decode(const uint8_t *header, ods2_extent_t *ext, size_t max)
++{
++    const ods2_head_core_t *core = (const ods2_head_core_t *) header;
++    return ods2_decode_retrieval_pointers(header + (size_t) core->mpoffset * 2,
++                                          core->map_inuse, ext, max);
++}
++
++static void set_checksum(uint8_t *header)
++{
++    uint16_t c = ods2_checksum(header, 255);
++    header[510] = (uint8_t) (c & 0xff);
++    header[511] = (uint8_t) (c >> 8);
++}
++
++int main(void)
++{
++    ods2_volume_t vol;
++    uint8_t ix[512], before[512], root[512];
++    ods2_head_core_t *core = (ods2_head_core_t *) ix;
++    ods2_extent_t ext[ODS2_MAX_EXTENTS];
++    int count, base_count;
++    uint32_t hiblk;
++    unsigned words;
++
++    copy_sparse(SOURCE_DISK_PATH, DISK_PATH);
++    /* Room for an extent at LBN 5,000,000 (zeros, sparse). */
++    assert(truncate(DISK_PATH, (off_t) (HIGH_LBN + HIGH_BLOCKS + 16) * 512) == 0);
++
++    assert(ods2_mount_write(DISK_PATH, &vol).ok);
++    assert(ods2_read_header(&vol, 1, ix).ok);
++    base_count = decode(ix, ext, ODS2_MAX_EXTENTS);
++    assert(base_count > 0);
++
++    /* --- below the limit: still Format 1 --- */
++    memcpy(before, ix, 512);
++    hiblk = word_swap(core->recattr.hiblk);
++    words = core->map_inuse;
++    assert(ods2_indexf_map_extent(ix, 2000000u, 9).ok);
++    assert(core->map_inuse == words + 2);
++    assert(word_swap(core->recattr.hiblk) == hiblk + 9);
++    count = decode(ix, ext, ODS2_MAX_EXTENTS);
++    assert(count == base_count + 1);
++    assert(ext[count - 1].lbn == 2000000u && ext[count - 1].block_count == 9);
++    printf("PASS: an extent below LBN 4,194,303 is mapped with a Format 1 pointer\n");
++
++    /* --- above it: Format 2 --- */
++    memcpy(ix, before, 512);
++    assert(ods2_indexf_map_extent(ix, HIGH_LBN, HIGH_BLOCKS).ok);
++    assert(core->map_inuse == words + 3);
++    assert(word_swap(core->recattr.hiblk) == hiblk + HIGH_BLOCKS);
++    if (core->highwater != 0) assert(core->highwater == hiblk + HIGH_BLOCKS + 1);
++    count = decode(ix, ext, ODS2_MAX_EXTENTS);
++    assert(count == base_count + 1);
++    assert(ext[count - 1].lbn == HIGH_LBN && ext[count - 1].block_count == HIGH_BLOCKS);
++    printf("PASS: an extent at LBN %u is mapped with a Format 2 pointer and decodes "
++           "back to the same extent; HIBLK and HIGHWATER follow\n", HIGH_LBN);
++
++    /* --- map area full: refused, header unchanged --- */
++    {
++        uint8_t full[512];
++        int added = 0;
++        memcpy(full, before, 512);
++        while (ods2_indexf_map_extent(full, HIGH_LBN + 1000u * (unsigned) added, 8).ok) {
++            added++;
++            assert(added < 300);
++        }
++        {
++            uint8_t snapshot[512];
++            memcpy(snapshot, full, 512);
++            assert(!ods2_indexf_map_extent(full, HIGH_LBN, 8).ok);
++            assert(memcmp(snapshot, full, 512) == 0);
++        }
++        printf("PASS: with the map area full (%d Format 2 pointers added) the next "
++               "extent is refused and the header left unchanged\n", added);
++    }
++
++    /* --- end to end: headers stored above LBN 4,194,304 --- */
++    memcpy(ix, before, 512);
++    assert(ods2_indexf_map_extent(ix, HIGH_LBN, HIGH_BLOCKS).ok);
++    set_checksum(ix);
++    assert(ods2_validate_head(ix).ok);
++    assert(ods2_write_header(&vol, 1, ix).ok);
++    assert(ods2_write_block(&vol, vol.home.altidxlbn, ix).ok);
++    ods2_dismount(&vol);
++
++    assert(ods2_mount_write(DISK_PATH, &vol).ok);
++    {
++        uint32_t old_hiblk = hiblk; /* VBNs past this lie in the new extent */
++        int i, high = 0;
++        for (i = 0; i < 40; i++) {
++            char name[32];
++            ods2_fid_t fid;
++            uint8_t content = 'x', h[512];
++            uint32_t vbn;
++            ods2_result_t r;
++
++            snprintf(name, sizeof name, "HIGH%02d.TXT", i);
++            assert(ods2_read_header(&vol, 4, root).ok);
++            r = ods2_create_file(&vol, root, name, &content, 1, 5, &fid);
++            if (!r.ok) printf("create %s: %s\n", name, r.problem);
++            assert(r.ok);
++
++            vbn = header_vbn(&vol, fid.fid_num);
++            if (vbn > old_hiblk) {
++                /* Read the raw block where the header must be. */
++                read_block(&vol, HIGH_LBN + (vbn - old_hiblk - 1), h);
++                assert(ods2_validate_head(h).ok);
++                assert(((ods2_head_core_t *) h)->fid.fid_num == fid.fid_num);
++                high++;
++            }
++        }
++        assert(high > 20);
++        {
++            uint8_t backup[512];
++            assert(ods2_read_header(&vol, 1, ix).ok);
++            assert(ods2_validate_head(ix).ok);
++            read_block(&vol, vol.home.altidxlbn, backup);
++            assert(memcmp(ix, backup, 512) == 0);
++            assert(word_swap(core->recattr.efblk) <= word_swap(core->recattr.hiblk) + 1);
++        }
++        {
++            ods2_fid_t fid;
++            assert(ods2_read_header(&vol, 4, root).ok);
++            assert(ods2_lookup_name(&vol, root, "HIGH39.TXT", &fid).ok);
++        }
++        printf("PASS: %d new headers stored in INDEXF.SYS's extent at LBN %u, each "
++               "valid at the LBN expected; INDEXF.SYS's header and backup agree\n",
++               high, HIGH_LBN);
++    }
++
++    ods2_dismount(&vol);
++    remove(DISK_PATH);
++    printf("\nods2_indexf_large_selftest: all checks passed\n");
++    return 0;
++}
+-- 
+2.43.0

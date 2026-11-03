@@ -98,6 +98,22 @@ static uint8_t *pattern(size_t len, unsigned seed)
 }
 
 /* Free clusters according to BITMAP.SYS (VBN 1 is the SCB). */
+/* A content source that delivers zeros, then fails after
+   `fail_after` bytes, recording the largest chunk asked for. */
+typedef struct {
+    size_t delivered, fail_after, largest;
+} failing_source_t;
+
+static bool failing_read(void *ctx_, uint8_t *buf, size_t n)
+{
+    failing_source_t *fs = (failing_source_t *) ctx_;
+    if (n > fs->largest) fs->largest = n;
+    if (fs->delivered + n > fs->fail_after) return false;
+    memset(buf, 0, n);
+    fs->delivered += n;
+    return true;
+}
+
 static size_t free_clusters(ods2_volume_t *vol)
 {
     uint8_t bh[512];
@@ -276,6 +292,39 @@ int main(void)
             free(junk);
             printf("PASS: a copy larger than the free space fails and gives back every "
                    "block and file number (%s)\n", r.problem);
+        }
+
+        /* Streamed content (issue #16): a source that fails part way,
+           after some chunks are already on the disk, leaves no file
+           and gives everything back. */
+        {
+            failing_source_t fs;
+            ods2_content_source_t src;
+            ods2_record_attrs_t attrs;
+            fs.delivered = 0;
+            fs.fail_after = 3u * ODS2_STREAM_CHUNK;
+            fs.largest = 0;
+            src.length = 5u * ODS2_STREAM_CHUNK + 123u;
+            src.read = failing_read;
+            src.ctx = &fs;
+            src.problem = NULL;
+            src.var_records = false;
+            attrs.rtype = ODS2_RFM_UDF;
+            attrs.rattrib = 0;
+            attrs.rsize = 0;
+            attrs.maxrec = 0;
+            assert(ods2_read_header(&vol, 4, root).ok);
+            r = ods2_create_file_source(&vol, root, "BROKEN.BIN", &src, &attrs, &fid);
+            assert(!r.ok);
+            assert(fs.delivered > 0 && fs.delivered <= fs.fail_after);
+            assert(fs.largest <= ODS2_STREAM_CHUNK);
+            assert(free_clusters(&vol) == free_before);
+            assert(used_file_numbers(&vol) == files_before);
+            assert(ods2_read_header(&vol, 4, root).ok);
+            assert(!ods2_lookup_name(&vol, root, "BROKEN.BIN", &fid).ok);
+            printf("PASS: a streamed source failing after %zu of %zu bytes leaves no "
+                   "file and gives back every block and file number (%s)\n",
+                   fs.delivered, src.length, r.problem);
         }
 
         /* Content that takes every hole leaves no room for INDEXF.SYS

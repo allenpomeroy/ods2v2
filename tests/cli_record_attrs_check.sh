@@ -94,6 +94,58 @@ n=$((n + 1))
 check "plain COPY is still Stream_LF, 512, no RAT" \
     "rtype=0x05 rattrib=0x00 rsize=512 maxrec=512" "$(hdr $n)"
 
+# --- COPY/CONVERT: host text to variable-length records (issue #15) ---
+printf 'first line\r\nsecond\n\nodd\nlast' > "$TMP/crlf.txt"
+# The records: count word, data, a pad byte after an odd length.
+printf '\012\000first line\006\000second\000\000\003\000odd\000\004\000last' \
+    > "$TMP/crlf.var"
+check "COPY/CONVERT succeeds" \
+    "%ODS2-I-COPIED, 28 bytes to CRLF.TXT;1 as 5 variable-length records (longest 10)" \
+    "$($ODS2 $DISK "COPY/CONVERT $TMP/crlf.txt [000000]CRLF.TXT" 2>&1)"
+n=$((n + 1))
+check "...VAR, RAT:CR, LRL the longest line, MRS 0" \
+    "rtype=0x02 rattrib=0x02 rsize=10 maxrec=0" "$(hdr $n)"
+$ODS2 $DISK "TYPE [000000]CRLF.TXT" > "$TMP/out.bin" 2>/dev/null
+if cmp -s "$TMP/crlf.var" "$TMP/out.bin"; then same=identical; else same=different; fi
+check "...holding exactly the records expected" identical "$same"
+$ODS2 $DISK "COPY/ATTRIBUTES=(RFM:VAR,RAT:CR)/CONVERT $TMP/crlf.txt [000000]ISSUE.TXT" >/dev/null 2>&1
+n=$((n + 1))
+check "the issue's spelling: /ATTRIBUTES=(RFM:VAR,RAT:CR)/CONVERT" \
+    "rtype=0x02 rattrib=0x02 rsize=10 maxrec=0" "$(hdr $n)"
+$ODS2 $DISK "COPY/CONV/ATTR=(RAT:NONE,MRS:100) $TMP/crlf.txt [000000]NOCC.TXT" >/dev/null 2>&1
+n=$((n + 1))
+check "/CONV abbreviation, RAT:NONE and MRS:100 honored" \
+    "rtype=0x02 rattrib=0x00 rsize=10 maxrec=100" "$(hdr $n)"
+check "COPY/CONVERT from a pipe" \
+    "%ODS2-I-COPIED, 28 bytes to PIPED.TXT;1 as 5 variable-length records (longest 10)" \
+    "$(cat $TMP/crlf.txt | $ODS2 $DISK "COPY/CONVERT /dev/stdin [000000]PIPED.TXT" 2>&1)"
+n=$((n + 1))
+$ODS2 $DISK "TYPE [000000]PIPED.TXT" > "$TMP/out.bin" 2>/dev/null
+if cmp -s "$TMP/crlf.var" "$TMP/out.bin"; then same=identical; else same=different; fi
+check "...holding the same records" identical "$same"
+: > "$TMP/empty.txt"
+check "COPY/CONVERT of an empty file: no records" \
+    "%ODS2-I-COPIED, 0 bytes to EMPTY.TXT;1 as 0 variable-length records (longest 0)" \
+    "$($ODS2 $DISK "COPY/CONVERT $TMP/empty.txt [000000]EMPTY.TXT" 2>&1)"
+n=$((n + 1))
+{ printf 'short\n'; head -c 32768 /dev/zero | tr '\0' 'L'; printf '\n'; } > "$TMP/long.txt"
+check "a line over 32767 bytes is refused (exit 1)" 1 \
+    "$(status $ODS2 $DISK "COPY/CONVERT $TMP/long.txt [000000]REFUSED8.TXT")"
+check "...naming the line" \
+    "%ODS2-E-RECTOOBIG, $TMP/long.txt: line 2 is longer than a variable-length record can be (32767 bytes)" \
+    "$($ODS2 $DISK "COPY/CONVERT $TMP/long.txt [000000]REFUSED8.TXT" 2>&1)"
+check "/CONVERT with RFM:FIX exits 1" 1 \
+    "$(status $ODS2 $DISK "COPY/ATTRIBUTES=(RFM:FIX)/CONVERT $TMP/crlf.txt [000000]REFUSED9.TXT")"
+check "/CONVERT with RAT:BLK exits 1" 1 \
+    "$(status $ODS2 $DISK "COPY/CONVERT/ATTRIBUTES=(RAT:CR,RAT:BLK) $TMP/crlf.txt [000000]REFUSED10.TXT")"
+check "/CONVERT with LRL given exits 1" 1 \
+    "$(status $ODS2 $DISK "COPY/CONVERT/ATTRIBUTES=(LRL:80) $TMP/crlf.txt [000000]REFUSED11.TXT")"
+check "/CONVERT with MRS below the longest line exits 1" 1 \
+    "$(status $ODS2 $DISK "COPY/CONVERT/ATTRIBUTES=(MRS:5) $TMP/crlf.txt [000000]REFUSED12.TXT")"
+check "RFM:VAR without /CONVERT says to use it" \
+    "%ODS2-E-CONFQUAL, RFM:VAR needs /CONVERT: each variable-length record starts with a byte count the host file doesn't have, so COPY/CONVERT makes one record per line" \
+    "$($ODS2 $DISK "COPY/ATTRIBUTES=(RFM:VAR) $TMP/notes.txt [000000]REFUSED3.TXT" 2>&1)"
+
 check "COPY of content that isn't whole records exits 1" 1 \
     "$(status $ODS2 $DISK "COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) $TMP/short.pcsi [000000]SHORT.PCSI")"
 check "...and creates no file" "%ODS2-W-NOFILES, no files found" \

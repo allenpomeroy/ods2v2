@@ -65,5 +65,32 @@ check "COPY again into the space it freed" \
     "%ODS2-I-COPIED, 27000001 bytes to ODD2.BIN;1" \
     "$($ODS2 $DISK COPY $TMP/odd.bin '[000000]ODD2.BIN' 2>&1)"
 
+# Issue #16: COPY and TYPE stream, so their memory use doesn't grow
+# with the file. A 96 MiB file must go through in well under 96 MiB of
+# peak memory - from a file, from a pipe (spooled to a temporary file),
+# and back out with TYPE. (Measured with Python's getrusage, as the
+# test suite already needs Python.)
+peak_mib() { # peak_mib <command...>: the command's peak RSS, in MiB
+    python3 -I -c 'import resource, subprocess, sys
+subprocess.run(sys.argv[1:], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+print(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss // 1024)' "$@"
+}
+under_limit() { if [ "$1" -lt 64 ]; then echo yes; else echo "no ($1 MiB)"; fi; }
+head -c 100663296 /dev/zero | tr '\0' 'z' > "$TMP/big.bin"
+check "COPY of a 96 MiB file stays under 64 MiB of memory (issue #16)" yes \
+    "$(under_limit "$(peak_mib $ODS2 $DISK COPY $TMP/big.bin '[000000]BIG.BIN')")"
+check "TYPE of it stays under 64 MiB of memory" yes \
+    "$(under_limit "$(peak_mib $ODS2 $DISK 'TYPE [000000]BIG.BIN')")"
+$ODS2 $DISK "TYPE [000000]BIG.BIN" > "$TMP/out.bin" 2>/dev/null
+if cmp -s "$TMP/big.bin" "$TMP/out.bin"; then same=identical; else same=different; fi
+check "TYPE BIG.BIN reads back byte for byte" identical "$same"
+check "COPY of it from a pipe stays under 64 MiB too" yes \
+    "$(under_limit "$(peak_mib sh -c "cat $TMP/big.bin | $ODS2 $DISK COPY /dev/stdin '[000000]BIGPIPE.BIN'")")"
+$ODS2 $DISK "TYPE [000000]BIGPIPE.BIN" > "$TMP/out.bin" 2>/dev/null
+if cmp -s "$TMP/big.bin" "$TMP/out.bin"; then same=identical; else same=different; fi
+check "TYPE BIGPIPE.BIN reads back byte for byte" identical "$same"
+$ODS2 $DISK 'DELETE [000000]BIG.BIN;1' > /dev/null 2>&1
+$ODS2 $DISK 'DELETE [000000]BIGPIPE.BIN;1' > /dev/null 2>&1
+
 rm -rf "$TMP"
 [ "$fails" -eq 0 ] || { echo "$fails CLI large-file check(s) failed"; exit 1; }

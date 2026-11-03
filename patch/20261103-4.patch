@@ -1,0 +1,731 @@
+From 18ab53f49787341f75e24339f1bdcda988ee5df4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 13:18:27 -0600
+Subject: [PATCH] Host-side SET VOLUME/LABEL and SHOW VOLUME (#13)
+
+Copies of a blank VMS-initialized volume all carry the blank's label,
+and two volumes with one label can't both be mounted /SYSTEM on a node
+(they clash on DISK$label), so each copy needed a trip through VMS for
+SET VOLUME/LABEL.
+
+    ./ods2 kits.dsk SET VOLUME/LABEL=ITANKITS
+    ./ods2 kits.dsk SHOW VOLUME
+
+ods2_set_volume_label() rewrites every copy of the home block: the
+home block and its cluster fillers (INDEXF.SYS VBNs 2 to 2v) and the
+backup home block's cluster (VBNs 2v+1 to 3v), per spec 5.1.3-5.1.4.
+On the real starter volume that is 8 blocks, LBN 1-5 and 1032-1034.
+The copies aren't identical - each names its own position in HOMELBN
+and HOMEVBN - so each is changed in place, HM2$T_VOLNAME set, checksum1
+then checksum2 recomputed.
+
+Nothing is written unless every one of those blocks is first found to
+be a valid home block naming its own position and otherwise identical
+to the primary, with the primary and backup among them. A volume set
+member (structure name, RVN or set count) is refused. The primary is
+written last, so an interruption leaves VMS seeing the old label
+consistently, and every copy is read back. Labels are 1-12 of letters,
+digits, $, _ and -, uppercased.
+
+SHOW VOLUME reports the label, owner, format, structure level, cluster
+size, maximum files, owner UIC, volume set, and total (SCB$L_VOLSIZE)
+and free blocks (ods2_volume_space(), counting BITMAP.SYS).
+
+cli_volume_label_check.sh runs on the real starter volume: all 8
+copies relabelled with their own LBN/VBN and valid checksums and no
+other block changed (checked across the whole image), the relabelled
+volume still takes files, and with the image left byte for byte
+unchanged: bad labels, a damaged backup copy (named in the message), a
+volume set member, and a volume missing its backup cluster.
+
+Not yet checked on VMS: MOUNT and ANALYZE/DISK of a relabelled volume.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WA1cTxSh5f8UrT87d9WhcQ
+---
+ Makefile                        |   4 +-
+ README.md                       |  25 ++++
+ include/ods2_volume.h           |  34 +++++
+ src/ods2_volume.c               | 225 ++++++++++++++++++++++++++++++++
+ tests/cli_volume_label_check.sh | 159 ++++++++++++++++++++++
+ tools/ods2.c                    | 139 ++++++++++++++++++++
+ 6 files changed, 585 insertions(+), 1 deletion(-)
+ create mode 100644 tests/cli_volume_label_check.sh
+
+diff --git a/Makefile b/Makefile
+index 7a412ea..ba3155a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -230,6 +230,8 @@ test: $(TESTS) tools ods2_put ods2_dump_header
+ 	@sh tests/cli_exit_status_check.sh
+ 	@echo "--- CLI record attribute checks ---"
+ 	@sh tests/cli_record_attrs_check.sh
++	@echo "--- CLI volume label check ---"
++	@sh tests/cli_volume_label_check.sh
+ 	@echo "--- CLI recursive DIR regression check ---"
+ 	@if command -v timeout >/dev/null 2>&1; then \
+ 		rm -f samples/cli_regression_disk.img; \
+@@ -268,5 +270,5 @@ release: test
+ clean:
+ 	rm -rf $(BUILD)
+ 	rm -f samples/synthetic_disk.img samples/synthetic_disk_working.img
+-	rm -f samples/versions_disk.img samples/versions_cli_disk.img samples/cli_wildcard_disk.img samples/file_alloc_disk.img samples/dir_order_disk.img samples/large_file_disk.img samples/cli_status_disk.img samples/cli_attrs_disk.img samples/record_attrs_disk.img
++	rm -f samples/versions_disk.img samples/versions_cli_disk.img samples/cli_wildcard_disk.img samples/file_alloc_disk.img samples/dir_order_disk.img samples/large_file_disk.img samples/cli_status_disk.img samples/cli_attrs_disk.img samples/record_attrs_disk.img samples/indexf_large_disk.img samples/text_var_disk.img samples/cli_label_disk.img samples/cli_label_orig.img
+ 	rm -f $(TOOLS)
+diff --git a/README.md b/README.md
+index be707a6..04fd49a 100644
+--- a/README.md
++++ b/README.md
+@@ -85,6 +85,8 @@ implements basic command recall to ease repetitive command sequences.
+ | `DELETE path` | `DELETE [DECUS]OLDFILE.TXT;1` |
+ | `SET DEFAULT path` | `SET DEFAULT [DECUS.NETLIB020]` |
+ | `SHOW DEFAULT` | |
++| `SET VOLUME/LABEL=name` | `SET VOLUME/LABEL=ITANKITS` — relabel the volume |
++| `SHOW VOLUME` | label, owner, cluster size, maximum files, free blocks |
+ | `HELP` | |
+ | `EXIT` / `QUIT` | |
+ 
+@@ -186,6 +188,29 @@ path has `/` in it too). `ods2_put` takes the same as numbers:
+ `ods2_put disk kit.pcsi KITS KIT.PCSI 1 8192` (record format, record
+ size, record attributes).
+ 
++### Volume labels
++
++A copy of a blank volume carries the blank's label, and two volumes
++with the same label can't both be mounted `/SYSTEM` on one node - they
++clash on the `DISK$label` logical name. Relabel a copy on the host, as
++VMS's `SET VOLUME/LABEL` would, while VMS doesn't have it mounted:
++
++```
++./ods2 kits.dsk SET VOLUME/LABEL=ITANKITS
++./ods2 kits.dsk SHOW VOLUME
++```
++
++- The label is 1-12 characters - letters, digits, `$`, `_` and `-` -
++  and is uppercased.
++- Every copy of the home block is rewritten: the home block and its
++  cluster fillers, and the backup home block's cluster (8 blocks on
++  the starter volume, cluster factor 3). Each keeps its own position
++  fields, with both checksums recomputed; the primary is written last.
++- Nothing is written unless every one of those copies is first found
++  valid and consistent with the primary. A volume whose copies don't
++  agree should go through `ANALYZE/DISK` on VMS first.
++- A volume set member is refused: relabel a set on VMS.
++
+ ### File dates and time zones
+ 
+ VMS keeps file dates in local time, so `ods2` stamps new files (and
+diff --git a/include/ods2_volume.h b/include/ods2_volume.h
+index 7c3c4e9..7901e09 100644
+--- a/include/ods2_volume.h
++++ b/include/ods2_volume.h
+@@ -445,4 +445,38 @@ ods2_result_t ods2_delete(ods2_volume_t *vol, unsigned dir_file_number, const ch
+ ods2_result_t ods2_delete_version(ods2_volume_t *vol, unsigned dir_file_number,
+                                   const char *name, int version, uint16_t *version_out);
+ 
++
++/* --- the volume label (issue #13) --- */
++
++/* Checks `label` as a volume label and writes it to `out` in its
++ * on-disk form: uppercased and space-padded to 12 bytes (HM2$T_VOLNAME,
++ * spec 5.1.9.36). Returns NULL if acceptable, else why not: it may not
++ * be empty (spec 2.1) or over 12 characters, and - keeping to what the
++ * spec recommends and what a DISK$label logical name can hold - only
++ * letters, digits, '$', '_' and '-' are allowed. */
++const char *ods2_make_volume_label(const char *label, char out[12]);
++
++/* Relabels the volume, as VMS's SET VOLUME/LABEL does, for a volume
++ * VMS does not have mounted. Every copy of the home block is changed:
++ * the home block and its cluster fillers (INDEXF.SYS VBNs 2 to 2v) and
++ * the backup home block's cluster (VBNs 2v+1 to 3v), v the cluster
++ * factor (spec 5.1.3-5.1.4). Each keeps its own HOMELBN and HOMEVBN,
++ * and both its checksums are recomputed.
++ *
++ * Nothing is written unless every one of those blocks is first found
++ * to be a valid home block naming its own position and otherwise
++ * identical to the primary, with the primary and backup among them.
++ * Refused for a volume in a volume set (a structure name, a relative
++ * volume number or a set count), since one member can't be relabelled
++ * alone. The primary is written last and every copy read back.
++ * *copies_out (if non-NULL) is how many blocks were rewritten. */
++ods2_result_t ods2_set_volume_label(ods2_volume_t *vol, const char *label,
++                                     unsigned *copies_out);
++
++/* The volume's size in blocks (SCB$L_VOLSIZE, from BITMAP.SYS's
++ * storage control block) and how many of them are free (free clusters
++ * in the storage bitmap times the cluster factor). Read only. */
++ods2_result_t ods2_volume_space(ods2_volume_t *vol, uint64_t *total_blocks_out,
++                                 uint64_t *free_blocks_out);
++
+ #endif /* ODS2_VOLUME_H */
+diff --git a/src/ods2_volume.c b/src/ods2_volume.c
+index ddaed29..a811007 100644
+--- a/src/ods2_volume.c
++++ b/src/ods2_volume.c
+@@ -2249,3 +2249,228 @@ ods2_result_t ods2_delete_version(ods2_volume_t *vol, unsigned dir_file_number,
+     if (version_out != NULL) *version_out = target_version;
+     return ok();
+ }
++
++/* --- the volume label (issue #13) --- */
++
++const char *ods2_make_volume_label(const char *label, char out[12])
++{
++    size_t len = strlen(label), i;
++
++    if (len == 0) return "a volume label may not be empty";
++    if (len > 12) return "a volume label is at most 12 characters";
++    for (i = 0; i < len; i++) {
++        unsigned char c = (unsigned char) label[i];
++        if (!(isalnum(c) || c == '$' || c == '_' || c == '-')) {
++            return "a volume label may contain only letters, digits, '$', '_' and '-'";
++        }
++    }
++    for (i = 0; i < 12; i++) {
++        out[i] = (i < len) ? (char) toupper((unsigned char) label[i]) : ' ';
++    }
++    return NULL;
++}
++
++/* A 12-byte name field is blank: spaces (as the spec says) or NULs. */
++static bool name_is_blank(const char *field)
++{
++    int i;
++    for (i = 0; i < 12; i++) {
++        if (field[i] != ' ' && field[i] != '\0') return false;
++    }
++    return true;
++}
++
++static void set_home_checksums(uint8_t *raw)
++{
++    /* checksum1 first: checksum2's coverage includes it (see
++       ods2_validate.h). */
++    uint16_t c1 = ods2_checksum(raw, 29), c2;
++    raw[58] = (uint8_t) (c1 & 0xff);
++    raw[59] = (uint8_t) (c1 >> 8);
++    c2 = ods2_checksum(raw, 255);
++    raw[510] = (uint8_t) (c2 & 0xff);
++    raw[511] = (uint8_t) (c2 >> 8);
++}
++
++/* Is `block` the copy of `primary` that belongs at `lbn` / INDEXF.SYS
++   VBN `vbn`? A valid home block whose HOMELBN and HOMEVBN name its own
++   position, and otherwise identical to the primary: only those two
++   fields and the checksums differ between copies (as on every volume
++   VMS INITIALIZE made that has been examined). */
++static bool is_home_copy(const uint8_t *block, const uint8_t *primary, uint32_t lbn,
++                         uint32_t vbn)
++{
++    const ods2_home_t *h = (const ods2_home_t *) block;
++    size_t i;
++
++    if (!ods2_validate_home(h).ok) return false;
++    if (h->homelbn != lbn || h->homevbn != vbn) return false;
++    for (i = 0; i < 512; i++) {
++        bool own_field = i < 4 || i == 16 || i == 17 || i == 58 || i == 59 || i >= 510;
++        if (!own_field && block[i] != primary[i]) return false;
++    }
++    return true;
++}
++
++ods2_result_t ods2_set_volume_label(ods2_volume_t *vol, const char *label,
++                                     unsigned *copies_out)
++{
++    /* The home block and its cluster fillers are INDEXF.SYS VBNs 2 to
++       2v, the backup home block's cluster VBNs 2v+1 to 3v, where v is
++       the cluster factor (spec 5.1.3, 5.1.4); VBN 1 is the boot
++       block. Every one of them holds a copy of the home block. */
++    char name[12];
++    const char *why;
++    uint8_t primary[512];
++    uint8_t (*blocks)[512] = NULL;
++    uint32_t *lbns = NULL;
++    unsigned v = vol->home.cluster, count, i, primary_index = 0;
++    bool have_primary = false, have_backup = false;
++    ods2_result_t r = ok();
++
++    if (copies_out) *copies_out = 0;
++    if (!vol->writable) {
++        return fail("volume was not mounted for write (use ods2_mount_write)");
++    }
++    why = ods2_make_volume_label(label, name);
++    if (why != NULL) return fail(why);
++    if (!name_is_blank(vol->home.strucname) || vol->home.rvn != 0 || vol->home.setcount != 0) {
++        return fail("this volume is part of a volume set: relabelling one member "
++                    "alone isn't supported - relabel the set on VMS");
++    }
++    if (v == 0) return fail("home block has a cluster factor of 0");
++
++    memcpy(primary, &vol->home, 512);
++    count = 3u * v - 1u; /* VBNs 2 .. 3v */
++    blocks = malloc((size_t) count * 512u);
++    lbns = malloc((size_t) count * sizeof(*lbns));
++    if (blocks == NULL || lbns == NULL) {
++        free(blocks);
++        free(lbns);
++        return fail("could not allocate memory for the home block copies");
++    }
++
++    /* Read and check every copy first; write nothing unless all of
++       them are what they should be. */
++    for (i = 0; i < count && r.ok; i++) {
++        uint32_t vbn = i + 2, lbn;
++        if (!vbn_to_lbn(vol->indexf_extents, vol->indexf_extent_count, vbn, &lbn)) {
++            r = fail("INDEXF.SYS doesn't map all of the home block's clusters");
++            break;
++        }
++        lbns[i] = lbn;
++        if (fseek(vol->fp, (long) lbn * 512, SEEK_SET) != 0 ||
++            fread(blocks[i], 1, 512, vol->fp) != 512) {
++            r = fail("could not read a home block copy");
++            break;
++        }
++        if (!is_home_copy(blocks[i], primary, lbn, vbn)) {
++            static char msg[200];
++            snprintf(msg, sizeof msg, "the block at LBN %u (INDEXF.SYS VBN %u) isn't a "
++                     "valid copy of the home block - nothing changed; check the volume "
++                     "with ANALYZE/DISK on VMS", (unsigned) lbn, (unsigned) vbn);
++            r = fail(msg);
++            break;
++        }
++        if (lbn == vol->home.homelbn) {
++            have_primary = true;
++            primary_index = i;
++        }
++        if (lbn == vol->home.alhomelbn) have_backup = true;
++    }
++    if (r.ok && !have_primary) {
++        r = fail("the primary home block isn't among INDEXF.SYS's home block clusters");
++    }
++    if (r.ok && !have_backup) {
++        r = fail("the backup home block isn't among INDEXF.SYS's home block clusters");
++    }
++
++    /* Relabel each copy, keeping its own HOMELBN/HOMEVBN, and write the
++       primary last: until it is written VMS still sees one consistent
++       (old) label, and running this again finishes the job. */
++    if (r.ok) {
++        for (i = 0; i < count; i++) {
++            memcpy(((ods2_home_t *) blocks[i])->volname, name, 12);
++            set_home_checksums(blocks[i]);
++            if (!ods2_validate_home((const ods2_home_t *) blocks[i]).ok) {
++                r = fail("internal error: a relabelled home block doesn't validate");
++                break;
++            }
++        }
++    }
++    for (i = 0; r.ok && i <= count; i++) {
++        unsigned k = (i < count) ? i : primary_index;
++        if (i < count && i == primary_index) continue;
++        r = ods2_write_block(vol, lbns[k], blocks[k]);
++    }
++    if (r.ok && fflush(vol->fp) != 0) r = fail("could not flush the home blocks");
++
++    /* Read every copy back. */
++    for (i = 0; r.ok && i < count; i++) {
++        uint8_t back[512];
++        if (fseek(vol->fp, (long) lbns[i] * 512, SEEK_SET) != 0 ||
++            fread(back, 1, 512, vol->fp) != 512 || memcmp(back, blocks[i], 512) != 0) {
++            r = fail("a home block copy didn't read back as written");
++        }
++    }
++    if (r.ok) {
++        memcpy(&vol->home, blocks[primary_index], 512);
++        if (copies_out) *copies_out = count;
++    }
++    free(blocks);
++    free(lbns);
++    return r;
++}
++
++ods2_result_t ods2_volume_space(ods2_volume_t *vol, uint64_t *total_blocks_out,
++                                 uint64_t *free_blocks_out)
++{
++    uint8_t bitmap_header[512], block[512];
++    ods2_extent_t extents[ODS2_MAX_EXTENTS];
++    int extent_count;
++    uint32_t volsize = 0, vbn = 1, cluster = vol->home.cluster, bitmap_blocks = 0;
++    uint64_t clusters = 0, free_clusters = 0, bit = 0;
++    int i;
++    ods2_result_t r;
++
++    r = ods2_read_header(vol, 2, bitmap_header); /* BITMAP.SYS */
++    if (!r.ok) return r;
++    r = ods2_decode_all_extents(vol, bitmap_header, extents, ODS2_MAX_EXTENTS, &extent_count);
++    if (!r.ok) return r;
++    if (extent_count <= 0 || cluster == 0) return fail("could not decode BITMAP.SYS");
++    for (i = 0; i < extent_count; i++) bitmap_blocks += extents[i].block_count;
++
++    /* VBN 1 is the storage control block (spec 5.2.1): SCB$L_VOLSIZE
++       at byte 4. The bits follow from VBN 2, one per cluster, set =
++       free (spec 5.2.2). */
++    for (i = 0; i < extent_count; i++) {
++        uint32_t b;
++        for (b = 0; b < extents[i].block_count; b++, vbn++) {
++            uint32_t k;
++            if (fseek(vol->fp, (long) (extents[i].lbn + b) * 512, SEEK_SET) != 0 ||
++                fread(block, 1, 512, vol->fp) != 512) {
++                return fail("could not read BITMAP.SYS");
++            }
++            if (vbn == 1) {
++                volsize = (uint32_t) block[4] | ((uint32_t) block[5] << 8) |
++                          ((uint32_t) block[6] << 16) | ((uint32_t) block[7] << 24);
++                clusters = ((uint64_t) volsize + cluster - 1) / cluster;
++                /* The bitmap (VBN 2 on) must have a bit for every
++                   cluster; an SCB that says otherwise isn't believed. */
++                if (volsize == 0 || bitmap_blocks < 2 ||
++                    clusters > (uint64_t) (bitmap_blocks - 1) * 4096u) {
++                    return fail("BITMAP.SYS's storage control block gives a volume "
++                                "size its bitmap doesn't cover");
++                }
++                *total_blocks_out = volsize;
++                continue;
++            }
++            for (k = 0; k < 4096 && bit < clusters; k++, bit++) {
++                if ((block[k / 8] >> (k % 8)) & 1u) free_clusters++;
++            }
++        }
++    }
++    if (vbn == 1) return fail("BITMAP.SYS is empty");
++    *free_blocks_out = free_clusters * cluster;
++    return ok();
++}
+diff --git a/tests/cli_volume_label_check.sh b/tests/cli_volume_label_check.sh
+new file mode 100644
+index 0000000..ac87c4a
+--- /dev/null
++++ b/tests/cli_volume_label_check.sh
+@@ -0,0 +1,159 @@
++#!/bin/sh
++# MIT License - Copyright (c) 2026 Allen Pomeroy (see LICENSE)
++#
++# cli_volume_label_check.sh - SET VOLUME/LABEL and SHOW VOLUME
++# (issue #13), on the real VMS-INITIALIZEd starter volume
++# (samples/empty_ods2_volume.dsk.gz): its eight home block copies (LBN
++# 1-5: the home block and cluster fillers; LBN 1032-1034: the backup
++# cluster) are all relabelled, each keeping its own HOMELBN/HOMEVBN,
++# with both checksums valid, and no other block changed. Labels that
++# aren't allowed, a damaged copy, a volume set member, and a volume
++# missing its backup home block are refused with exit status 1 and
++# the image left byte for byte as it was. Called by `make test`; run
++# from the project root.
++
++GZ=samples/empty_ods2_volume.dsk.gz
++DISK=samples/cli_label_disk.img
++ORIG=samples/cli_label_orig.img
++SYNTH=samples/synthetic_disk.img
++ODS2=./ods2
++TMP=samples/cli_label_tmp
++fails=0
++
++check() { # check <description> <expected> <actual>
++    if [ "$2" = "$3" ]; then
++        echo "PASS: $1"
++    else
++        echo "FAIL: $1"
++        echo "      expected: $2"
++        echo "      got:      $3"
++        fails=$((fails + 1))
++    fi
++}
++
++status() { "$@" >/dev/null 2>&1; echo $?; }
++same() { if cmp -s "$1" "$2"; then echo unchanged; else echo changed; fi; }
++
++# Checks every home block copy of <image>: prints "<label> ok" if all
++# eight carry that label, name their own LBN/VBN and have valid
++# checksums, and no block other than them differs from <original>.
++home_check() { # home_check <image> <original>
++    python3 -I - "$1" "$2" <<'EOF'
++import struct, sys
++img, orig = open(sys.argv[1], 'rb'), open(sys.argv[2], 'rb')
++copies = {1: 2, 2: 3, 3: 4, 4: 5, 5: 6, 1032: 7, 1033: 8, 1034: 9}  # LBN: VBN
++def csum(b, words): return sum(struct.unpack_from('<%dH' % words, b, 0)) & 0xffff
++labels = set()
++for lbn, vbn in copies.items():
++    img.seek(lbn * 512); b = img.read(512)
++    if struct.unpack_from('<I', b, 0)[0] != lbn or struct.unpack_from('<H', b, 16)[0] != vbn:
++        print('LBN %d names the wrong position' % lbn); sys.exit()
++    if struct.unpack_from('<H', b, 58)[0] != csum(b, 29) or \
++       struct.unpack_from('<H', b, 510)[0] != csum(b, 255):
++        print('LBN %d checksum bad' % lbn); sys.exit()
++    labels.add(b[472:484].decode('ascii'))
++changed = []
++img.seek(0); orig.seek(0); pos = 0
++while True:
++    x, y = img.read(1 << 20), orig.read(1 << 20)
++    if not x and not y: break
++    if x != y:
++        for i in range(0, max(len(x), len(y)), 512):
++            if x[i:i + 512] != y[i:i + 512]: changed.append(pos // 512 + i // 512)
++    pos += 1 << 20
++extra = [c for c in changed if c not in copies]
++if extra: print('other blocks changed: %s' % extra[:10]); sys.exit()
++print(' / '.join(sorted(labels)).rstrip() + ' ok')
++EOF
++}
++
++[ -f "$GZ" ] || { echo "FAIL: $GZ missing"; exit 1; }
++mkdir -p "$TMP"
++gunzip -c "$GZ" | dd of="$ORIG" bs=1M conv=sparse status=none
++cp --sparse=always "$ORIG" "$DISK"
++
++# --- SHOW VOLUME ---
++show=$($ODS2 $DISK 'SHOW VOLUME' 2>&1)
++check "SHOW VOLUME: label" "  Volume label:       TRANSFER" \
++    "$(echo "$show" | grep 'Volume label')"
++check "SHOW VOLUME: cluster size, maximum files, total blocks" \
++    "  Cluster size:       3|  Maximum files:      367618|  Total blocks:       2940951" \
++    "$(echo "$show" | grep -E 'Cluster size|Maximum files|Total blocks' | paste -sd'|' -)"
++check "SHOW VOLUME: not a volume set" "  Volume set:         none" \
++    "$(echo "$show" | grep 'Volume set')"
++check "SHOW VOLUME changes nothing" unchanged "$(same $DISK $ORIG)"
++
++# --- SET VOLUME/LABEL ---
++check "SET VOLUME/LABEL=itankits succeeds, uppercased" \
++    "%ODS2-I-RELABELED, volume label changed from TRANSFER to ITANKITS (8 home block copies)" \
++    "$($ODS2 $DISK 'SET VOLUME/LABEL=itankits' 2>&1)"
++check "...all 8 copies relabelled in place, checksums valid, nothing else touched" \
++    "ITANKITS ok" "$(home_check $DISK $ORIG)"
++check "...and SHOW VOLUME reports it" "  Volume label:       ITANKITS" \
++    "$($ODS2 $DISK 'SHOW VOL' 2>&1 | grep 'Volume label')"
++check "SET VOL /LABEL=... (abbreviated, qualifier as its own word), 12 characters" \
++    "%ODS2-I-RELABELED, volume label changed from ITANKITS to KITS_2026-\$1 (8 home block copies)" \
++    "$($ODS2 $DISK 'SET VOL /LABEL=KITS_2026-$1' 2>&1)"
++check "...all copies again" 'KITS_2026-$1 ok' "$(home_check $DISK $ORIG)"
++printf 'not much\n' > "$TMP/f.txt"
++check "the relabelled volume still takes files" "%ODS2-I-COPIED, 9 bytes to F.TXT;1" \
++    "$($ODS2 $DISK COPY $TMP/f.txt '[000000]F.TXT' 2>&1)"
++
++# --- refusals: exit 1, nothing written ---
++cp --sparse=always "$DISK" "$TMP/before.img"
++check "an empty label exits 1" 1 "$(status $ODS2 $DISK 'SET VOLUME/LABEL=')"
++check "a 13-character label exits 1" 1 "$(status $ODS2 $DISK 'SET VOLUME/LABEL=ABCDEFGHIJKLM')"
++check "a '.' in a label exits 1" 1 "$(status $ODS2 $DISK 'SET VOLUME/LABEL=KITS.1')"
++check "...saying which characters are allowed" \
++    "%ODS2-E-SETVOL, a volume label may contain only letters, digits, '\$', '_' and '-'" \
++    "$($ODS2 $DISK 'SET VOLUME/LABEL=KITS.1' 2>&1)"
++check "SET VOLUME without /LABEL exits 1" 1 "$(status $ODS2 $DISK 'SET VOLUME')"
++check "an unknown SET VOLUME qualifier exits 1" 1 "$(status $ODS2 $DISK 'SET VOLUME/OWNER=ME')"
++check "none of those changed the image" unchanged "$(same $DISK $TMP/before.img)"
++
++# A damaged copy: one byte of the backup cluster's middle block.
++cp --sparse=always "$DISK" "$TMP/damaged.img"
++printf 'X' | dd of="$TMP/damaged.img" bs=1 seek=$((1033 * 512 + 100)) conv=notrunc status=none
++cp --sparse=always "$TMP/damaged.img" "$TMP/damaged_before.img"
++check "a damaged home block copy is refused (exit 1)" 1 \
++    "$(status $ODS2 $TMP/damaged.img 'SET VOLUME/LABEL=OTHER')"
++check "...naming it" \
++    "%ODS2-E-SETVOL, the block at LBN 1033 (INDEXF.SYS VBN 8) isn't a valid copy of the home block - nothing changed; check the volume with ANALYZE/DISK on VMS" \
++    "$($ODS2 $TMP/damaged.img 'SET VOLUME/LABEL=OTHER' 2>&1)"
++check "...and nothing written" unchanged "$(same $TMP/damaged.img $TMP/damaged_before.img)"
++
++# A volume set member: a structure name in every copy, checksums fixed.
++cp --sparse=always "$DISK" "$TMP/volset.img"
++python3 -I - "$TMP/volset.img" <<'EOF'
++import struct, sys
++f = open(sys.argv[1], 'r+b')
++for lbn in (1, 2, 3, 4, 5, 1032, 1033, 1034):
++    f.seek(lbn * 512); b = bytearray(f.read(512))
++    b[460:472] = b'KITSET      '
++    struct.pack_into('<H', b, 58, sum(struct.unpack_from('<29H', b, 0)) & 0xffff)
++    struct.pack_into('<H', b, 510, sum(struct.unpack_from('<255H', b, 0)) & 0xffff)
++    f.seek(lbn * 512); f.write(b)
++EOF
++cp --sparse=always "$TMP/volset.img" "$TMP/volset_before.img"
++check "a volume set member is refused (exit 1)" 1 \
++    "$(status $ODS2 $TMP/volset.img 'SET VOLUME/LABEL=OTHER')"
++check "...and nothing written" unchanged "$(same $TMP/volset.img $TMP/volset_before.img)"
++check "SHOW VOLUME shows the set" "  Volume set:         KITSET, volume 0 of 0" \
++    "$($ODS2 $TMP/volset.img 'SHOW VOLUME' 2>&1 | grep 'Volume set')"
++
++# The synthetic disk has the home block cluster but not the backup
++# cluster's blocks (they were never extracted): refused, not half done.
++if [ -f "$SYNTH" ]; then
++    cp --sparse=always "$SYNTH" "$TMP/synth.img"
++    cp --sparse=always "$SYNTH" "$TMP/synth_before.img"
++    check "a volume whose backup home block cluster isn't valid is refused (exit 1)" 1 \
++        "$(status $ODS2 $TMP/synth.img 'SET VOLUME/LABEL=OTHER')"
++    check "...and nothing written" unchanged "$(same $TMP/synth.img $TMP/synth_before.img)"
++    # Its storage control block is a placeholder (all 0xFF): SHOW VOLUME
++    # says so rather than print a size its bitmap can't describe.
++    check "SHOW VOLUME doesn't believe an SCB its bitmap doesn't cover (exit 1)" 1 \
++        "$(status $ODS2 $TMP/synth.img 'SHOW VOLUME')"
++fi
++
++rm -rf "$TMP" "$DISK" "$ORIG"
++[ "$fails" -eq 0 ] || { echo "$fails CLI volume label check(s) failed"; exit 1; }
+diff --git a/tools/ods2.c b/tools/ods2.c
+index 9a97ea2..561ad8b 100644
+--- a/tools/ods2.c
++++ b/tools/ods2.c
+@@ -67,6 +67,10 @@
+  *                                 empty directory
+  *   SET DEFAULT path              set the current default directory
+  *   SHOW DEFAULT                  show the current default directory
++ *   SET VOLUME/LABEL=name         relabel the volume: every home block
++ *                                 copy, checksums recomputed
++ *   SHOW VOLUME                   label, owner, cluster size, maximum
++ *                                 files, total and free blocks
+  *   HELP                          show this command list
+  *   EXIT / QUIT                   leave the interactive shell
+  *
+@@ -1005,6 +1009,131 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
+     }
+ }
+ 
++/* "VOLUME", abbreviated to at least "VOL", with any qualifiers after
++   it ("VOLUME/LABEL=X"). */
++static bool is_volume_word(const char *token)
++{
++    const char *slash = strchr(token, '/');
++    size_t len = slash ? (size_t) (slash - token) : strlen(token);
++    return keyword(token, len, "VOLUME", 3);
++}
++
++/* A 12-byte, space-padded name field, without its padding. */
++static void print_name(const char *what, const char *field)
++{
++    int len = 12;
++    while (len > 0 && (field[len - 1] == ' ' || field[len - 1] == '\0')) len--;
++    printf("  %-20s%.*s\n", what, len, field);
++}
++
++/* SET VOLUME/LABEL=name (issue #13), as on VMS; the qualifier may also
++   come as a separate word ("SET VOLUME /LABEL=name"). */
++static void cmd_set_volume(ods2_volume_t *vol, char **tokens, int n)
++{
++    const char *label = NULL;
++    int i;
++
++    for (i = 1; i < n; i++) {
++        const char *q = (i == 1) ? strchr(tokens[1], '/') : tokens[i];
++        while (q != NULL && *q == '/') {
++            const char *name = ++q, *value = NULL;
++            size_t name_len;
++            while (*q && *q != '=' && *q != '/') q++;
++            name_len = (size_t) (q - name);
++            if (*q == '=') {
++                value = ++q;
++                while (*q && *q != '/') q++;
++            }
++            if (!keyword(name, name_len, "LABEL", 3)) {
++                report_error("%%ODS2-E-IVQUAL, unrecognized qualifier /%.*s - SET VOLUME "
++                             "takes /LABEL=name\n", (int) name_len, name);
++                return;
++            }
++            if (value == NULL || value == q) {
++                report_error("%%ODS2-E-VALREQ, /LABEL needs a value, e.g. "
++                             "SET VOLUME/LABEL=ITANKITS\n");
++                return;
++            }
++            {
++                static char buf[64];
++                size_t len = (size_t) (q - value);
++                if (len >= sizeof(buf)) len = sizeof(buf) - 1;
++                memcpy(buf, value, len);
++                buf[len] = '\0';
++                label = buf;
++            }
++        }
++        if (i > 1 && (tokens[i][0] != '/')) {
++            report_error("%%ODS2-E-MAXPARM, SET VOLUME takes no parameters here - the "
++                         "volume is the disk image (unexpected \"%s\")\n", tokens[i]);
++            return;
++        }
++    }
++    if (label == NULL) {
++        report_error("%%ODS2-E-NOPARM, usage: SET VOLUME/LABEL=name\n");
++        return;
++    }
++    {
++        unsigned copies = 0;
++        char old[13];
++        ods2_result_t r;
++        memcpy(old, vol->home.volname, 12);
++        old[12] = '\0';
++        r = ods2_set_volume_label(vol, label, &copies);
++        if (!r.ok) {
++            report_error("%%ODS2-E-SETVOL, %s\n", r.problem);
++            return;
++        }
++        {
++            int len = 12;
++            while (len > 0 && old[len - 1] == ' ') len--;
++            old[len] = '\0';
++        }
++        {
++            int len = 12;
++            while (len > 0 && vol->home.volname[len - 1] == ' ') len--;
++            printf("%%ODS2-I-RELABELED, volume label changed from %s to %.*s "
++                   "(%u home block copies)\n", old, len, vol->home.volname, copies);
++        }
++    }
++}
++
++/* SHOW VOLUME (issue #13): the home block's identification, and space. */
++static void cmd_show_volume(ods2_volume_t *vol)
++{
++    const ods2_home_t *h = &vol->home;
++    uint64_t total = 0, free_blocks = 0;
++    ods2_result_t r = ods2_volume_space(vol, &total, &free_blocks);
++    bool in_set = false;
++    int i;
++
++    for (i = 0; i < 12; i++) {
++        if (h->strucname[i] != ' ' && h->strucname[i] != '\0') in_set = true;
++    }
++    print_name("Volume label:", h->volname);
++    print_name("Owner name:", h->ownername);
++    print_name("Format:", h->format);
++    printf("  %-20sODS-%u, version %u\n", "Structure level:", h->struclev >> 8,
++           h->struclev & 0xffu);
++    printf("  %-20s%u\n", "Cluster size:", h->cluster);
++    printf("  %-20s%u\n", "Maximum files:", (unsigned) h->maxfiles);
++    printf("  %-20s[%o,%o]\n", "Volume owner UIC:", h->volowner_uic[1], h->volowner_uic[0]);
++    if (in_set || h->rvn != 0) {
++        int len = 12;
++        while (len > 0 && (h->strucname[len - 1] == ' ' || h->strucname[len - 1] == '\0')) len--;
++        printf("  %-20s%.*s, volume %u of %u\n", "Volume set:", len, h->strucname,
++               h->rvn, h->setcount);
++    } else {
++        printf("  %-20snone\n", "Volume set:");
++    }
++    if (r.ok) {
++        printf("  %-20s%llu\n", "Total blocks:", (unsigned long long) total);
++        printf("  %-20s%llu\n", "Free blocks:", (unsigned long long) free_blocks);
++    } else {
++        report_error("%%ODS2-E-READERR, could not count free space: %s\n", r.problem);
++    }
++}
++
+ static bool stdout_sink(void *ctx, const uint8_t *data, size_t n)
+ {
+     (void) ctx;
+@@ -1153,6 +1282,8 @@ static void print_help(void)
+            "  DELETE path                delete a file (one version) or empty directory\n"
+            "  SET DEFAULT path           set the current default directory\n"
+            "  SHOW DEFAULT               show the current default directory\n"
++           "  SET VOLUME/LABEL=name      relabel the volume (all home block copies)\n"
++           "  SHOW VOLUME                label, owner, cluster size, files, free space\n"
+            "  HELP                       show this command list\n"
+            "  EXIT / QUIT                leave the interactive shell\n"
+            "\n"
+@@ -1211,6 +1342,14 @@ static bool execute_line(ods2_volume_t *vol, char *line)
+         print_help();
+         return true;
+     }
++    if (matches(tokens[0], "SET") && n > 1 && is_volume_word(tokens[1])) {
++        cmd_set_volume(vol, tokens, n);
++        return true;
++    }
++    if (matches(tokens[0], "SHOW") && n > 1 && is_volume_word(tokens[1])) {
++        cmd_show_volume(vol);
++        return true;
++    }
+     if (matches(tokens[0], "SET") && n > 1 &&
+         (matches(tokens[1], "DEFAULT") || matches(tokens[1], "DEF"))) {
+         ods2_parsed_path_t p;
+-- 
+2.43.0

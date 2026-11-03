@@ -250,6 +250,17 @@ ods2_result_t ods2_allocate_extent(ods2_volume_t *vol, unsigned max_blocks,
  */
 ods2_result_t ods2_free_blocks(ods2_volume_t *vol, uint32_t lbn, unsigned block_count);
 
+/* Appends one extent (`block_count` blocks at `lbn`) to INDEXF.SYS's
+ * own header (file 1) in memory: encodes it as the smallest retrieval
+ * pointer that fits - Format 1, or Format 2/3 above LBN 4,194,303 -
+ * after the pointers already in use, and raises HIBLK (and HIGHWATER,
+ * when set) by the same count. Writes nothing to disk and takes no
+ * blocks; the caller has allocated them and writes the header. Fails,
+ * changing nothing, when the header's map area has no room left for
+ * the pointer. Used when INDEXF.SYS grows to hold more headers.
+ */
+ods2_result_t ods2_indexf_map_extent(uint8_t *indexf_header, uint32_t lbn, unsigned block_count);
+
 /* Creates a new, empty subdirectory named `name` (e.g. "NETLIB020",
  * without ".DIR" - that's appended internally, matching VMS
  * convention) within the directory described by `parent_header`.
@@ -296,7 +307,8 @@ ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,
    Record formats (FAT$B_RTYPE, sequential organization): */
 #define ODS2_RFM_UDF   0 /* FAB$C_UDF: undefined - a stream of bytes */
 #define ODS2_RFM_FIX   1 /* FAB$C_FIX: fixed-length records */
-#define ODS2_RFM_VAR   2 /* FAB$C_VAR: variable-length (not importable) */
+#define ODS2_RFM_VAR   2 /* FAB$C_VAR: variable-length (only as converted
+                            records - see ods2_text_var.h) */
 #define ODS2_RFM_VFC   3 /* FAB$C_VFC: variable with control (not importable) */
 #define ODS2_RFM_STM   4 /* FAB$C_STM: stream, CR-LF terminated */
 #define ODS2_RFM_STMLF 5 /* FAB$C_STMLF: stream, LF terminated */
@@ -329,6 +341,15 @@ typedef struct {
  *    carriage control, are refused. */
 const char *ods2_check_record_attrs(const ods2_record_attrs_t *attrs, size_t content_len);
 
+/* Checks `attrs` for a new file whose `content_len` bytes are already
+ * variable-length records (issue #15). Returns NULL if acceptable,
+ * else why not: the format must be VAR; the longest record (RSIZE) at
+ * most 32767; MRS 0 (no limit, as VMS FTP leaves it) or at least the
+ * longest record; the content a whole number of words; not RAT:BLK
+ * (converted records run on across blocks, which BLK forbids); at most
+ * one carriage control; no unknown RAT bits. */
+const char *ods2_check_var_record_attrs(const ods2_record_attrs_t *attrs, size_t content_len);
+
 /* ods2_create_file() with chosen record attributes, checked first by
  * ods2_check_record_attrs() - a file whose attributes don't fit its
  * content is refused, not created. ods2_create_file(..., rtype, ...)
@@ -338,6 +359,48 @@ ods2_result_t ods2_create_file_attrs(ods2_volume_t *vol, const uint8_t *parent_h
                                       const char *name, const uint8_t *content,
                                       size_t content_len, const ods2_record_attrs_t *attrs,
                                       ods2_fid_t *new_fid_out);
+
+/* Content for a new file, read in order rather than held in memory
+ * (issue #16): `length` bytes in all, known before anything is
+ * allocated, delivered by `read`, which fills exactly `n` bytes of
+ * `buf` with the next part of the content and returns true, or returns
+ * false if it can't (a read error, or a source shorter than `length`).
+ * `read` is called with chunks of at most ODS2_STREAM_CHUNK bytes, in
+ * order, `length` bytes in total. `problem`, if `read` sets it, says
+ * why it failed; otherwise the failure is reported generically. */
+#define ODS2_STREAM_CHUNK (1u << 20)
+
+typedef struct {
+    size_t length;
+    bool (*read)(void *ctx, uint8_t *buf, size_t n);
+    void *ctx;
+    const char *problem;
+    /* true when the content is already RMS variable-length records,
+       count words included (ods2_text_var.h makes them from host
+       text): RFM:VAR is then accepted, and checked by
+       ods2_check_var_record_attrs() instead. */
+    bool var_records;
+} ods2_content_source_t;
+
+/* ods2_create_file_attrs() with the content taken from `src` a chunk
+ * at a time, so memory use stays the same whatever the file's size.
+ * Everything is allocated (from src->length) before the first read;
+ * if `src` fails part way, everything is given back and no file is
+ * created. */
+ods2_result_t ods2_create_file_source(ods2_volume_t *vol, const uint8_t *parent_header,
+                                       const char *name, ods2_content_source_t *src,
+                                       const ods2_record_attrs_t *attrs,
+                                       ods2_fid_t *new_fid_out);
+
+/* Reads a file's logical content (as ods2_read_file()) and hands it to
+ * `sink` in order, a chunk of at most ODS2_STREAM_CHUNK bytes at a
+ * time, so memory use stays the same whatever the file's size. If
+ * `sink` returns false the read stops and fails with *sink_failed_out
+ * (if non-NULL) set true, telling that apart from a volume read error.
+ * *bytes_out (if non-NULL) is how much reached the sink. */
+ods2_result_t ods2_read_file_stream(ods2_volume_t *vol, const uint8_t *header,
+                                     bool (*sink)(void *ctx, const uint8_t *data, size_t n),
+                                     void *ctx, size_t *bytes_out, bool *sink_failed_out);
 
 /* Inserts (name, version, fid) into the directory whose header is at
  * `dir_file_number`, trying each of its existing content blocks
@@ -381,5 +444,39 @@ ods2_result_t ods2_delete(ods2_volume_t *vol, unsigned dir_file_number, const ch
  */
 ods2_result_t ods2_delete_version(ods2_volume_t *vol, unsigned dir_file_number,
                                   const char *name, int version, uint16_t *version_out);
+
+
+/* --- the volume label (issue #13) --- */
+
+/* Checks `label` as a volume label and writes it to `out` in its
+ * on-disk form: uppercased and space-padded to 12 bytes (HM2$T_VOLNAME,
+ * spec 5.1.9.36). Returns NULL if acceptable, else why not: it may not
+ * be empty (spec 2.1) or over 12 characters, and - keeping to what the
+ * spec recommends and what a DISK$label logical name can hold - only
+ * letters, digits, '$', '_' and '-' are allowed. */
+const char *ods2_make_volume_label(const char *label, char out[12]);
+
+/* Relabels the volume, as VMS's SET VOLUME/LABEL does, for a volume
+ * VMS does not have mounted. Every copy of the home block is changed:
+ * the home block and its cluster fillers (INDEXF.SYS VBNs 2 to 2v) and
+ * the backup home block's cluster (VBNs 2v+1 to 3v), v the cluster
+ * factor (spec 5.1.3-5.1.4). Each keeps its own HOMELBN and HOMEVBN,
+ * and both its checksums are recomputed.
+ *
+ * Nothing is written unless every one of those blocks is first found
+ * to be a valid home block naming its own position and otherwise
+ * identical to the primary, with the primary and backup among them.
+ * Refused for a volume in a volume set (a structure name, a relative
+ * volume number or a set count), since one member can't be relabelled
+ * alone. The primary is written last and every copy read back.
+ * *copies_out (if non-NULL) is how many blocks were rewritten. */
+ods2_result_t ods2_set_volume_label(ods2_volume_t *vol, const char *label,
+                                     unsigned *copies_out);
+
+/* The volume's size in blocks (SCB$L_VOLSIZE, from BITMAP.SYS's
+ * storage control block) and how many of them are free (free clusters
+ * in the storage bitmap times the cluster factor). Read only. */
+ods2_result_t ods2_volume_space(ods2_volume_t *vol, uint64_t *total_blocks_out,
+                                 uint64_t *free_blocks_out);
 
 #endif /* ODS2_VOLUME_H */

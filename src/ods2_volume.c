@@ -619,47 +619,102 @@ size_t ods2_file_allocated_bytes(const uint8_t *header)
     return (size_t) ods2_word_swap32(core->recattr.hiblk) * 512u;
 }
 
-ods2_result_t ods2_read_file(ods2_volume_t *vol, const uint8_t *header,
-                              uint8_t *buf_out, size_t buf_size, size_t *bytes_read_out)
+ods2_result_t ods2_read_file_stream(ods2_volume_t *vol, const uint8_t *header,
+                                     bool (*sink)(void *ctx, const uint8_t *data, size_t n),
+                                     void *ctx, size_t *bytes_out, bool *sink_failed_out)
 {
     size_t content_len = ods2_file_content_length(header);
     size_t allocated = ods2_file_allocated_bytes(header);
     size_t written = 0;
+    ods2_result_t r = ok();
 
+    if (bytes_out) *bytes_out = 0;
+    if (sink_failed_out) *sink_failed_out = false;
     if (content_len > allocated) {
         /* Corrupt header: the EOF mark claims more data than the file
            has blocks. Say so, rather than fail later on an unmapped
            VBN (or have a caller size a buffer from a bogus length). */
         return fail("file's end-of-file mark lies beyond its allocated blocks");
     }
-    if (content_len > buf_size) {
-        return fail("output buffer too small for file content");
-    }
 
-    /* Decoded once, then read a whole extent at a time - a large file
-       is hundreds of thousands of blocks, too many to look up and
-       read one by one. */
+    /* Decoded once, then read an extent at a time in chunks of at
+       most ODS2_STREAM_CHUNK - a large file is hundreds of thousands
+       of blocks, too many to look up one by one, and too much to hold
+       in memory at once (issue #16). */
     if (content_len > 0) {
         ods2_extent_t extents[ODS2_MAX_EXTENTS];
+        size_t chunk_cap = content_len < ODS2_STREAM_CHUNK ? content_len : ODS2_STREAM_CHUNK;
+        uint8_t *chunk;
         int n, i;
-        ods2_result_t r = ods2_decode_all_extents(vol, header, extents, ODS2_MAX_EXTENTS, &n);
+
+        r = ods2_decode_all_extents(vol, header, extents, ODS2_MAX_EXTENTS, &n);
         if (!r.ok) return r;
-        for (i = 0; i < n && written < content_len; i++) {
+        chunk = malloc(chunk_cap);
+        if (chunk == NULL) return fail("could not allocate a read buffer");
+        for (i = 0; i < n && written < content_len && r.ok; i++) {
             size_t want = content_len - written;
             size_t run = (size_t) extents[i].block_count * 512u;
             if (want > run) want = run;
-            if (fseek(vol->fp, (long) extents[i].lbn * 512, SEEK_SET) != 0 ||
-                fread(buf_out + written, 1, want, vol->fp) != want) {
-                return fail("could not read file content block");
+            if (fseek(vol->fp, (long) extents[i].lbn * 512, SEEK_SET) != 0) {
+                r = fail("could not read file content block");
+                break;
             }
-            written += want;
+            while (want > 0) {
+                size_t piece = want < chunk_cap ? want : chunk_cap;
+                if (fread(chunk, 1, piece, vol->fp) != piece) {
+                    r = fail("could not read file content block");
+                    break;
+                }
+                if (!sink(ctx, chunk, piece)) {
+                    if (sink_failed_out) *sink_failed_out = true;
+                    r = fail("could not deliver file content to its destination");
+                    break;
+                }
+                written += piece;
+                want -= piece;
+            }
         }
-        if (written < content_len) {
-            return fail("requested VBN is not covered by this file's extents");
+        free(chunk);
+        if (r.ok && written < content_len) {
+            r = fail("requested VBN is not covered by this file's extents");
         }
     }
+    if (bytes_out) *bytes_out = written;
+    return r;
+}
 
-    *bytes_read_out = written;
+typedef struct {
+    uint8_t *buf;
+    size_t size, used;
+} memory_sink_t;
+
+static bool memory_sink(void *ctx_, const uint8_t *data, size_t n)
+{
+    memory_sink_t *ctx = (memory_sink_t *) ctx_;
+    if (n > ctx->size - ctx->used) return false;
+    memcpy(ctx->buf + ctx->used, data, n);
+    ctx->used += n;
+    return true;
+}
+
+ods2_result_t ods2_read_file(ods2_volume_t *vol, const uint8_t *header,
+                              uint8_t *buf_out, size_t buf_size, size_t *bytes_read_out)
+{
+    memory_sink_t ctx;
+    ods2_result_t r;
+
+    if (ods2_file_content_length(header) > ods2_file_allocated_bytes(header)) {
+        return fail("file's end-of-file mark lies beyond its allocated blocks");
+    }
+    if (ods2_file_content_length(header) > buf_size) {
+        return fail("output buffer too small for file content");
+    }
+    ctx.buf = buf_out;
+    ctx.size = buf_size;
+    ctx.used = 0;
+    r = ods2_read_file_stream(vol, header, memory_sink, &ctx, NULL, NULL);
+    if (!r.ok) return r;
+    *bytes_read_out = ctx.used;
     return ok();
 }
 
@@ -906,22 +961,58 @@ static ods2_result_t write_indexf_header(ods2_volume_t *vol, uint8_t *indexf_hea
     return ok();
 }
 
-/* Allocates more blocks to INDEXF.SYS and maps them, so more headers
-   fit. Up to 256 blocks at a time (one Format 1 retrieval pointer);
-   falls back to a single cluster if no run that long is free. */
-static ods2_result_t extend_indexf(ods2_volume_t *vol, uint8_t *indexf_header)
+ods2_result_t ods2_indexf_map_extent(uint8_t *indexf_header, uint32_t lbn, unsigned block_count)
 {
     ods2_head_core_t *core = (ods2_head_core_t *) indexf_header;
     size_t map_offset = (size_t) core->mpoffset * 2;
     size_t map_bytes = (size_t) core->map_inuse * 2;
     size_t map_end = (size_t) core->acoffset * 2;
+    size_t size = ods2_retrieval_pointer_size(lbn, block_count);
+    uint32_t hiblk;
+
+    if (size == 0) {
+        return fail("internal error: INDEXF.SYS extent cannot be described by "
+                    "any retrieval pointer format");
+    }
+    if (map_end > 510 || map_offset + map_bytes + size > map_end) {
+        return fail("INDEXF.SYS's header has no room for another extent "
+                    "(would need an extension header - not yet implemented)");
+    }
+    if (ods2_encode_retrieval_pointer(indexf_header + map_offset + map_bytes,
+                                      lbn, block_count) != size) {
+        return fail("internal error: could not encode an INDEXF.SYS retrieval pointer");
+    }
+    core->map_inuse = (uint8_t) ((map_bytes + size) / 2);
+    hiblk = ods2_word_swap32(core->recattr.hiblk) + block_count;
+    core->recattr.hiblk = ods2_word_swap32(hiblk);
+    /* INITIALIZE leaves FH2$L_HIGHWATER at HIBLK + 1 on INDEXF.SYS;
+       keep that relationship. */
+    if (core->highwater != 0) core->highwater = hiblk + 1;
+    return ok();
+}
+
+/* Allocates more blocks to INDEXF.SYS and maps them, so more headers
+   fit. Up to 256 blocks at a time; falls back to a single cluster if
+   no run that long is free. The new piece is mapped with the smallest
+   retrieval pointer that describes it - Format 1 below LBN 4,194,303,
+   Format 2 beyond (issue #14) - so INDEXF.SYS can grow anywhere on a
+   volume of any size. */
+static ods2_result_t extend_indexf(ods2_volume_t *vol, uint8_t *indexf_header)
+{
+    const ods2_head_core_t *core = (const ods2_head_core_t *) indexf_header;
+    size_t map_offset = (size_t) core->mpoffset * 2;
+    size_t map_bytes = (size_t) core->map_inuse * 2;
+    size_t map_end = (size_t) core->acoffset * 2;
     unsigned want = (256u / vol->home.cluster) * vol->home.cluster;
-    uint32_t lbn, hiblk;
+    uint32_t lbn;
     unsigned got;
     ods2_result_t r;
 
     if (want == 0) want = vol->home.cluster;
-    if (map_offset + map_bytes + 4 > map_end || map_end > 510) {
+    /* Check first, before taking any blocks, that the smallest pointer
+       (4 bytes) could still fit; the exact size is checked after
+       allocation, once the LBN is known. */
+    if (map_end > 510 || map_offset + map_bytes + 4 > map_end) {
         return fail("INDEXF.SYS's header has no room for another extent "
                     "(would need an extension header - not yet implemented)");
     }
@@ -931,21 +1022,13 @@ static ods2_result_t extend_indexf(ods2_volume_t *vol, uint8_t *indexf_header)
         r = ods2_allocate_blocks(vol, want, &lbn, &got);
     }
     if (!r.ok) return r;
-    if (!ods2_encode_retrieval_pointer_format1(indexf_header + map_offset + map_bytes,
-                                               lbn, got)) {
+    r = ods2_indexf_map_extent(indexf_header, lbn, got);
+    if (!r.ok) {
         /* ods2_allocate_blocks() has already marked them used; give
            them back rather than leak them. */
         ods2_free_blocks(vol, lbn, got);
-        return fail("cannot map more INDEXF.SYS blocks: the free space found lies "
-                    "beyond LBN 4194303, which needs a Format 2 retrieval pointer "
-                    "(not yet implemented)");
+        return r;
     }
-    core->map_inuse = (uint8_t) ((map_bytes + 4) / 2);
-    hiblk = ods2_word_swap32(core->recattr.hiblk) + got;
-    core->recattr.hiblk = ods2_word_swap32(hiblk);
-    /* INITIALIZE leaves FH2$L_HIGHWATER at HIBLK + 1 on INDEXF.SYS;
-       keep that relationship. */
-    if (core->highwater != 0) core->highwater = hiblk + 1;
     return ok();
 }
 
@@ -1284,50 +1367,85 @@ ods2_result_t ods2_create_directory(ods2_volume_t *vol, const uint8_t *parent_he
     return ok();
 }
 
-/* Writes `content` (`content_len` bytes) into the blocks described by
-   `extents`, in order, zero-filling the rest of the last block and any
-   further allocated blocks. Writes whole runs at a time rather than a
-   block per call - a large file is hundreds of thousands of blocks. */
+/* Writes src->length bytes, read from `src` a chunk at a time, into
+   the blocks described by `extents`, in order, zero-filling the rest
+   of the last block and any further allocated blocks. Seeks once per
+   extent and writes it a chunk at a time, so memory use stays at one
+   chunk however large the file (issue #16). */
 static ods2_result_t write_extents(ods2_volume_t *vol, const ods2_extent_t *extents,
-                                   int extent_count, const uint8_t *content,
-                                   size_t content_len)
+                                   int extent_count, ods2_content_source_t *src)
 {
     static const uint8_t zeros[65536];
     size_t offset = 0;
+    size_t content_len = src->length;
+    size_t chunk_cap = content_len < ODS2_STREAM_CHUNK ? content_len : ODS2_STREAM_CHUNK;
+    uint8_t *chunk = NULL;
+    ods2_result_t r = ok();
     int i;
 
     if (!vol->writable) {
         return fail("volume was not mounted for write (use ods2_mount_write)");
     }
-    for (i = 0; i < extent_count; i++) {
+    if (chunk_cap > 0) {
+        chunk = malloc(chunk_cap);
+        if (chunk == NULL) return fail("could not allocate a write buffer");
+    }
+    for (i = 0; i < extent_count && r.ok; i++) {
         size_t run_bytes = (size_t) extents[i].block_count * 512u;
         size_t data = (offset < content_len) ? content_len - offset : 0;
 
         if (data > run_bytes) data = run_bytes;
         if (fseek(vol->fp, (long) extents[i].lbn * 512, SEEK_SET) != 0) {
-            return fail("could not seek to file content blocks");
-        }
-        if (data > 0 && fwrite(content + offset, 1, data, vol->fp) != data) {
-            return fail("could not write file content blocks");
+            r = fail("could not seek to file content blocks");
+            break;
         }
         run_bytes -= data;
-        while (run_bytes > 0) {
+        while (data > 0) {
+            size_t piece = data < chunk_cap ? data : chunk_cap;
+            if (!src->read(src->ctx, chunk, piece)) {
+                r = fail(src->problem != NULL ? src->problem
+                                              : "could not read the file's content");
+                break;
+            }
+            if (fwrite(chunk, 1, piece, vol->fp) != piece) {
+                r = fail("could not write file content blocks");
+                break;
+            }
+            data -= piece;
+            offset += piece;
+        }
+        while (r.ok && run_bytes > 0) {
             size_t n = (run_bytes < sizeof(zeros)) ? run_bytes : sizeof(zeros);
             if (fwrite(zeros, 1, n, vol->fp) != n) {
-                return fail("could not write file content blocks");
+                r = fail("could not write file content blocks");
+                break;
             }
             run_bytes -= n;
         }
-        offset += data;
     }
-    if (fflush(vol->fp) != 0) {
-        return fail("could not flush written file content");
+    free(chunk);
+    if (r.ok && fflush(vol->fp) != 0) {
+        r = fail("could not flush written file content");
     }
-    return ok();
+    return r;
+}
+
+/* An ods2_content_source_t over a buffer already in memory. */
+typedef struct {
+    const uint8_t *data;
+    size_t pos;
+} memory_source_t;
+
+static bool memory_source_read(void *ctx_, uint8_t *buf, size_t n)
+{
+    memory_source_t *ctx = (memory_source_t *) ctx_;
+    memcpy(buf, ctx->data + ctx->pos, n);
+    ctx->pos += n;
+    return true;
 }
 
 static ods2_result_t create_file(ods2_volume_t *vol, const uint8_t *parent_header,
-                                 const char *name, const uint8_t *content, size_t content_len,
+                                 const char *name, ods2_content_source_t *src,
                                  const ods2_record_attrs_t *attrs, ods2_fid_t *new_fid_out);
 
 const char *ods2_check_record_attrs(const ods2_record_attrs_t *attrs, size_t content_len)
@@ -1378,16 +1496,63 @@ const char *ods2_check_record_attrs(const ods2_record_attrs_t *attrs, size_t con
     return NULL;
 }
 
+const char *ods2_check_var_record_attrs(const ods2_record_attrs_t *attrs, size_t content_len)
+{
+    unsigned cc = attrs->rattrib & (ODS2_RAT_FTN | ODS2_RAT_CR | ODS2_RAT_PRN);
+
+    if (attrs->rtype != ODS2_RFM_VAR) {
+        return "converted records are variable-length: the format must be VAR";
+    }
+    if (attrs->rsize > 32767) {
+        return "a record is too long (at most 32767 bytes)";
+    }
+    if (attrs->maxrec != 0 && attrs->maxrec < attrs->rsize) {
+        return "a record is longer than the maximum record size (MRS) given";
+    }
+    if (content_len % 2 != 0) {
+        return "internal error: variable-length records must fill whole words";
+    }
+    if (attrs->rattrib & ODS2_RAT_BLK) {
+        return "RAT:BLK isn't supported with converted records: they run on "
+               "across block boundaries, which BLK forbids";
+    }
+    if (attrs->rattrib & ~0x0fu) {
+        return "unknown record attribute bits";
+    }
+    if (cc != 0 && (cc & (cc - 1)) != 0) {
+        return "only one carriage control (FTN, CR or PRN) can be given";
+    }
+    return NULL;
+}
+
 ods2_result_t ods2_create_file_attrs(ods2_volume_t *vol, const uint8_t *parent_header,
                                       const char *name, const uint8_t *content,
                                       size_t content_len, const ods2_record_attrs_t *attrs,
                                       ods2_fid_t *new_fid_out)
 {
-    const char *why = ods2_check_record_attrs(attrs, content_len);
+    memory_source_t ctx;
+    ods2_content_source_t src;
+    ctx.data = content;
+    ctx.pos = 0;
+    src.length = content_len;
+    src.read = memory_source_read;
+    src.ctx = &ctx;
+    src.problem = NULL;
+    src.var_records = false;
+    return ods2_create_file_source(vol, parent_header, name, &src, attrs, new_fid_out);
+}
+
+ods2_result_t ods2_create_file_source(ods2_volume_t *vol, const uint8_t *parent_header,
+                                       const char *name, ods2_content_source_t *src,
+                                       const ods2_record_attrs_t *attrs,
+                                       ods2_fid_t *new_fid_out)
+{
+    const char *why = src->var_records ? ods2_check_var_record_attrs(attrs, src->length)
+                                       : ods2_check_record_attrs(attrs, src->length);
     if (why != NULL) {
         return fail(why);
     }
-    return create_file(vol, parent_header, name, content, content_len, attrs, new_fid_out);
+    return create_file(vol, parent_header, name, src, attrs, new_fid_out);
 }
 
 ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,
@@ -1399,13 +1564,25 @@ ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,
     attrs.rattrib = 0;
     attrs.rsize = 512;
     attrs.maxrec = 512;
-    return create_file(vol, parent_header, name, content, content_len, &attrs, new_fid_out);
+    {
+        memory_source_t ctx;
+        ods2_content_source_t src;
+        ctx.data = content;
+        ctx.pos = 0;
+        src.length = content_len;
+        src.read = memory_source_read;
+        src.ctx = &ctx;
+        src.problem = NULL;
+        src.var_records = false;
+        return create_file(vol, parent_header, name, &src, &attrs, new_fid_out);
+    }
 }
 
 static ods2_result_t create_file(ods2_volume_t *vol, const uint8_t *parent_header,
-                                 const char *name, const uint8_t *content, size_t content_len,
+                                 const char *name, ods2_content_source_t *src,
                                  const ods2_record_attrs_t *attrs, ods2_fid_t *new_fid_out)
 {
+    size_t content_len = src->length;
     const ods2_head_core_t *parent_core = (const ods2_head_core_t *) parent_header;
     ods2_fid_t existing;
     size_t blocks_needed;
@@ -1534,7 +1711,7 @@ static ods2_result_t create_file(ods2_volume_t *vol, const uint8_t *parent_heade
         numbered++;
     }
     /* The content goes down before any header refers to it. */
-    r = write_extents(vol, extents, extent_count, content, content_len);
+    r = write_extents(vol, extents, extent_count, src);
     if (!r.ok) goto undo;
 
     memset(&spec, 0, sizeof(spec));
@@ -1671,6 +1848,7 @@ static ods2_result_t store_directory(ods2_volume_t *vol, unsigned dir_file_numbe
         unsigned want = allocated * 2;
         uint32_t lbn;
         unsigned got;
+        size_t ptr_size;
         size_t map_start = (size_t) core->mpoffset * 2;
         size_t map_end = (size_t) core->acoffset * 2;
 
@@ -1686,19 +1864,21 @@ static ods2_result_t store_directory(ods2_volume_t *vol, unsigned dir_file_numbe
             r = ods2_allocate_blocks(vol, want, &lbn, &got);
         }
         if (!r.ok) return r;
-        if (lbn + got - 1 > 0x3fffffu || map_end > 510 || map_end < map_start + 4) {
+        /* Format 1 below LBN 4,194,303, Format 2 beyond it (issue #14):
+           the new area may lie anywhere on a large volume. */
+        ptr_size = ods2_retrieval_pointer_size(lbn, got);
+        if (ptr_size == 0 || map_end > 510 || map_end < map_start + ptr_size) {
             ods2_free_blocks(vol, lbn, got);
-            return fail("cannot map the directory's new area: it lies beyond LBN "
-                        "4194303, which needs a Format 2 retrieval pointer "
-                        "(not yet implemented)");
+            return fail("cannot map the directory's new area: no room in its "
+                        "header's map area for the retrieval pointer");
         }
         for (v = 0; v < got; v++) {
             r = ods2_write_block(vol, lbn + v, (v < used) ? blocks + (size_t) v * 512 : zero);
             if (!r.ok) return r;
         }
         memset(dir_header + map_start, 0, map_end - map_start);
-        ods2_encode_retrieval_pointer_format1(dir_header + map_start, lbn, got);
-        core->map_inuse = 2;
+        ods2_encode_retrieval_pointer(dir_header + map_start, lbn, got);
+        core->map_inuse = (uint8_t) (ptr_size / 2);
         core->recattr.hiblk = ods2_word_swap32(got);
         moved = true;
     } else {
@@ -2067,5 +2247,230 @@ ods2_result_t ods2_delete_version(ods2_volume_t *vol, unsigned dir_file_number,
     }
 
     if (version_out != NULL) *version_out = target_version;
+    return ok();
+}
+
+/* --- the volume label (issue #13) --- */
+
+const char *ods2_make_volume_label(const char *label, char out[12])
+{
+    size_t len = strlen(label), i;
+
+    if (len == 0) return "a volume label may not be empty";
+    if (len > 12) return "a volume label is at most 12 characters";
+    for (i = 0; i < len; i++) {
+        unsigned char c = (unsigned char) label[i];
+        if (!(isalnum(c) || c == '$' || c == '_' || c == '-')) {
+            return "a volume label may contain only letters, digits, '$', '_' and '-'";
+        }
+    }
+    for (i = 0; i < 12; i++) {
+        out[i] = (i < len) ? (char) toupper((unsigned char) label[i]) : ' ';
+    }
+    return NULL;
+}
+
+/* A 12-byte name field is blank: spaces (as the spec says) or NULs. */
+static bool name_is_blank(const char *field)
+{
+    int i;
+    for (i = 0; i < 12; i++) {
+        if (field[i] != ' ' && field[i] != '\0') return false;
+    }
+    return true;
+}
+
+static void set_home_checksums(uint8_t *raw)
+{
+    /* checksum1 first: checksum2's coverage includes it (see
+       ods2_validate.h). */
+    uint16_t c1 = ods2_checksum(raw, 29), c2;
+    raw[58] = (uint8_t) (c1 & 0xff);
+    raw[59] = (uint8_t) (c1 >> 8);
+    c2 = ods2_checksum(raw, 255);
+    raw[510] = (uint8_t) (c2 & 0xff);
+    raw[511] = (uint8_t) (c2 >> 8);
+}
+
+/* Is `block` the copy of `primary` that belongs at `lbn` / INDEXF.SYS
+   VBN `vbn`? A valid home block whose HOMELBN and HOMEVBN name its own
+   position, and otherwise identical to the primary: only those two
+   fields and the checksums differ between copies (as on every volume
+   VMS INITIALIZE made that has been examined). */
+static bool is_home_copy(const uint8_t *block, const uint8_t *primary, uint32_t lbn,
+                         uint32_t vbn)
+{
+    const ods2_home_t *h = (const ods2_home_t *) block;
+    size_t i;
+
+    if (!ods2_validate_home(h).ok) return false;
+    if (h->homelbn != lbn || h->homevbn != vbn) return false;
+    for (i = 0; i < 512; i++) {
+        bool own_field = i < 4 || i == 16 || i == 17 || i == 58 || i == 59 || i >= 510;
+        if (!own_field && block[i] != primary[i]) return false;
+    }
+    return true;
+}
+
+ods2_result_t ods2_set_volume_label(ods2_volume_t *vol, const char *label,
+                                     unsigned *copies_out)
+{
+    /* The home block and its cluster fillers are INDEXF.SYS VBNs 2 to
+       2v, the backup home block's cluster VBNs 2v+1 to 3v, where v is
+       the cluster factor (spec 5.1.3, 5.1.4); VBN 1 is the boot
+       block. Every one of them holds a copy of the home block. */
+    char name[12];
+    const char *why;
+    uint8_t primary[512];
+    uint8_t (*blocks)[512] = NULL;
+    uint32_t *lbns = NULL;
+    unsigned v = vol->home.cluster, count, i, primary_index = 0;
+    bool have_primary = false, have_backup = false;
+    ods2_result_t r = ok();
+
+    if (copies_out) *copies_out = 0;
+    if (!vol->writable) {
+        return fail("volume was not mounted for write (use ods2_mount_write)");
+    }
+    why = ods2_make_volume_label(label, name);
+    if (why != NULL) return fail(why);
+    if (!name_is_blank(vol->home.strucname) || vol->home.rvn != 0 || vol->home.setcount != 0) {
+        return fail("this volume is part of a volume set: relabelling one member "
+                    "alone isn't supported - relabel the set on VMS");
+    }
+    if (v == 0) return fail("home block has a cluster factor of 0");
+
+    memcpy(primary, &vol->home, 512);
+    count = 3u * v - 1u; /* VBNs 2 .. 3v */
+    blocks = malloc((size_t) count * 512u);
+    lbns = malloc((size_t) count * sizeof(*lbns));
+    if (blocks == NULL || lbns == NULL) {
+        free(blocks);
+        free(lbns);
+        return fail("could not allocate memory for the home block copies");
+    }
+
+    /* Read and check every copy first; write nothing unless all of
+       them are what they should be. */
+    for (i = 0; i < count && r.ok; i++) {
+        uint32_t vbn = i + 2, lbn;
+        if (!vbn_to_lbn(vol->indexf_extents, vol->indexf_extent_count, vbn, &lbn)) {
+            r = fail("INDEXF.SYS doesn't map all of the home block's clusters");
+            break;
+        }
+        lbns[i] = lbn;
+        if (fseek(vol->fp, (long) lbn * 512, SEEK_SET) != 0 ||
+            fread(blocks[i], 1, 512, vol->fp) != 512) {
+            r = fail("could not read a home block copy");
+            break;
+        }
+        if (!is_home_copy(blocks[i], primary, lbn, vbn)) {
+            static char msg[200];
+            snprintf(msg, sizeof msg, "the block at LBN %u (INDEXF.SYS VBN %u) isn't a "
+                     "valid copy of the home block - nothing changed; check the volume "
+                     "with ANALYZE/DISK on VMS", (unsigned) lbn, (unsigned) vbn);
+            r = fail(msg);
+            break;
+        }
+        if (lbn == vol->home.homelbn) {
+            have_primary = true;
+            primary_index = i;
+        }
+        if (lbn == vol->home.alhomelbn) have_backup = true;
+    }
+    if (r.ok && !have_primary) {
+        r = fail("the primary home block isn't among INDEXF.SYS's home block clusters");
+    }
+    if (r.ok && !have_backup) {
+        r = fail("the backup home block isn't among INDEXF.SYS's home block clusters");
+    }
+
+    /* Relabel each copy, keeping its own HOMELBN/HOMEVBN, and write the
+       primary last: until it is written VMS still sees one consistent
+       (old) label, and running this again finishes the job. */
+    if (r.ok) {
+        for (i = 0; i < count; i++) {
+            memcpy(((ods2_home_t *) blocks[i])->volname, name, 12);
+            set_home_checksums(blocks[i]);
+            if (!ods2_validate_home((const ods2_home_t *) blocks[i]).ok) {
+                r = fail("internal error: a relabelled home block doesn't validate");
+                break;
+            }
+        }
+    }
+    for (i = 0; r.ok && i <= count; i++) {
+        unsigned k = (i < count) ? i : primary_index;
+        if (i < count && i == primary_index) continue;
+        r = ods2_write_block(vol, lbns[k], blocks[k]);
+    }
+    if (r.ok && fflush(vol->fp) != 0) r = fail("could not flush the home blocks");
+
+    /* Read every copy back. */
+    for (i = 0; r.ok && i < count; i++) {
+        uint8_t back[512];
+        if (fseek(vol->fp, (long) lbns[i] * 512, SEEK_SET) != 0 ||
+            fread(back, 1, 512, vol->fp) != 512 || memcmp(back, blocks[i], 512) != 0) {
+            r = fail("a home block copy didn't read back as written");
+        }
+    }
+    if (r.ok) {
+        memcpy(&vol->home, blocks[primary_index], 512);
+        if (copies_out) *copies_out = count;
+    }
+    free(blocks);
+    free(lbns);
+    return r;
+}
+
+ods2_result_t ods2_volume_space(ods2_volume_t *vol, uint64_t *total_blocks_out,
+                                 uint64_t *free_blocks_out)
+{
+    uint8_t bitmap_header[512], block[512];
+    ods2_extent_t extents[ODS2_MAX_EXTENTS];
+    int extent_count;
+    uint32_t volsize = 0, vbn = 1, cluster = vol->home.cluster, bitmap_blocks = 0;
+    uint64_t clusters = 0, free_clusters = 0, bit = 0;
+    int i;
+    ods2_result_t r;
+
+    r = ods2_read_header(vol, 2, bitmap_header); /* BITMAP.SYS */
+    if (!r.ok) return r;
+    r = ods2_decode_all_extents(vol, bitmap_header, extents, ODS2_MAX_EXTENTS, &extent_count);
+    if (!r.ok) return r;
+    if (extent_count <= 0 || cluster == 0) return fail("could not decode BITMAP.SYS");
+    for (i = 0; i < extent_count; i++) bitmap_blocks += extents[i].block_count;
+
+    /* VBN 1 is the storage control block (spec 5.2.1): SCB$L_VOLSIZE
+       at byte 4. The bits follow from VBN 2, one per cluster, set =
+       free (spec 5.2.2). */
+    for (i = 0; i < extent_count; i++) {
+        uint32_t b;
+        for (b = 0; b < extents[i].block_count; b++, vbn++) {
+            uint32_t k;
+            if (fseek(vol->fp, (long) (extents[i].lbn + b) * 512, SEEK_SET) != 0 ||
+                fread(block, 1, 512, vol->fp) != 512) {
+                return fail("could not read BITMAP.SYS");
+            }
+            if (vbn == 1) {
+                volsize = (uint32_t) block[4] | ((uint32_t) block[5] << 8) |
+                          ((uint32_t) block[6] << 16) | ((uint32_t) block[7] << 24);
+                clusters = ((uint64_t) volsize + cluster - 1) / cluster;
+                /* The bitmap (VBN 2 on) must have a bit for every
+                   cluster; an SCB that says otherwise isn't believed. */
+                if (volsize == 0 || bitmap_blocks < 2 ||
+                    clusters > (uint64_t) (bitmap_blocks - 1) * 4096u) {
+                    return fail("BITMAP.SYS's storage control block gives a volume "
+                                "size its bitmap doesn't cover");
+                }
+                *total_blocks_out = volsize;
+                continue;
+            }
+            for (k = 0; k < 4096 && bit < clusters; k++, bit++) {
+                if ((block[k / 8] >> (k % 8)) & 1u) free_clusters++;
+            }
+        }
+    }
+    if (vbn == 1) return fail("BITMAP.SYS is empty");
+    *free_blocks_out = free_clusters * cluster;
     return ok();
 }

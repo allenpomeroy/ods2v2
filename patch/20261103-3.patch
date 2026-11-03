@@ -1,0 +1,1262 @@
+From 3db9e9fe1745a26144f0ec0578faf8a922a4ab61 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 13:13:13 -0600
+Subject: [PATCH] COPY/CONVERT: import host text as VAR records with RAT:CR
+ (#15)
+
+VMS's native text format is variable-length records with CR carriage
+control - what VMS FTP writes in ASCII mode, and what some older
+utilities and kit procedures expect - but COPY could only make stream
+formats, refusing RFM:VAR since a host file has no record counts.
+
+COPY/CONVERT now converts a host text file into VAR records, one per
+line:
+
+    COPY/CONVERT notes.txt [DOC]NOTES.TXT
+    COPY/ATTRIBUTES=(RFM:VAR,RAT:CR)/CONVERT notes.txt [DOC]NOTES.TXT
+
+Lines end at LF, a CR just before the LF is dropped, and a last line
+with no LF is still a record. Each record is a 2-byte little-endian
+count, the bytes, and a pad byte to an even length; records run on
+across blocks and end at the EOF mark, with no marker after them.
+FAT$W_RSIZE is the longest line; MRS is 0 unless given; RAT defaults to
+CR. A line over 32,767 bytes is refused, naming the line. RAT:BLK, LRL,
+an MRS below the longest line, or /CONVERT with another RFM are
+refused. RFM:VAR without /CONVERT says to use it.
+
+The new src/ods2_text_var.c does it in two passes, building on #16's
+streaming: a scan gives the converted length and longest record before
+anything is allocated, then an encoder produces the records a chunk at
+a time as COPY writes them, so memory stays flat. A pipe is spooled to
+a temporary file first, as for any COPY. ods2_content_source_t gains
+var_records, and ods2_check_var_record_attrs() checks such content;
+VAR content not marked as converted is still refused.
+
+Tests: ods2_text_var_selftest checks the scan and encoder agree and
+produce exactly the expected records (LF, CRLF, empty lines, no final
+LF, lone CRs, odd/even lengths, empty file, the 32767-byte limit) read
+in awkward piece sizes, the refusals, and end to end on a volume: VAR,
+RAT:CR, LRL, MRS 0, EOF, records decoding back to the lines.
+cli_record_attrs_check.sh covers the CLI forms, a pipe, an empty file,
+and each refusal.
+
+Not yet checked on VMS: DIRECTORY/FULL ("Variable length ... Carriage
+return carriage control") and TYPE of a converted file.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WA1cTxSh5f8UrT87d9WhcQ
+---
+ Makefile                         |  12 +-
+ README.md                        |  28 ++-
+ include/ods2_text_var.h          |  71 +++++++
+ include/ods2_volume.h            |  17 +-
+ src/ods2_text_var.c              | 174 +++++++++++++++++
+ src/ods2_volume.c                |  34 +++-
+ tests/cli_record_attrs_check.sh  |  52 +++++
+ tests/ods2_large_file_selftest.c |   1 +
+ tests/ods2_text_var_selftest.c   | 323 +++++++++++++++++++++++++++++++
+ tools/ods2.c                     | 187 ++++++++++++++++--
+ 10 files changed, 875 insertions(+), 24 deletions(-)
+ create mode 100644 include/ods2_text_var.h
+ create mode 100644 src/ods2_text_var.c
+ create mode 100644 tests/ods2_text_var_selftest.c
+
+diff --git a/Makefile b/Makefile
+index 41468d9..7a412ea 100644
+--- a/Makefile
++++ b/Makefile
+@@ -23,7 +23,8 @@ BUILD    = build
+ # set even if they don't exercise every piece of it.
+ VOLUME_SRCS = src/ods2_volume.c src/ods2_validate.c src/ods2_checksum.c \
+               src/ods2_retrieval.c src/ods2_directory.c src/ods2_bitmap.c \
+-              src/ods2_header_build.c src/ods2_directory_write.c src/ods2_time.c
++              src/ods2_header_build.c src/ods2_directory_write.c src/ods2_time.c \
++              src/ods2_text_var.c
+ 
+ TOOLS = ods2 read_home_block read_file_header ods2_ls ods2_cat ods2_mkdir \
+         ods2_put ods2_check_headers ods2_dump_root ods2_dump_header ods2_rm
+@@ -40,7 +41,7 @@ MAIN_TOOLS = ods2
+ DEV_TOOLS = read_home_block read_file_header ods2_ls ods2_cat ods2_mkdir \
+             ods2_put ods2_check_headers ods2_dump_root ods2_dump_header ods2_rm
+ 
+-TESTS = $(BUILD)/ods2_ondisk_selftest $(BUILD)/ods2_checksum_selftest $(BUILD)/ods2_validate_selftest $(BUILD)/ods2_bitmap_selftest $(BUILD)/ods2_indexf_selftest $(BUILD)/ods2_retrieval_selftest $(BUILD)/ods2_root_header_selftest $(BUILD)/ods2_directory_selftest $(BUILD)/ods2_volume_selftest $(BUILD)/ods2_wildcard_selftest $(BUILD)/ods2_read_file_selftest $(BUILD)/ods2_header_build_selftest $(BUILD)/ods2_directory_write_selftest $(BUILD)/ods2_path_selftest $(BUILD)/ods2_versions_selftest $(BUILD)/ods2_time_selftest $(BUILD)/ods2_file_alloc_selftest $(BUILD)/ods2_dir_order_selftest $(BUILD)/ods2_large_file_selftest $(BUILD)/ods2_record_attrs_selftest $(BUILD)/ods2_indexf_large_selftest
++TESTS = $(BUILD)/ods2_ondisk_selftest $(BUILD)/ods2_checksum_selftest $(BUILD)/ods2_validate_selftest $(BUILD)/ods2_bitmap_selftest $(BUILD)/ods2_indexf_selftest $(BUILD)/ods2_retrieval_selftest $(BUILD)/ods2_root_header_selftest $(BUILD)/ods2_directory_selftest $(BUILD)/ods2_volume_selftest $(BUILD)/ods2_wildcard_selftest $(BUILD)/ods2_read_file_selftest $(BUILD)/ods2_header_build_selftest $(BUILD)/ods2_directory_write_selftest $(BUILD)/ods2_path_selftest $(BUILD)/ods2_versions_selftest $(BUILD)/ods2_time_selftest $(BUILD)/ods2_file_alloc_selftest $(BUILD)/ods2_dir_order_selftest $(BUILD)/ods2_large_file_selftest $(BUILD)/ods2_record_attrs_selftest $(BUILD)/ods2_indexf_large_selftest $(BUILD)/ods2_text_var_selftest
+ 
+ .PHONY: all test tools dev-tools release clean starter-volume
+ 
+@@ -131,6 +132,9 @@ $(BUILD)/ods2_record_attrs_selftest: tests/ods2_record_attrs_selftest.c $(VOLUME
+ $(BUILD)/ods2_indexf_large_selftest: tests/ods2_indexf_large_selftest.c $(VOLUME_SRCS) include/ods2_volume.h samples/synthetic_disk.img | $(BUILD)
+ 	$(CC) $(CFLAGS) $(SANFLAGS) -D_DEFAULT_SOURCE tests/ods2_indexf_large_selftest.c $(VOLUME_SRCS) -o $@
+ 
++$(BUILD)/ods2_text_var_selftest: tests/ods2_text_var_selftest.c $(VOLUME_SRCS) include/ods2_text_var.h include/ods2_volume.h samples/synthetic_disk.img | $(BUILD)
++	$(CC) $(CFLAGS) $(SANFLAGS) tests/ods2_text_var_selftest.c $(VOLUME_SRCS) -o $@
++
+ # --- CLI tools (built directly into the project root, e.g. ./ods2_ls,
+ #     not into build/, since that's where they're actually run from) ---
+ 
+@@ -168,7 +172,7 @@ ods2_dump_header: tools/ods2_dump_header.c $(VOLUME_SRCS) include/ods2_volume.h
+ ods2_rm: tools/ods2_rm.c $(VOLUME_SRCS) src/ods2_path.c src/ods2_wildcard.c include/ods2_volume.h include/ods2_path.h
+ 	$(CC) $(CFLAGS) $(SANFLAGS) tools/ods2_rm.c $(VOLUME_SRCS) src/ods2_path.c src/ods2_wildcard.c -o $@
+ 
+-ods2: tools/ods2.c $(VOLUME_SRCS) src/ods2_path.c src/ods2_wildcard.c third_party/linenoise/linenoise.c include/ods2_volume.h include/ods2_path.h include/ods2_wildcard.h third_party/linenoise/linenoise.h
++ods2: tools/ods2.c $(VOLUME_SRCS) src/ods2_path.c src/ods2_wildcard.c third_party/linenoise/linenoise.c include/ods2_volume.h include/ods2_text_var.h include/ods2_path.h include/ods2_wildcard.h third_party/linenoise/linenoise.h
+ 	$(CC) $(CFLAGS) -D_DEFAULT_SOURCE -Ithird_party/linenoise $(SANFLAGS) tools/ods2.c $(VOLUME_SRCS) src/ods2_path.c src/ods2_wildcard.c third_party/linenoise/linenoise.c -o $@
+ 
+ test: $(TESTS) tools ods2_put ods2_dump_header
+@@ -214,6 +218,8 @@ test: $(TESTS) tools ods2_put ods2_dump_header
+ 	@$(BUILD)/ods2_record_attrs_selftest
+ 	@echo "--- ods2_indexf_large_selftest ---"
+ 	@$(BUILD)/ods2_indexf_large_selftest
++	@echo "--- ods2_text_var_selftest ---"
++	@$(BUILD)/ods2_text_var_selftest
+ 	@echo "--- CLI file version checks ---"
+ 	@sh tests/cli_versions_check.sh
+ 	@echo "--- CLI directory wildcard checks ---"
+diff --git a/README.md b/README.md
+index 11edc5a..be707a6 100644
+--- a/README.md
++++ b/README.md
+@@ -80,6 +80,7 @@ implements basic command recall to ease repetitive command sequences.
+ | `CREATE/DIRECTORY path` | `CREATE/DIRECTORY [DECUS.NETLIB020]` |
+ | `COPY <local-file> <path>` | `COPY readme.txt [DECUS]README.TXT` |
+ | `COPY/ATTRIBUTES=(...) <local-file> <path>` | `COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) kit.pcsi [KITS]KIT.PCSI` |
++| `COPY/CONVERT <local-file> <path>` | `COPY/CONVERT notes.txt [DOC]NOTES.TXT` — text as VAR records |
+ | `TYPE path` | `TYPE [DECUS]README.TXT;2` |
+ | `DELETE path` | `DELETE [DECUS]OLDFILE.TXT;1` |
+ | `SET DEFAULT path` | `SET DEFAULT [DECUS.NETLIB020]` |
+@@ -150,15 +151,36 @@ COPY/ATTRIBUTES=(RFM:FIX) backup.bck [SAVE]BACKUP.BCK          ! fixed 512-byte
+ COPY/ATTRIBUTES=(RFM:STMLF,RAT:CR) notes.txt [DOC]NOTES.TXT
+ ```
+ 
+-- `RFM:` record format - `FIX`, `STMLF`, `STM`, `STMCR` or `UDF`.
+-  `VAR` and `VFC` can't be imported: on disk each of their records
+-  starts with a byte count a host file doesn't have.
++- `RFM:` record format - `FIX`, `STMLF`, `STM`, `STMCR` or `UDF`, or
++  `VAR` with `/CONVERT` (below). On disk each `VAR` or `VFC` record
++  starts with a byte count a host file doesn't have, so `VAR` needs the
++  conversion; `VFC` can't be imported.
+ - `MRS:` the record size (for `FIX`; `LRL:` means the same there).
+   `RFM:FIX` with no size is 512-byte records. The file must be a whole
+   number of records, and the size even (2-32766).
+ - `RAT:` record attributes - `NONE`, `CR`, `FTN`, `PRN`, `BLK`, `NOBLK`;
+   repeat `RAT:` for more than one.
+ 
++VMS's native text format is variable-length records with carriage-return
++carriage control (`RFM:VAR`, `RAT:CR`) - what VMS FTP writes in ASCII
++mode, and what some older utilities and kit procedures expect.
++`/CONVERT` makes that from a host text file, one record per line:
++
++```
++COPY/CONVERT notes.txt [DOC]NOTES.TXT
++COPY/ATTRIBUTES=(RFM:VAR,RAT:CR)/CONVERT notes.txt [DOC]NOTES.TXT   ! the same
++```
++
++- Lines end at LF; a CR just before the LF is dropped, so CRLF text
++  converts the same. A last line with no LF is still a record.
++- The longest record length (`LRL`) is set from the file; `MRS` is 0
++  (no limit) unless given. A line over 32,767 bytes is refused.
++- `RAT:` defaults to `CR`; `RAT:NONE`, `FTN` or `PRN` can be given
++  instead. `RAT:BLK` isn't supported (the records run on across
++  blocks, as VMS FTP writes them).
++- `TYPE` of such a file shows the records as they are on disk, byte
++  counts included.
++
+ The qualifier goes on `COPY` itself, not after the file names (a host
+ path has `/` in it too). `ods2_put` takes the same as numbers:
+ `ods2_put disk kit.pcsi KITS KIT.PCSI 1 8192` (record format, record
+diff --git a/include/ods2_text_var.h b/include/ods2_text_var.h
+new file mode 100644
+index 0000000..5afe174
+--- /dev/null
++++ b/include/ods2_text_var.h
+@@ -0,0 +1,71 @@
++/*
++ * MIT License - Copyright (c) 2026 Allen Pomeroy (see LICENSE)
++ *
++ * ods2_text_var.h - host text to RMS variable-length records
++ * (issue #15).
++ *
++ * VMS's native text format is a sequential file of variable-length
++ * records (RFM:VAR), usually with carriage-return carriage control
++ * (RAT:CR) - what VMS FTP writes in ASCII mode. On disk each record is
++ * a 16-bit little-endian byte count, then that many bytes, then one
++ * pad byte if the count is odd, so every record starts on a word
++ * boundary. Records run on across block boundaries (the file is not
++ * RAT:BLK); the end of the data is the file's end-of-file mark (EFBLK/
++ * FFBYTE), with no marker after the last record.
++ *
++ * A host text file becomes one record per line:
++ *  - lines end at LF; a CR just before the LF is dropped (CRLF text);
++ *    any other CR is kept as data;
++ *  - a last line with no LF is still a record; a file ending in LF has
++ *    no empty record after it; an empty file has no records;
++ *  - a line longer than ODS2_VAR_MAX_RECORD bytes can't be a record.
++ *
++ * Converting takes two passes over the host file: a scan, giving the
++ * converted size and longest record before anything is allocated on
++ * the volume, then an encoder that produces the records a chunk at a
++ * time as COPY writes them, so memory use stays flat (issue #16).
++ */
++#ifndef ODS2_TEXT_VAR_H
++#define ODS2_TEXT_VAR_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#define ODS2_VAR_MAX_RECORD 32767u
++
++/* Pass 1: feed the whole host file, in pieces of any size, then
++   finish. */
++typedef struct {
++    size_t records;          /* records the file converts to */
++    size_t converted_length; /* bytes, count words and pads included */
++    size_t longest;          /* longest record (FAT$W_RSIZE), bytes */
++    size_t too_long_line;    /* first line over ODS2_VAR_MAX_RECORD, 1-based; 0 if none */
++    /* internal */
++    size_t cur_len;
++    bool last_cr;
++} ods2_text_var_scan_t;
++
++void ods2_text_var_scan_init(ods2_text_var_scan_t *s);
++void ods2_text_var_scan_feed(ods2_text_var_scan_t *s, const uint8_t *data, size_t n);
++void ods2_text_var_scan_finish(ods2_text_var_scan_t *s);
++
++/* Pass 2: an encoder reading the host text through `read_some` (which
++   returns up to `n` bytes, 0 at the end of the file, and sets
++   *error_out on a read error) and producing the records. */
++typedef struct ods2_text_var_encoder ods2_text_var_encoder_t;
++
++ods2_text_var_encoder_t *ods2_text_var_encoder_new(
++    size_t (*read_some)(void *ctx, uint8_t *buf, size_t n, bool *error_out), void *ctx);
++void ods2_text_var_encoder_free(ods2_text_var_encoder_t *e);
++
++/* Fills exactly `n` bytes of `buf` with the next part of the converted
++   content, for use as an ods2_content_source_t read function (its ctx
++   is the encoder). Returns false if it can't: a read error, a line too
++   long, or the input ending early - each meaning the file changed
++   since it was scanned, or couldn't be read. ods2_text_var_problem()
++   then says which. */
++bool ods2_text_var_read(void *encoder, uint8_t *buf, size_t n);
++const char *ods2_text_var_problem(const ods2_text_var_encoder_t *e);
++
++#endif /* ODS2_TEXT_VAR_H */
+diff --git a/include/ods2_volume.h b/include/ods2_volume.h
+index 1588095..7c3c4e9 100644
+--- a/include/ods2_volume.h
++++ b/include/ods2_volume.h
+@@ -307,7 +307,8 @@ ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,
+    Record formats (FAT$B_RTYPE, sequential organization): */
+ #define ODS2_RFM_UDF   0 /* FAB$C_UDF: undefined - a stream of bytes */
+ #define ODS2_RFM_FIX   1 /* FAB$C_FIX: fixed-length records */
+-#define ODS2_RFM_VAR   2 /* FAB$C_VAR: variable-length (not importable) */
++#define ODS2_RFM_VAR   2 /* FAB$C_VAR: variable-length (only as converted
++                            records - see ods2_text_var.h) */
+ #define ODS2_RFM_VFC   3 /* FAB$C_VFC: variable with control (not importable) */
+ #define ODS2_RFM_STM   4 /* FAB$C_STM: stream, CR-LF terminated */
+ #define ODS2_RFM_STMLF 5 /* FAB$C_STMLF: stream, LF terminated */
+@@ -340,6 +341,15 @@ typedef struct {
+  *    carriage control, are refused. */
+ const char *ods2_check_record_attrs(const ods2_record_attrs_t *attrs, size_t content_len);
+ 
++/* Checks `attrs` for a new file whose `content_len` bytes are already
++ * variable-length records (issue #15). Returns NULL if acceptable,
++ * else why not: the format must be VAR; the longest record (RSIZE) at
++ * most 32767; MRS 0 (no limit, as VMS FTP leaves it) or at least the
++ * longest record; the content a whole number of words; not RAT:BLK
++ * (converted records run on across blocks, which BLK forbids); at most
++ * one carriage control; no unknown RAT bits. */
++const char *ods2_check_var_record_attrs(const ods2_record_attrs_t *attrs, size_t content_len);
++
+ /* ods2_create_file() with chosen record attributes, checked first by
+  * ods2_check_record_attrs() - a file whose attributes don't fit its
+  * content is refused, not created. ods2_create_file(..., rtype, ...)
+@@ -365,6 +375,11 @@ typedef struct {
+     bool (*read)(void *ctx, uint8_t *buf, size_t n);
+     void *ctx;
+     const char *problem;
++    /* true when the content is already RMS variable-length records,
++       count words included (ods2_text_var.h makes them from host
++       text): RFM:VAR is then accepted, and checked by
++       ods2_check_var_record_attrs() instead. */
++    bool var_records;
+ } ods2_content_source_t;
+ 
+ /* ods2_create_file_attrs() with the content taken from `src` a chunk
+diff --git a/src/ods2_text_var.c b/src/ods2_text_var.c
+new file mode 100644
+index 0000000..4a9aa1c
+--- /dev/null
++++ b/src/ods2_text_var.c
+@@ -0,0 +1,174 @@
++/*
++ * MIT License - Copyright (c) 2026 Allen Pomeroy (see LICENSE)
++ *
++ * ods2_text_var.c - host text to RMS variable-length records
++ * (issue #15). See ods2_text_var.h for the format and the rules.
++ */
++#include "ods2_text_var.h"
++#include <stdlib.h>
++#include <string.h>
++
++/* --- pass 1: scan --- */
++
++void ods2_text_var_scan_init(ods2_text_var_scan_t *s)
++{
++    memset(s, 0, sizeof(*s));
++}
++
++static void scan_record(ods2_text_var_scan_t *s, size_t len)
++{
++    s->records++;
++    s->converted_length += 2 + len + (len & 1u);
++    if (len > s->longest) s->longest = len;
++    if (len > ODS2_VAR_MAX_RECORD && s->too_long_line == 0) {
++        s->too_long_line = s->records;
++    }
++}
++
++void ods2_text_var_scan_feed(ods2_text_var_scan_t *s, const uint8_t *data, size_t n)
++{
++    size_t i;
++    for (i = 0; i < n; i++) {
++        if (data[i] == '\n') {
++            scan_record(s, s->cur_len - (s->last_cr ? 1u : 0u));
++            s->cur_len = 0;
++            s->last_cr = false;
++        } else {
++            s->cur_len++;
++            s->last_cr = (data[i] == '\r');
++        }
++    }
++}
++
++void ods2_text_var_scan_finish(ods2_text_var_scan_t *s)
++{
++    /* A last line with no LF is a record, its CR (if any) kept: only
++       a CR right before an LF is a line ending. */
++    if (s->cur_len > 0) scan_record(s, s->cur_len);
++    s->cur_len = 0;
++    s->last_cr = false;
++}
++
++/* --- pass 2: encode --- */
++
++#define INBUF_SIZE 65536u
++
++struct ods2_text_var_encoder {
++    size_t (*read_some)(void *ctx, uint8_t *buf, size_t n, bool *error_out);
++    void *ctx;
++    uint8_t in[INBUF_SIZE];
++    size_t in_pos, in_len;
++    bool in_eof;
++    /* the record being handed out: count word, data, pad */
++    uint8_t rec[2 + ODS2_VAR_MAX_RECORD + 2];
++    size_t rec_len, rec_pos;
++    const char *problem;
++};
++
++ods2_text_var_encoder_t *ods2_text_var_encoder_new(
++    size_t (*read_some)(void *ctx, uint8_t *buf, size_t n, bool *error_out), void *ctx)
++{
++    ods2_text_var_encoder_t *e = calloc(1, sizeof(*e));
++    if (e == NULL) return NULL;
++    e->read_some = read_some;
++    e->ctx = ctx;
++    return e;
++}
++
++void ods2_text_var_encoder_free(ods2_text_var_encoder_t *e)
++{
++    free(e);
++}
++
++const char *ods2_text_var_problem(const ods2_text_var_encoder_t *e)
++{
++    return e->problem;
++}
++
++/* Next input byte into *c; false at the end of the input or on error
++   (e->problem set). */
++static bool next_byte(ods2_text_var_encoder_t *e, uint8_t *c)
++{
++    if (e->in_pos == e->in_len) {
++        bool error = false;
++        if (e->in_eof) return false;
++        e->in_len = e->read_some(e->ctx, e->in, sizeof(e->in), &error);
++        e->in_pos = 0;
++        if (error) {
++            e->problem = "error reading the file";
++            e->in_eof = true;
++            return false;
++        }
++        if (e->in_len == 0) {
++            e->in_eof = true;
++            return false;
++        }
++    }
++    *c = e->in[e->in_pos++];
++    return true;
++}
++
++/* Builds the next record in e->rec. Returns false at the end of the
++   input (no more records) or on a problem (e->problem set). */
++static bool next_record(ods2_text_var_encoder_t *e)
++{
++    uint8_t *data = e->rec + 2;
++    size_t len = 0;
++    bool got_any = false, ended_by_lf = false;
++    uint8_t c;
++
++    while (next_byte(e, &c)) {
++        got_any = true;
++        if (c == '\n') {
++            ended_by_lf = true;
++            break;
++        }
++        /* Room for one byte past the limit: a CR that an LF then drops. */
++        if (len == ODS2_VAR_MAX_RECORD + 1) {
++            e->problem = "a line is longer than a record can be (32767 bytes) - "
++                         "the file changed after it was checked";
++            return false;
++        }
++        data[len++] = c;
++    }
++    if (e->problem != NULL) return false;
++    if (!got_any) return false; /* end of input: no more records */
++    if (ended_by_lf && len > 0 && data[len - 1] == '\r') len--;
++    if (len > ODS2_VAR_MAX_RECORD) {
++        e->problem = "a line is longer than a record can be (32767 bytes) - "
++                     "the file changed after it was checked";
++        return false;
++    }
++    e->rec[0] = (uint8_t) (len & 0xffu);
++    e->rec[1] = (uint8_t) (len >> 8);
++    e->rec_len = 2 + len;
++    if (len & 1u) {
++        data[len] = 0; /* pad to a word boundary */
++        e->rec_len++;
++    }
++    e->rec_pos = 0;
++    return true;
++}
++
++bool ods2_text_var_read(void *encoder, uint8_t *buf, size_t n)
++{
++    ods2_text_var_encoder_t *e = (ods2_text_var_encoder_t *) encoder;
++    while (n > 0) {
++        size_t piece;
++        if (e->rec_pos == e->rec_len) {
++            if (!next_record(e)) {
++                if (e->problem == NULL) {
++                    e->problem = "the file became shorter while being copied";
++                }
++                return false;
++            }
++        }
++        piece = e->rec_len - e->rec_pos;
++        if (piece > n) piece = n;
++        memcpy(buf, e->rec + e->rec_pos, piece);
++        e->rec_pos += piece;
++        buf += piece;
++        n -= piece;
++    }
++    return true;
++}
+diff --git a/src/ods2_volume.c b/src/ods2_volume.c
+index 3c5ce2f..ddaed29 100644
+--- a/src/ods2_volume.c
++++ b/src/ods2_volume.c
+@@ -1496,6 +1496,35 @@ const char *ods2_check_record_attrs(const ods2_record_attrs_t *attrs, size_t con
+     return NULL;
+ }
+ 
++const char *ods2_check_var_record_attrs(const ods2_record_attrs_t *attrs, size_t content_len)
++{
++    unsigned cc = attrs->rattrib & (ODS2_RAT_FTN | ODS2_RAT_CR | ODS2_RAT_PRN);
++
++    if (attrs->rtype != ODS2_RFM_VAR) {
++        return "converted records are variable-length: the format must be VAR";
++    }
++    if (attrs->rsize > 32767) {
++        return "a record is too long (at most 32767 bytes)";
++    }
++    if (attrs->maxrec != 0 && attrs->maxrec < attrs->rsize) {
++        return "a record is longer than the maximum record size (MRS) given";
++    }
++    if (content_len % 2 != 0) {
++        return "internal error: variable-length records must fill whole words";
++    }
++    if (attrs->rattrib & ODS2_RAT_BLK) {
++        return "RAT:BLK isn't supported with converted records: they run on "
++               "across block boundaries, which BLK forbids";
++    }
++    if (attrs->rattrib & ~0x0fu) {
++        return "unknown record attribute bits";
++    }
++    if (cc != 0 && (cc & (cc - 1)) != 0) {
++        return "only one carriage control (FTN, CR or PRN) can be given";
++    }
++    return NULL;
++}
++
+ ods2_result_t ods2_create_file_attrs(ods2_volume_t *vol, const uint8_t *parent_header,
+                                       const char *name, const uint8_t *content,
+                                       size_t content_len, const ods2_record_attrs_t *attrs,
+@@ -1509,6 +1538,7 @@ ods2_result_t ods2_create_file_attrs(ods2_volume_t *vol, const uint8_t *parent_h
+     src.read = memory_source_read;
+     src.ctx = &ctx;
+     src.problem = NULL;
++    src.var_records = false;
+     return ods2_create_file_source(vol, parent_header, name, &src, attrs, new_fid_out);
+ }
+ 
+@@ -1517,7 +1547,8 @@ ods2_result_t ods2_create_file_source(ods2_volume_t *vol, const uint8_t *parent_
+                                        const ods2_record_attrs_t *attrs,
+                                        ods2_fid_t *new_fid_out)
+ {
+-    const char *why = ods2_check_record_attrs(attrs, src->length);
++    const char *why = src->var_records ? ods2_check_var_record_attrs(attrs, src->length)
++                                       : ods2_check_record_attrs(attrs, src->length);
+     if (why != NULL) {
+         return fail(why);
+     }
+@@ -1542,6 +1573,7 @@ ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,
+         src.read = memory_source_read;
+         src.ctx = &ctx;
+         src.problem = NULL;
++        src.var_records = false;
+         return create_file(vol, parent_header, name, &src, &attrs, new_fid_out);
+     }
+ }
+diff --git a/tests/cli_record_attrs_check.sh b/tests/cli_record_attrs_check.sh
+index 367d1d6..4dcda37 100644
+--- a/tests/cli_record_attrs_check.sh
++++ b/tests/cli_record_attrs_check.sh
+@@ -94,6 +94,58 @@ n=$((n + 1))
+ check "plain COPY is still Stream_LF, 512, no RAT" \
+     "rtype=0x05 rattrib=0x00 rsize=512 maxrec=512" "$(hdr $n)"
+ 
++# --- COPY/CONVERT: host text to variable-length records (issue #15) ---
++printf 'first line\r\nsecond\n\nodd\nlast' > "$TMP/crlf.txt"
++# The records: count word, data, a pad byte after an odd length.
++printf '\012\000first line\006\000second\000\000\003\000odd\000\004\000last' \
++    > "$TMP/crlf.var"
++check "COPY/CONVERT succeeds" \
++    "%ODS2-I-COPIED, 28 bytes to CRLF.TXT;1 as 5 variable-length records (longest 10)" \
++    "$($ODS2 $DISK "COPY/CONVERT $TMP/crlf.txt [000000]CRLF.TXT" 2>&1)"
++n=$((n + 1))
++check "...VAR, RAT:CR, LRL the longest line, MRS 0" \
++    "rtype=0x02 rattrib=0x02 rsize=10 maxrec=0" "$(hdr $n)"
++$ODS2 $DISK "TYPE [000000]CRLF.TXT" > "$TMP/out.bin" 2>/dev/null
++if cmp -s "$TMP/crlf.var" "$TMP/out.bin"; then same=identical; else same=different; fi
++check "...holding exactly the records expected" identical "$same"
++$ODS2 $DISK "COPY/ATTRIBUTES=(RFM:VAR,RAT:CR)/CONVERT $TMP/crlf.txt [000000]ISSUE.TXT" >/dev/null 2>&1
++n=$((n + 1))
++check "the issue's spelling: /ATTRIBUTES=(RFM:VAR,RAT:CR)/CONVERT" \
++    "rtype=0x02 rattrib=0x02 rsize=10 maxrec=0" "$(hdr $n)"
++$ODS2 $DISK "COPY/CONV/ATTR=(RAT:NONE,MRS:100) $TMP/crlf.txt [000000]NOCC.TXT" >/dev/null 2>&1
++n=$((n + 1))
++check "/CONV abbreviation, RAT:NONE and MRS:100 honored" \
++    "rtype=0x02 rattrib=0x00 rsize=10 maxrec=100" "$(hdr $n)"
++check "COPY/CONVERT from a pipe" \
++    "%ODS2-I-COPIED, 28 bytes to PIPED.TXT;1 as 5 variable-length records (longest 10)" \
++    "$(cat $TMP/crlf.txt | $ODS2 $DISK "COPY/CONVERT /dev/stdin [000000]PIPED.TXT" 2>&1)"
++n=$((n + 1))
++$ODS2 $DISK "TYPE [000000]PIPED.TXT" > "$TMP/out.bin" 2>/dev/null
++if cmp -s "$TMP/crlf.var" "$TMP/out.bin"; then same=identical; else same=different; fi
++check "...holding the same records" identical "$same"
++: > "$TMP/empty.txt"
++check "COPY/CONVERT of an empty file: no records" \
++    "%ODS2-I-COPIED, 0 bytes to EMPTY.TXT;1 as 0 variable-length records (longest 0)" \
++    "$($ODS2 $DISK "COPY/CONVERT $TMP/empty.txt [000000]EMPTY.TXT" 2>&1)"
++n=$((n + 1))
++{ printf 'short\n'; head -c 32768 /dev/zero | tr '\0' 'L'; printf '\n'; } > "$TMP/long.txt"
++check "a line over 32767 bytes is refused (exit 1)" 1 \
++    "$(status $ODS2 $DISK "COPY/CONVERT $TMP/long.txt [000000]REFUSED8.TXT")"
++check "...naming the line" \
++    "%ODS2-E-RECTOOBIG, $TMP/long.txt: line 2 is longer than a variable-length record can be (32767 bytes)" \
++    "$($ODS2 $DISK "COPY/CONVERT $TMP/long.txt [000000]REFUSED8.TXT" 2>&1)"
++check "/CONVERT with RFM:FIX exits 1" 1 \
++    "$(status $ODS2 $DISK "COPY/ATTRIBUTES=(RFM:FIX)/CONVERT $TMP/crlf.txt [000000]REFUSED9.TXT")"
++check "/CONVERT with RAT:BLK exits 1" 1 \
++    "$(status $ODS2 $DISK "COPY/CONVERT/ATTRIBUTES=(RAT:CR,RAT:BLK) $TMP/crlf.txt [000000]REFUSED10.TXT")"
++check "/CONVERT with LRL given exits 1" 1 \
++    "$(status $ODS2 $DISK "COPY/CONVERT/ATTRIBUTES=(LRL:80) $TMP/crlf.txt [000000]REFUSED11.TXT")"
++check "/CONVERT with MRS below the longest line exits 1" 1 \
++    "$(status $ODS2 $DISK "COPY/CONVERT/ATTRIBUTES=(MRS:5) $TMP/crlf.txt [000000]REFUSED12.TXT")"
++check "RFM:VAR without /CONVERT says to use it" \
++    "%ODS2-E-CONFQUAL, RFM:VAR needs /CONVERT: each variable-length record starts with a byte count the host file doesn't have, so COPY/CONVERT makes one record per line" \
++    "$($ODS2 $DISK "COPY/ATTRIBUTES=(RFM:VAR) $TMP/notes.txt [000000]REFUSED3.TXT" 2>&1)"
++
+ check "COPY of content that isn't whole records exits 1" 1 \
+     "$(status $ODS2 $DISK "COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) $TMP/short.pcsi [000000]SHORT.PCSI")"
+ check "...and creates no file" "%ODS2-W-NOFILES, no files found" \
+diff --git a/tests/ods2_large_file_selftest.c b/tests/ods2_large_file_selftest.c
+index 4f18d6e..12f0a79 100644
+--- a/tests/ods2_large_file_selftest.c
++++ b/tests/ods2_large_file_selftest.c
+@@ -308,6 +308,7 @@ int main(void)
+             src.read = failing_read;
+             src.ctx = &fs;
+             src.problem = NULL;
++            src.var_records = false;
+             attrs.rtype = ODS2_RFM_UDF;
+             attrs.rattrib = 0;
+             attrs.rsize = 0;
+diff --git a/tests/ods2_text_var_selftest.c b/tests/ods2_text_var_selftest.c
+new file mode 100644
+index 0000000..554d64d
+--- /dev/null
++++ b/tests/ods2_text_var_selftest.c
+@@ -0,0 +1,323 @@
++/*
++ * MIT License - Copyright (c) 2026 Allen Pomeroy (see LICENSE)
++ *
++ * ods2_text_var_selftest - host text to variable-length records
++ * (issue #15):
++ *
++ *  - the scan (pass 1) and the encoder (pass 2) agree on the length,
++ *    and the encoder's bytes are exactly the records expected, for
++ *    LF and CRLF text, empty lines, a last line with no LF, a lone CR,
++ *    odd and even lengths, an empty file, and lines at the 32767-byte
++ *    limit; read in pieces of awkward sizes, the result is the same;
++ *  - a line over the limit is reported by the scan, and refused by the
++ *    encoder if the file changed between the passes; input that ends
++ *    early is refused;
++ *  - end to end on a copy of the synthetic disk: the file is VAR with
++ *    the carriage control asked for, LRL = the longest line, MRS 0,
++ *    the end-of-file just past the last record, and its blocks hold
++ *    exactly the records, which decode back to the original lines;
++ *  - the volume refuses VAR content not marked as converted, and
++ *    converted records with RAT:BLK or a longest record over MRS. */
++
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++#include <assert.h>
++#include "ods2_text_var.h"
++#include "ods2_volume.h"
++#include "ods2_validate.h"
++
++#define SOURCE_DISK_PATH "samples/synthetic_disk.img"
++#define DISK_PATH        "samples/text_var_disk.img"
++
++/* An input for the encoder: a buffer, handed out `step` bytes at a
++   time (to exercise reads that split lines and CRLFs). */
++typedef struct {
++    const uint8_t *data;
++    size_t len, pos, step;
++} input_t;
++
++static size_t input_read_some(void *ctx_, uint8_t *buf, size_t n, bool *error_out)
++{
++    input_t *in = (input_t *) ctx_;
++    size_t k = in->len - in->pos;
++    (void) error_out;
++    if (k > n) k = n;
++    if (k > in->step) k = in->step;
++    memcpy(buf, in->data + in->pos, k);
++    in->pos += k;
++    return k;
++}
++
++/* Converts `text` with the scan and the encoder (reading `step` bytes
++   at a time, handing out `out_step` bytes at a time); returns the
++   records in a malloc'd buffer, *len_out its length, after checking
++   the two passes agree. */
++static uint8_t *convert(const uint8_t *text, size_t len, size_t step, size_t out_step,
++                        ods2_text_var_scan_t *scan_out, size_t *len_out)
++{
++    ods2_text_var_scan_t scan;
++    ods2_text_var_encoder_t *e;
++    input_t in;
++    uint8_t *out;
++    size_t done = 0, i;
++
++    ods2_text_var_scan_init(&scan);
++    for (i = 0; i < len; i += step) {
++        ods2_text_var_scan_feed(&scan, text + i, (len - i < step) ? len - i : step);
++    }
++    ods2_text_var_scan_finish(&scan);
++    assert(scan.too_long_line == 0);
++
++    in.data = text;
++    in.len = len;
++    in.pos = 0;
++    in.step = step;
++    e = ods2_text_var_encoder_new(input_read_some, &in);
++    assert(e != NULL);
++    out = malloc(scan.converted_length + 1);
++    assert(out != NULL);
++    while (done < scan.converted_length) {
++        size_t k = scan.converted_length - done;
++        if (k > out_step) k = out_step;
++        assert(ods2_text_var_read(e, out + done, k));
++        done += k;
++    }
++    /* Nothing more: one more byte would be past the last record. */
++    {
++        uint8_t extra;
++        assert(!ods2_text_var_read(e, &extra, 1));
++    }
++    ods2_text_var_encoder_free(e);
++    *scan_out = scan;
++    *len_out = done;
++    return out;
++}
++
++static void expect(const char *what, const char *text, size_t text_len,
++                   const uint8_t *records, size_t records_len, size_t n_records,
++                   size_t longest)
++{
++    static const size_t steps[] = { 1, 2, 3, 7, 64, 65536 };
++    size_t s;
++    for (s = 0; s < sizeof(steps) / sizeof(steps[0]); s++) {
++        ods2_text_var_scan_t scan;
++        size_t len;
++        uint8_t *out = convert((const uint8_t *) text, text_len, steps[s], steps[s] + 2,
++                               &scan, &len);
++        assert(scan.converted_length == records_len);
++        assert(len == records_len);
++        assert(memcmp(out, records, records_len) == 0);
++        assert(scan.records == n_records);
++        assert(scan.longest == longest);
++        free(out);
++    }
++    printf("PASS: %s\n", what);
++}
++
++/* Decodes records back into lines joined by LF, for comparison. */
++static size_t decode(const uint8_t *rec, size_t len, uint8_t *out)
++{
++    size_t pos = 0, o = 0;
++    while (pos < len) {
++        size_t n = (size_t) rec[pos] | ((size_t) rec[pos + 1] << 8);
++        memcpy(out + o, rec + pos + 2, n);
++        o += n;
++        out[o++] = '\n';
++        pos += 2 + n + (n & 1u);
++    }
++    return o;
++}
++
++static void copy_sparse(const char *src, const char *dst)
++{
++    FILE *in = fopen(src, "rb");
++    FILE *out = fopen(dst, "wb");
++    static char buf[1 << 20];
++    static const char zero[1 << 20];
++    size_t n;
++    assert(in != NULL && out != NULL);
++    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
++        if (n == sizeof(buf) && memcmp(buf, zero, n) == 0) {
++            assert(fseek(out, (long) n, SEEK_CUR) == 0);
++        } else {
++            assert(fwrite(buf, 1, n, out) == n);
++        }
++    }
++    fclose(in);
++    fclose(out);
++}
++
++static bool memory_read(void *ctx, uint8_t *buf, size_t n)
++{
++    const uint8_t **p = (const uint8_t **) ctx;
++    memcpy(buf, *p, n);
++    *p += n;
++    return true;
++}
++
++int main(void)
++{
++    /* --- the format --- */
++    {
++        static const uint8_t r[] = { 3, 0, 'a', 'b', 'c', 0, 2, 0, 'd', 'e' };
++        expect("LF lines: count word, data, a pad byte after an odd length",
++               "abc\nde\n", 7, r, sizeof r, 2, 3);
++    }
++    {
++        static const uint8_t r[] = { 3, 0, 'a', 'b', 'c', 0, 2, 0, 'd', 'e' };
++        expect("CRLF lines: the CR before each LF is dropped",
++               "abc\r\nde\r\n", 9, r, sizeof r, 2, 3);
++    }
++    {
++        static const uint8_t r[] = { 0, 0, 0, 0, 1, 0, 'x', 0 };
++        expect("empty lines are zero-length records", "\n\nx\n", 4, r, sizeof r, 3, 1);
++    }
++    {
++        static const uint8_t r[] = { 2, 0, 'a', 'b', 3, 0, 't', 'a', 'i', 0 };
++        expect("a last line with no LF is still a record", "ab\ntai", 6, r, sizeof r, 2, 3);
++    }
++    {
++        static const uint8_t r[] = { 3, 0, 'a', '\r', 'b', 0, 2, 0, 'c', '\r' };
++        expect("a CR not before an LF is kept, including at the very end",
++               "a\rb\nc\r", 6, r, sizeof r, 2, 3);
++    }
++    {
++        expect("an empty file has no records", "", 0, (const uint8_t *) "", 0, 0, 0);
++    }
++
++    /* --- the 32767-byte limit --- */
++    {
++        size_t len = ODS2_VAR_MAX_RECORD;
++        uint8_t *text = malloc(len + 3), *rec = malloc(len + 3);
++        memset(text, 'L', len);
++        text[len] = '\r';
++        text[len + 1] = '\n';
++        rec[0] = (uint8_t) (len & 0xff);
++        rec[1] = (uint8_t) (len >> 8);
++        memset(rec + 2, 'L', len);
++        rec[2 + len] = 0;
++        expect("a 32767-byte CRLF line is one record (the CR doesn't count)",
++               (const char *) text, len + 2, rec, len + 3, 1, len);
++        free(text);
++        free(rec);
++    }
++    {
++        size_t len = ODS2_VAR_MAX_RECORD + 1;
++        uint8_t *text = malloc(len + 4);
++        ods2_text_var_scan_t scan;
++        memcpy(text, "ok\n", 3);
++        memset(text + 3, 'L', len);
++        text[3 + len] = '\n';
++        ods2_text_var_scan_init(&scan);
++        ods2_text_var_scan_feed(&scan, text, len + 4);
++        ods2_text_var_scan_finish(&scan);
++        assert(scan.too_long_line == 2);
++        {
++            /* The encoder refuses it too (the file changed between the
++               passes from fitting to not). */
++            input_t in = { text, len + 4, 0, 4096 };
++            ods2_text_var_encoder_t *e = ods2_text_var_encoder_new(input_read_some, &in);
++            uint8_t *out = malloc(len + 8);
++            assert(ods2_text_var_read(e, out, 4)); /* the "ok" record */
++            assert(!ods2_text_var_read(e, out, len));
++            assert(strstr(ods2_text_var_problem(e), "longer") != NULL);
++            ods2_text_var_encoder_free(e);
++            free(out);
++        }
++        free(text);
++        printf("PASS: a 32768-byte line is reported by the scan (line 2) and refused "
++               "by the encoder\n");
++    }
++    {
++        /* Input shorter than was scanned. */
++        input_t in = { (const uint8_t *) "ab\n", 3, 0, 1 };
++        ods2_text_var_encoder_t *e = ods2_text_var_encoder_new(input_read_some, &in);
++        uint8_t out[16];
++        assert(!ods2_text_var_read(e, out, 10));
++        assert(strstr(ods2_text_var_problem(e), "shorter") != NULL);
++        ods2_text_var_encoder_free(e);
++        printf("PASS: input ending before the length scanned is refused\n");
++    }
++
++    /* --- end to end on a volume --- */
++    {
++        static const char text[] =
++            "$! A DCL procedure\r\n"
++            "$ WRITE SYS$OUTPUT \"Hello\"\r\n"
++            "\r\n"
++            "$ EXIT\r\n";
++        ods2_volume_t vol;
++        ods2_text_var_scan_t scan;
++        ods2_content_source_t src;
++        ods2_record_attrs_t attrs;
++        ods2_fid_t fid;
++        uint8_t root[512], h[512];
++        const ods2_head_core_t *core = (const ods2_head_core_t *) h;
++        size_t rec_len, n;
++        uint8_t *rec = convert((const uint8_t *) text, sizeof text - 1, 65536, 65536,
++                               &scan, &rec_len);
++        const uint8_t *cursor = rec;
++        uint8_t *back, decoded[256];
++
++        copy_sparse(SOURCE_DISK_PATH, DISK_PATH);
++        assert(ods2_mount_write(DISK_PATH, &vol).ok);
++
++        memset(&src, 0, sizeof src);
++        src.length = rec_len;
++        src.read = memory_read;
++        src.ctx = &cursor;
++        src.var_records = true;
++        attrs.rtype = ODS2_RFM_VAR;
++        attrs.rattrib = ODS2_RAT_CR;
++        attrs.rsize = (uint16_t) scan.longest;
++        attrs.maxrec = 0;
++        assert(ods2_read_header(&vol, 4, root).ok);
++        assert(ods2_create_file_source(&vol, root, "HELLO.COM", &src, &attrs, &fid).ok);
++
++        assert(ods2_read_header(&vol, fid.fid_num, h).ok);
++        assert(ods2_validate_head(h).ok);
++        assert(core->recattr.rtype == ODS2_RFM_VAR);
++        assert(core->recattr.rattrib == ODS2_RAT_CR);
++        assert(core->recattr.rsize == 26); /* $ WRITE SYS$OUTPUT "Hello" */
++        assert(core->recattr.maxrec == 0);
++        assert(ods2_file_content_length(h) == rec_len);
++        back = malloc(rec_len);
++        assert(ods2_read_file(&vol, h, back, rec_len, &n).ok && n == rec_len);
++        assert(memcmp(back, rec, rec_len) == 0);
++        n = decode(back, rec_len, decoded);
++        assert(n == 18 + 1 + 26 + 1 + 0 + 1 + 6 + 1);
++        assert(memcmp(decoded, "$! A DCL procedure\n$ WRITE SYS$OUTPUT \"Hello\"\n\n$ EXIT\n",
++                      n) == 0);
++        free(back);
++        printf("PASS: on a volume: VAR, RAT:CR, LRL 26 (the longest line), MRS 0, EOF "
++               "just past the last record; records decode back to the lines\n");
++
++        /* --- the volume's checks --- */
++        cursor = rec;
++        src.var_records = false;
++        assert(ods2_read_header(&vol, 4, root).ok);
++        assert(!ods2_create_file_source(&vol, root, "RAW.COM", &src, &attrs, &fid).ok);
++        src.var_records = true;
++        attrs.rattrib = ODS2_RAT_CR | ODS2_RAT_BLK;
++        assert(ods2_check_var_record_attrs(&attrs, rec_len) != NULL);
++        attrs.rattrib = ODS2_RAT_CR;
++        attrs.maxrec = 20;
++        assert(ods2_check_var_record_attrs(&attrs, rec_len) != NULL);
++        attrs.maxrec = 26;
++        assert(ods2_check_var_record_attrs(&attrs, rec_len) == NULL);
++        attrs.rtype = ODS2_RFM_STMLF;
++        assert(ods2_check_var_record_attrs(&attrs, rec_len) != NULL);
++        assert(ods2_read_header(&vol, 4, root).ok);
++        assert(!ods2_lookup_name(&vol, root, "RAW.COM", &fid).ok);
++        printf("PASS: VAR content not marked as converted is refused; converted records "
++               "with RAT:BLK, or longer than MRS, or not VAR, are refused\n");
++
++        ods2_dismount(&vol);
++        remove(DISK_PATH);
++        free(rec);
++    }
++
++    printf("\nods2_text_var_selftest: all checks passed\n");
++    return 0;
++}
+diff --git a/tools/ods2.c b/tools/ods2.c
+index 3b4cdf4..9a97ea2 100644
+--- a/tools/ods2.c
++++ b/tools/ods2.c
+@@ -58,6 +58,10 @@
+  *                                 ... with chosen RMS record attributes,
+  *                                 in SET FILE/ATTRIBUTES syntax (see
+  *                                 parse_copy_qualifiers())
++ *   COPY/CONVERT <local-file> <path>
++ *                                 a text file as variable-length
++ *                                 records (RFM:VAR, RAT:CR), one per
++ *                                 line - VMS's native text format
+  *   TYPE path                     print a file's content
+  *   DELETE path                   delete a file (one version) or an
+  *                                 empty directory
+@@ -109,6 +113,7 @@
+ #include "ods2_path.h"
+ #include "ods2_wildcard.h"
+ #include "ods2_directory_write.h"
++#include "ods2_text_var.h"
+ 
+ #define MAX_LINE 1024
+ #define MAX_TOKENS 8
+@@ -647,24 +652,43 @@ static bool keyword(const char *word, size_t len, const char *name, size_t min)
+     return true;
+ }
+ 
++/* COPY's options beyond the record attributes themselves. */
++typedef struct {
++    bool convert;   /* /CONVERT: host text lines -> VAR records */
++    bool mrs_given; /* MRS:n was given */
++} copy_options_t;
++
+ /* Parses COPY's qualifiers - everything after "COPY" in the command
+- * word - into the record attributes of the new file. The one qualifier
+- * is /ATTRIBUTES, in the syntax of VMS's SET FILE/ATTRIBUTES:
++ * word - into the record attributes of the new file. /ATTRIBUTES is in
++ * the syntax of VMS's SET FILE/ATTRIBUTES:
+  *
+  *   COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) kit.pcsi [000000]KIT.PCSI
+  *
+- *   RFM:fmt   record format - FIX, STMLF, STM, STMCR or UDF
++ *   RFM:fmt   record format - FIX, STMLF, STM, STMCR or UDF, or VAR
++ *             with /CONVERT
+  *   MRS:n     maximum record size; for FIX, the record size
+  *   LRL:n     longest record length (for FIX, the same as MRS)
+  *   RAT:x     record attributes - NONE, CR, FTN, PRN, BLK, NOBLK;
+  *             repeat RAT for more than one (RAT:CR,RAT:BLK)
+  *
++ * /CONVERT (issue #15) turns a host text file into variable-length
++ * records, one per line (see ods2_text_var.h) - VMS's native text
++ * format, as VMS FTP writes it in ASCII mode:
++ *
++ *   COPY/CONVERT notes.txt [DOC]NOTES.TXT
++ *   COPY/ATTRIBUTES=(RFM:VAR,RAT:CR)/CONVERT notes.txt [DOC]NOTES.TXT
++ *
++ * With /CONVERT the format is VAR and, unless a RAT was given, RAT:CR;
++ * the longest record length comes from the file, and MRS is 0 (no
++ * limit) unless given.
++ *
+  * With no qualifier the file is Stream_LF, as always. A fixed format
+  * with no size given is 512-byte records. Returns false after
+  * reporting the problem. */
+-static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a)
++static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a,
++                                  copy_options_t *opts)
+ {
+-    bool mrs_given = false, lrl_given = false;
++    bool mrs_given = false, lrl_given = false, rfm_given = false, rat_given = false;
+     const char *q = quals;
+ 
+     while (*q == '/') {
+@@ -674,9 +698,18 @@ static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a)
+ 
+         while (*q && *q != '=' && *q != '/') q++;
+         name_len = (size_t) (q - name);
++        if (keyword(name, name_len, "CONVERT", 4)) {
++            if (*q == '=') {
++                report_error("%%ODS2-E-NOVALUE, /CONVERT takes no value\n");
++                return false;
++            }
++            opts->convert = true;
++            continue;
++        }
+         if (!keyword(name, name_len, "ATTRIBUTES", 4)) {
+             report_error("%%ODS2-E-IVQUAL, unrecognized qualifier /%.*s - COPY takes "
+-                         "/ATTRIBUTES=(RFM:fmt,MRS:size,RAT:attr)\n", (int) name_len, name);
++                         "/ATTRIBUTES=(RFM:fmt,MRS:size,RAT:attr) and /CONVERT\n",
++                         (int) name_len, name);
+             return false;
+         }
+         if (*q != '=') {
+@@ -717,6 +750,7 @@ static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a)
+ 
+             if (keyword(item, key_len, "RFM", 3)) {
+                 const char *v = colon + 1;
++                rfm_given = true;
+                 if (keyword(v, val_len, "FIXED", 3)) a->rtype = ODS2_RFM_FIX;
+                 else if (keyword(v, val_len, "STMLF", 5) || keyword(v, val_len, "STREAM_LF", 8))
+                     a->rtype = ODS2_RFM_STMLF;
+@@ -730,7 +764,8 @@ static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a)
+                 else if (keyword(v, val_len, "VFC", 3)) a->rtype = ODS2_RFM_VFC;
+                 else {
+                     report_error("%%ODS2-E-BADVALUE, RFM:%.*s - record format must be FIX, "
+-                                 "STMLF, STM, STMCR or UDF\n", (int) val_len, v);
++                                 "STMLF, STM, STMCR or UDF, or VAR with /CONVERT\n",
++                                 (int) val_len, v);
+                     return false;
+                 }
+             } else if (keyword(item, key_len, "MRS", 3) || keyword(item, key_len, "LRL", 3)) {
+@@ -760,6 +795,7 @@ static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a)
+                 }
+             } else if (keyword(item, key_len, "RAT", 3)) {
+                 const char *v = colon + 1;
++                rat_given = true;
+                 if (keyword(v, val_len, "NONE", 4)) a->rattrib &= (uint8_t) ~0x07u;
+                 else if (keyword(v, val_len, "CR", 2)) a->rattrib |= ODS2_RAT_CR;
+                 else if (keyword(v, val_len, "FTN", 3)) a->rattrib |= ODS2_RAT_FTN;
+@@ -783,6 +819,27 @@ static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a)
+         return false;
+     }
+ 
++    opts->mrs_given = mrs_given;
++    if (opts->convert) {
++        if (!rfm_given) a->rtype = ODS2_RFM_VAR;
++        if (a->rtype != ODS2_RFM_VAR) {
++            report_error("%%ODS2-E-CONFQUAL, /CONVERT makes variable-length records: "
++                         "use it with RFM:VAR, or no RFM at all\n");
++            return false;
++        }
++        if (!rat_given) a->rattrib = ODS2_RAT_CR;
++        if (lrl_given) {
++            report_error("%%ODS2-E-CONFQUAL, with /CONVERT the longest record length "
++                         "(LRL) comes from the file - leave LRL out\n");
++            return false;
++        }
++    } else if (a->rtype == ODS2_RFM_VAR) {
++        report_error("%%ODS2-E-CONFQUAL, RFM:VAR needs /CONVERT: each variable-length "
++                     "record starts with a byte count the host file doesn't have, so "
++                     "COPY/CONVERT makes one record per line\n");
++        return false;
++    }
++
+     /* A fixed record's size is both RSIZE and MRS: either one sets
+        both, as VMS keeps them equal; neither means 512. */
+     if (a->rtype == ODS2_RFM_FIX) {
+@@ -793,13 +850,72 @@ static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a)
+     return true;
+ }
+ 
++/* /CONVERT's second pass: the encoder reads the host file through
++   this, and its problem is passed on to the content source. */
++typedef struct {
++    host_input_t *in;
++    ods2_text_var_encoder_t *enc;
++    ods2_content_source_t *src;
++} convert_ctx_t;
++
++static size_t convert_read_some(void *ctx_, uint8_t *buf, size_t n, bool *error_out)
++{
++    host_input_t *in = (host_input_t *) ctx_;
++    size_t got = fread(buf, 1, n, in->f);
++    if (got == 0 && ferror(in->f)) *error_out = true;
++    return got;
++}
++
++static bool convert_read(void *ctx_, uint8_t *buf, size_t n)
++{
++    convert_ctx_t *c = (convert_ctx_t *) ctx_;
++    if (ods2_text_var_read(c->enc, buf, n)) return true;
++    snprintf(c->in->problem, sizeof(c->in->problem), "%s: %s", c->in->path,
++             ods2_text_var_problem(c->enc));
++    c->src->problem = c->in->problem;
++    return false;
++}
++
++/* /CONVERT's first pass: reads the whole host file through the
++   scanner, then rewinds it. Returns false after reporting a problem
++   (a read error, or a line too long to be a record). */
++static bool convert_scan(host_input_t *in, ods2_text_var_scan_t *scan)
++{
++    static uint8_t buf[1 << 16];
++    size_t n;
++
++    ods2_text_var_scan_init(scan);
++    while ((n = fread(buf, 1, sizeof(buf), in->f)) > 0) {
++        ods2_text_var_scan_feed(scan, buf, n);
++    }
++    if (ferror(in->f)) {
++        report_error("%%ODS2-E-READERR, error reading %s\n", in->path);
++        return false;
++    }
++    ods2_text_var_scan_finish(scan);
++    if (scan->too_long_line != 0) {
++        report_error("%%ODS2-E-RECTOOBIG, %s: line %zu is longer than a variable-length "
++                     "record can be (%u bytes)\n", in->path, scan->too_long_line,
++                     ODS2_VAR_MAX_RECORD);
++        return false;
++    }
++    if (fseek(in->f, 0, SEEK_SET) != 0) {
++        report_error("%%ODS2-E-READERR, could not reread %s\n", in->path);
++        return false;
++    }
++    return true;
++}
++
+ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_parsed_path_t *p,
+-                     const ods2_record_attrs_t *attrs)
++                     const ods2_record_attrs_t *attrs_in, const copy_options_t *opts)
+ {
+     uint8_t dir_header[512];
+     ods2_fid_t dir_fid, new_fid;
+     host_input_t in;
+     ods2_content_source_t src;
++    ods2_record_attrs_t attrs = *attrs_in;
++    ods2_text_var_scan_t scan;
++    convert_ctx_t conv;
+     ods2_result_t r;
+     const char *name;
+ 
+@@ -824,6 +940,24 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
+     if (!host_input_open(local_file, &in)) {
+         return;
+     }
++    memset(&src, 0, sizeof(src));
++    memset(&conv, 0, sizeof(conv));
++    if (opts->convert) {
++        if (!convert_scan(&in, &scan)) {
++            fclose(in.f);
++            return;
++        }
++        attrs.rsize = (uint16_t) scan.longest;
++        if (!opts->mrs_given) attrs.maxrec = 0;
++        conv.in = &in;
++        conv.src = &src;
++        conv.enc = ods2_text_var_encoder_new(convert_read_some, &in);
++        if (conv.enc == NULL) {
++            report_error("%%ODS2-E-NOMEM, could not allocate the record converter\n");
++            fclose(in.f);
++            return;
++        }
++    }
+ 
+     {
+         char effective_dir[ODS2_PATH_MAX];
+@@ -832,14 +966,23 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
+     }
+     if (!r.ok) {
+         report_error("%%ODS2-E-DIRERR, %s\n", r.problem);
++        ods2_text_var_encoder_free(conv.enc);
+         fclose(in.f);
+         return;
+     }
+-    src.length = in.length;
+-    src.read = host_input_read;
+-    src.ctx = &in;
+-    src.problem = in.problem;
+-    r = ods2_create_file_source(vol, dir_header, name, &src, attrs, &new_fid);
++    if (opts->convert) {
++        src.length = scan.converted_length;
++        src.read = convert_read;
++        src.ctx = &conv;
++        src.var_records = true;
++    } else {
++        src.length = in.length;
++        src.read = host_input_read;
++        src.ctx = &in;
++        src.problem = in.problem;
++    }
++    r = ods2_create_file_source(vol, dir_header, name, &src, &attrs, &new_fid);
++    ods2_text_var_encoder_free(conv.enc);
+     fclose(in.f);
+     if (!r.ok) {
+         report_error("%%ODS2-E-COPYERR, %s\n", r.problem);
+@@ -852,7 +995,13 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
+         if (!ods2_make_file_name(name, stored, sizeof(stored), &why)) {
+             snprintf(stored, sizeof(stored), "%s", name);
+         }
+-        printf("%%ODS2-I-COPIED, %zu bytes to %s;1\n", in.length, stored);
++        if (opts->convert) {
++            printf("%%ODS2-I-COPIED, %zu bytes to %s;1 as %zu variable-length "
++                   "record%s (longest %zu)\n", in.length, stored, scan.records,
++                   scan.records == 1 ? "" : "s", scan.longest);
++        } else {
++            printf("%%ODS2-I-COPIED, %zu bytes to %s;1\n", in.length, stored);
++        }
+     }
+ }
+ 
+@@ -996,6 +1145,10 @@ static void print_help(void)
+            "                             ... with chosen record attributes: RFM: FIX,\n"
+            "                             STMLF, STM, STMCR or UDF; MRS: record size;\n"
+            "                             RAT: NONE, CR, FTN, PRN, BLK (one per RAT:)\n"
++           "  COPY/CONVERT <local-file> <path>\n"
++           "                             a text file as variable-length records with\n"
++           "                             CR carriage control (VMS's native text), one\n"
++           "                             per line; with /ATTRIBUTES for other RAT/MRS\n"
+            "  TYPE path                  print a file's content\n"
+            "  DELETE path                delete a file (one version) or empty directory\n"
+            "  SET DEFAULT path           set the current default directory\n"
+@@ -1149,12 +1302,14 @@ static bool execute_line(ods2_volume_t *vol, char *line)
+     if (matches(verb, "COPY") || matches(verb, "PUT") || matches(verb, "IMPORT")) {
+         ods2_parsed_path_t p;
+         ods2_record_attrs_t attrs;
++        copy_options_t opts;
++        memset(&opts, 0, sizeof(opts));
+         /* COPY's default: Stream_LF, as before qualifiers existed. */
+         attrs.rtype = ODS2_RFM_STMLF;
+         attrs.rattrib = 0;
+         attrs.rsize = 512;
+         attrs.maxrec = 512;
+-        if (quals != NULL && !parse_copy_qualifiers(quals, &attrs)) {
++        if (quals != NULL && !parse_copy_qualifiers(quals, &attrs, &opts)) {
+             return true;
+         }
+         if (n < 3) {
+@@ -1166,7 +1321,7 @@ static bool execute_line(ods2_volume_t *vol, char *line)
+             return true;
+         }
+         if (refuse_wild_dir(&p, "COPY", tokens[2])) return true;
+-        cmd_copy(vol, tokens[1], &p, &attrs);
++        cmd_copy(vol, tokens[1], &p, &attrs, &opts);
+         return true;
+     }
+     if (matches(tokens[0], "TYPE") || matches(tokens[0], "CAT")) {
+-- 
+2.43.0

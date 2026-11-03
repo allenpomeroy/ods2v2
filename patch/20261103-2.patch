@@ -1,0 +1,765 @@
+From 480dadbf500fc1e454109d42a23468517ddb136a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 13:07:29 -0600
+Subject: [PATCH] Stream COPY and TYPE instead of reading whole files into
+ memory (#16)
+
+COPY read the whole host file into memory before writing it, and TYPE
+read the whole VMS file into memory before printing it, so memory use
+grew with the file: a 192 MiB file took about 226 MiB peak either way.
+
+The library gains ods2_content_source_t and ods2_create_file_source():
+the content's length is known up front, so allocation is decided from
+it exactly as before, then write_extents() pulls 1 MiB chunks from the
+source and writes them extent by extent. If the source fails part way
+(a read error, a file that shrank) the existing undo path gives back
+every block and file number and no file is created.
+ods2_create_file() and ods2_create_file_attrs() are now thin wrappers
+over a memory source.
+
+ods2_read_file_stream() hands a file's content to a sink a chunk at a
+time, telling a sink failure apart from a volume read error;
+ods2_read_file() wraps it with a memory sink.
+
+In the CLI, COPY reads a regular file directly, sized by fstat(); input
+with no length (a pipe, /dev/stdin) is spooled to a tmpfile() first.
+TYPE writes each chunk to stdout as it is read. Measured with the same
+192 MiB file: COPY 226 -> 13 MiB peak, TYPE 225 -> 13 MiB.
+
+Tests: ods2_large_file_selftest checks a streamed source failing after
+some chunks leaves no file and leaks nothing, with no chunk over
+ODS2_STREAM_CHUNK; cli_large_file_check.sh checks a 96 MiB file stays
+under 64 MiB peak through COPY (file and pipe) and TYPE, byte for byte.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WA1cTxSh5f8UrT87d9WhcQ
+---
+ README.md                        |   7 +-
+ include/ods2_volume.h            |  37 ++++++
+ src/ods2_volume.c                | 197 ++++++++++++++++++++++++-------
+ tests/cli_large_file_check.sh    |  27 +++++
+ tests/ods2_large_file_selftest.c |  48 ++++++++
+ tools/ods2.c                     | 176 ++++++++++++++++-----------
+ 6 files changed, 378 insertions(+), 114 deletions(-)
+
+diff --git a/README.md b/README.md
+index 279bfcd..11edc5a 100644
+--- a/README.md
++++ b/README.md
+@@ -261,8 +261,11 @@ in every structural test.
+   goes in as few pieces as the free space allows (one, on a volume
+   with a long enough free run), described by Format 1, 2 or 3
+   retrieval pointers, continuing into extension headers on fragmented
+-  free space - up to 1,024 pieces. The whole file is read into memory
+-  first. Directories still grow only within one header.
++  free space - up to 1,024 pieces. `COPY` and `TYPE` stream the
++  content in 1 MiB chunks, so memory use stays flat however large the
++  file. Input with no length to go by (a pipe, `/dev/stdin`) is first
++  copied to a temporary file (in `$TMPDIR`, or `/tmp`), so that needs
++  room for it. Directories still grow only within one header.
+ - No INITIALIZE command (formatting a *new* volume from scratch) - see
+   `samples/README.md` for why that's a deliberate choice (it's complicated)
+   and how to get a real, ready-to-use volume instead.
+diff --git a/include/ods2_volume.h b/include/ods2_volume.h
+index 8a4946c..1588095 100644
+--- a/include/ods2_volume.h
++++ b/include/ods2_volume.h
+@@ -350,6 +350,43 @@ ods2_result_t ods2_create_file_attrs(ods2_volume_t *vol, const uint8_t *parent_h
+                                       size_t content_len, const ods2_record_attrs_t *attrs,
+                                       ods2_fid_t *new_fid_out);
+ 
++/* Content for a new file, read in order rather than held in memory
++ * (issue #16): `length` bytes in all, known before anything is
++ * allocated, delivered by `read`, which fills exactly `n` bytes of
++ * `buf` with the next part of the content and returns true, or returns
++ * false if it can't (a read error, or a source shorter than `length`).
++ * `read` is called with chunks of at most ODS2_STREAM_CHUNK bytes, in
++ * order, `length` bytes in total. `problem`, if `read` sets it, says
++ * why it failed; otherwise the failure is reported generically. */
++#define ODS2_STREAM_CHUNK (1u << 20)
++
++typedef struct {
++    size_t length;
++    bool (*read)(void *ctx, uint8_t *buf, size_t n);
++    void *ctx;
++    const char *problem;
++} ods2_content_source_t;
++
++/* ods2_create_file_attrs() with the content taken from `src` a chunk
++ * at a time, so memory use stays the same whatever the file's size.
++ * Everything is allocated (from src->length) before the first read;
++ * if `src` fails part way, everything is given back and no file is
++ * created. */
++ods2_result_t ods2_create_file_source(ods2_volume_t *vol, const uint8_t *parent_header,
++                                       const char *name, ods2_content_source_t *src,
++                                       const ods2_record_attrs_t *attrs,
++                                       ods2_fid_t *new_fid_out);
++
++/* Reads a file's logical content (as ods2_read_file()) and hands it to
++ * `sink` in order, a chunk of at most ODS2_STREAM_CHUNK bytes at a
++ * time, so memory use stays the same whatever the file's size. If
++ * `sink` returns false the read stops and fails with *sink_failed_out
++ * (if non-NULL) set true, telling that apart from a volume read error.
++ * *bytes_out (if non-NULL) is how much reached the sink. */
++ods2_result_t ods2_read_file_stream(ods2_volume_t *vol, const uint8_t *header,
++                                     bool (*sink)(void *ctx, const uint8_t *data, size_t n),
++                                     void *ctx, size_t *bytes_out, bool *sink_failed_out);
++
+ /* Inserts (name, version, fid) into the directory whose header is at
+  * `dir_file_number`, trying each of its existing content blocks
+  * first; if none have room, allocates a new block, extends the
+diff --git a/src/ods2_volume.c b/src/ods2_volume.c
+index 79e22f2..3c5ce2f 100644
+--- a/src/ods2_volume.c
++++ b/src/ods2_volume.c
+@@ -619,47 +619,102 @@ size_t ods2_file_allocated_bytes(const uint8_t *header)
+     return (size_t) ods2_word_swap32(core->recattr.hiblk) * 512u;
+ }
+ 
+-ods2_result_t ods2_read_file(ods2_volume_t *vol, const uint8_t *header,
+-                              uint8_t *buf_out, size_t buf_size, size_t *bytes_read_out)
++ods2_result_t ods2_read_file_stream(ods2_volume_t *vol, const uint8_t *header,
++                                     bool (*sink)(void *ctx, const uint8_t *data, size_t n),
++                                     void *ctx, size_t *bytes_out, bool *sink_failed_out)
+ {
+     size_t content_len = ods2_file_content_length(header);
+     size_t allocated = ods2_file_allocated_bytes(header);
+     size_t written = 0;
++    ods2_result_t r = ok();
+ 
++    if (bytes_out) *bytes_out = 0;
++    if (sink_failed_out) *sink_failed_out = false;
+     if (content_len > allocated) {
+         /* Corrupt header: the EOF mark claims more data than the file
+            has blocks. Say so, rather than fail later on an unmapped
+            VBN (or have a caller size a buffer from a bogus length). */
+         return fail("file's end-of-file mark lies beyond its allocated blocks");
+     }
+-    if (content_len > buf_size) {
+-        return fail("output buffer too small for file content");
+-    }
+ 
+-    /* Decoded once, then read a whole extent at a time - a large file
+-       is hundreds of thousands of blocks, too many to look up and
+-       read one by one. */
++    /* Decoded once, then read an extent at a time in chunks of at
++       most ODS2_STREAM_CHUNK - a large file is hundreds of thousands
++       of blocks, too many to look up one by one, and too much to hold
++       in memory at once (issue #16). */
+     if (content_len > 0) {
+         ods2_extent_t extents[ODS2_MAX_EXTENTS];
++        size_t chunk_cap = content_len < ODS2_STREAM_CHUNK ? content_len : ODS2_STREAM_CHUNK;
++        uint8_t *chunk;
+         int n, i;
+-        ods2_result_t r = ods2_decode_all_extents(vol, header, extents, ODS2_MAX_EXTENTS, &n);
++
++        r = ods2_decode_all_extents(vol, header, extents, ODS2_MAX_EXTENTS, &n);
+         if (!r.ok) return r;
+-        for (i = 0; i < n && written < content_len; i++) {
++        chunk = malloc(chunk_cap);
++        if (chunk == NULL) return fail("could not allocate a read buffer");
++        for (i = 0; i < n && written < content_len && r.ok; i++) {
+             size_t want = content_len - written;
+             size_t run = (size_t) extents[i].block_count * 512u;
+             if (want > run) want = run;
+-            if (fseek(vol->fp, (long) extents[i].lbn * 512, SEEK_SET) != 0 ||
+-                fread(buf_out + written, 1, want, vol->fp) != want) {
+-                return fail("could not read file content block");
++            if (fseek(vol->fp, (long) extents[i].lbn * 512, SEEK_SET) != 0) {
++                r = fail("could not read file content block");
++                break;
++            }
++            while (want > 0) {
++                size_t piece = want < chunk_cap ? want : chunk_cap;
++                if (fread(chunk, 1, piece, vol->fp) != piece) {
++                    r = fail("could not read file content block");
++                    break;
++                }
++                if (!sink(ctx, chunk, piece)) {
++                    if (sink_failed_out) *sink_failed_out = true;
++                    r = fail("could not deliver file content to its destination");
++                    break;
++                }
++                written += piece;
++                want -= piece;
+             }
+-            written += want;
+         }
+-        if (written < content_len) {
+-            return fail("requested VBN is not covered by this file's extents");
++        free(chunk);
++        if (r.ok && written < content_len) {
++            r = fail("requested VBN is not covered by this file's extents");
+         }
+     }
++    if (bytes_out) *bytes_out = written;
++    return r;
++}
++
++typedef struct {
++    uint8_t *buf;
++    size_t size, used;
++} memory_sink_t;
+ 
+-    *bytes_read_out = written;
++static bool memory_sink(void *ctx_, const uint8_t *data, size_t n)
++{
++    memory_sink_t *ctx = (memory_sink_t *) ctx_;
++    if (n > ctx->size - ctx->used) return false;
++    memcpy(ctx->buf + ctx->used, data, n);
++    ctx->used += n;
++    return true;
++}
++
++ods2_result_t ods2_read_file(ods2_volume_t *vol, const uint8_t *header,
++                              uint8_t *buf_out, size_t buf_size, size_t *bytes_read_out)
++{
++    memory_sink_t ctx;
++    ods2_result_t r;
++
++    if (ods2_file_content_length(header) > ods2_file_allocated_bytes(header)) {
++        return fail("file's end-of-file mark lies beyond its allocated blocks");
++    }
++    if (ods2_file_content_length(header) > buf_size) {
++        return fail("output buffer too small for file content");
++    }
++    ctx.buf = buf_out;
++    ctx.size = buf_size;
++    ctx.used = 0;
++    r = ods2_read_file_stream(vol, header, memory_sink, &ctx, NULL, NULL);
++    if (!r.ok) return r;
++    *bytes_read_out = ctx.used;
+     return ok();
+ }
+ 
+@@ -1312,50 +1367,85 @@ ods2_result_t ods2_create_directory(ods2_volume_t *vol, const uint8_t *parent_he
+     return ok();
+ }
+ 
+-/* Writes `content` (`content_len` bytes) into the blocks described by
+-   `extents`, in order, zero-filling the rest of the last block and any
+-   further allocated blocks. Writes whole runs at a time rather than a
+-   block per call - a large file is hundreds of thousands of blocks. */
++/* Writes src->length bytes, read from `src` a chunk at a time, into
++   the blocks described by `extents`, in order, zero-filling the rest
++   of the last block and any further allocated blocks. Seeks once per
++   extent and writes it a chunk at a time, so memory use stays at one
++   chunk however large the file (issue #16). */
+ static ods2_result_t write_extents(ods2_volume_t *vol, const ods2_extent_t *extents,
+-                                   int extent_count, const uint8_t *content,
+-                                   size_t content_len)
++                                   int extent_count, ods2_content_source_t *src)
+ {
+     static const uint8_t zeros[65536];
+     size_t offset = 0;
++    size_t content_len = src->length;
++    size_t chunk_cap = content_len < ODS2_STREAM_CHUNK ? content_len : ODS2_STREAM_CHUNK;
++    uint8_t *chunk = NULL;
++    ods2_result_t r = ok();
+     int i;
+ 
+     if (!vol->writable) {
+         return fail("volume was not mounted for write (use ods2_mount_write)");
+     }
+-    for (i = 0; i < extent_count; i++) {
++    if (chunk_cap > 0) {
++        chunk = malloc(chunk_cap);
++        if (chunk == NULL) return fail("could not allocate a write buffer");
++    }
++    for (i = 0; i < extent_count && r.ok; i++) {
+         size_t run_bytes = (size_t) extents[i].block_count * 512u;
+         size_t data = (offset < content_len) ? content_len - offset : 0;
+ 
+         if (data > run_bytes) data = run_bytes;
+         if (fseek(vol->fp, (long) extents[i].lbn * 512, SEEK_SET) != 0) {
+-            return fail("could not seek to file content blocks");
+-        }
+-        if (data > 0 && fwrite(content + offset, 1, data, vol->fp) != data) {
+-            return fail("could not write file content blocks");
++            r = fail("could not seek to file content blocks");
++            break;
+         }
+         run_bytes -= data;
+-        while (run_bytes > 0) {
++        while (data > 0) {
++            size_t piece = data < chunk_cap ? data : chunk_cap;
++            if (!src->read(src->ctx, chunk, piece)) {
++                r = fail(src->problem != NULL ? src->problem
++                                              : "could not read the file's content");
++                break;
++            }
++            if (fwrite(chunk, 1, piece, vol->fp) != piece) {
++                r = fail("could not write file content blocks");
++                break;
++            }
++            data -= piece;
++            offset += piece;
++        }
++        while (r.ok && run_bytes > 0) {
+             size_t n = (run_bytes < sizeof(zeros)) ? run_bytes : sizeof(zeros);
+             if (fwrite(zeros, 1, n, vol->fp) != n) {
+-                return fail("could not write file content blocks");
++                r = fail("could not write file content blocks");
++                break;
+             }
+             run_bytes -= n;
+         }
+-        offset += data;
+     }
+-    if (fflush(vol->fp) != 0) {
+-        return fail("could not flush written file content");
++    free(chunk);
++    if (r.ok && fflush(vol->fp) != 0) {
++        r = fail("could not flush written file content");
+     }
+-    return ok();
++    return r;
++}
++
++/* An ods2_content_source_t over a buffer already in memory. */
++typedef struct {
++    const uint8_t *data;
++    size_t pos;
++} memory_source_t;
++
++static bool memory_source_read(void *ctx_, uint8_t *buf, size_t n)
++{
++    memory_source_t *ctx = (memory_source_t *) ctx_;
++    memcpy(buf, ctx->data + ctx->pos, n);
++    ctx->pos += n;
++    return true;
+ }
+ 
+ static ods2_result_t create_file(ods2_volume_t *vol, const uint8_t *parent_header,
+-                                 const char *name, const uint8_t *content, size_t content_len,
++                                 const char *name, ods2_content_source_t *src,
+                                  const ods2_record_attrs_t *attrs, ods2_fid_t *new_fid_out);
+ 
+ const char *ods2_check_record_attrs(const ods2_record_attrs_t *attrs, size_t content_len)
+@@ -1411,11 +1501,27 @@ ods2_result_t ods2_create_file_attrs(ods2_volume_t *vol, const uint8_t *parent_h
+                                       size_t content_len, const ods2_record_attrs_t *attrs,
+                                       ods2_fid_t *new_fid_out)
+ {
+-    const char *why = ods2_check_record_attrs(attrs, content_len);
++    memory_source_t ctx;
++    ods2_content_source_t src;
++    ctx.data = content;
++    ctx.pos = 0;
++    src.length = content_len;
++    src.read = memory_source_read;
++    src.ctx = &ctx;
++    src.problem = NULL;
++    return ods2_create_file_source(vol, parent_header, name, &src, attrs, new_fid_out);
++}
++
++ods2_result_t ods2_create_file_source(ods2_volume_t *vol, const uint8_t *parent_header,
++                                       const char *name, ods2_content_source_t *src,
++                                       const ods2_record_attrs_t *attrs,
++                                       ods2_fid_t *new_fid_out)
++{
++    const char *why = ods2_check_record_attrs(attrs, src->length);
+     if (why != NULL) {
+         return fail(why);
+     }
+-    return create_file(vol, parent_header, name, content, content_len, attrs, new_fid_out);
++    return create_file(vol, parent_header, name, src, attrs, new_fid_out);
+ }
+ 
+ ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,
+@@ -1427,13 +1533,24 @@ ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,
+     attrs.rattrib = 0;
+     attrs.rsize = 512;
+     attrs.maxrec = 512;
+-    return create_file(vol, parent_header, name, content, content_len, &attrs, new_fid_out);
++    {
++        memory_source_t ctx;
++        ods2_content_source_t src;
++        ctx.data = content;
++        ctx.pos = 0;
++        src.length = content_len;
++        src.read = memory_source_read;
++        src.ctx = &ctx;
++        src.problem = NULL;
++        return create_file(vol, parent_header, name, &src, &attrs, new_fid_out);
++    }
+ }
+ 
+ static ods2_result_t create_file(ods2_volume_t *vol, const uint8_t *parent_header,
+-                                 const char *name, const uint8_t *content, size_t content_len,
++                                 const char *name, ods2_content_source_t *src,
+                                  const ods2_record_attrs_t *attrs, ods2_fid_t *new_fid_out)
+ {
++    size_t content_len = src->length;
+     const ods2_head_core_t *parent_core = (const ods2_head_core_t *) parent_header;
+     ods2_fid_t existing;
+     size_t blocks_needed;
+@@ -1562,7 +1679,7 @@ static ods2_result_t create_file(ods2_volume_t *vol, const uint8_t *parent_heade
+         numbered++;
+     }
+     /* The content goes down before any header refers to it. */
+-    r = write_extents(vol, extents, extent_count, content, content_len);
++    r = write_extents(vol, extents, extent_count, src);
+     if (!r.ok) goto undo;
+ 
+     memset(&spec, 0, sizeof(spec));
+diff --git a/tests/cli_large_file_check.sh b/tests/cli_large_file_check.sh
+index 17c7811..4b6984e 100644
+--- a/tests/cli_large_file_check.sh
++++ b/tests/cli_large_file_check.sh
+@@ -65,5 +65,32 @@ check "COPY again into the space it freed" \
+     "%ODS2-I-COPIED, 27000001 bytes to ODD2.BIN;1" \
+     "$($ODS2 $DISK COPY $TMP/odd.bin '[000000]ODD2.BIN' 2>&1)"
+ 
++# Issue #16: COPY and TYPE stream, so their memory use doesn't grow
++# with the file. A 96 MiB file must go through in well under 96 MiB of
++# peak memory - from a file, from a pipe (spooled to a temporary file),
++# and back out with TYPE. (Measured with Python's getrusage, as the
++# test suite already needs Python.)
++peak_mib() { # peak_mib <command...>: the command's peak RSS, in MiB
++    python3 -I -c 'import resource, subprocess, sys
++subprocess.run(sys.argv[1:], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++print(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss // 1024)' "$@"
++}
++under_limit() { if [ "$1" -lt 64 ]; then echo yes; else echo "no ($1 MiB)"; fi; }
++head -c 100663296 /dev/zero | tr '\0' 'z' > "$TMP/big.bin"
++check "COPY of a 96 MiB file stays under 64 MiB of memory (issue #16)" yes \
++    "$(under_limit "$(peak_mib $ODS2 $DISK COPY $TMP/big.bin '[000000]BIG.BIN')")"
++check "TYPE of it stays under 64 MiB of memory" yes \
++    "$(under_limit "$(peak_mib $ODS2 $DISK 'TYPE [000000]BIG.BIN')")"
++$ODS2 $DISK "TYPE [000000]BIG.BIN" > "$TMP/out.bin" 2>/dev/null
++if cmp -s "$TMP/big.bin" "$TMP/out.bin"; then same=identical; else same=different; fi
++check "TYPE BIG.BIN reads back byte for byte" identical "$same"
++check "COPY of it from a pipe stays under 64 MiB too" yes \
++    "$(under_limit "$(peak_mib sh -c "cat $TMP/big.bin | $ODS2 $DISK COPY /dev/stdin '[000000]BIGPIPE.BIN'")")"
++$ODS2 $DISK "TYPE [000000]BIGPIPE.BIN" > "$TMP/out.bin" 2>/dev/null
++if cmp -s "$TMP/big.bin" "$TMP/out.bin"; then same=identical; else same=different; fi
++check "TYPE BIGPIPE.BIN reads back byte for byte" identical "$same"
++$ODS2 $DISK 'DELETE [000000]BIG.BIN;1' > /dev/null 2>&1
++$ODS2 $DISK 'DELETE [000000]BIGPIPE.BIN;1' > /dev/null 2>&1
++
+ rm -rf "$TMP"
+ [ "$fails" -eq 0 ] || { echo "$fails CLI large-file check(s) failed"; exit 1; }
+diff --git a/tests/ods2_large_file_selftest.c b/tests/ods2_large_file_selftest.c
+index c6d205e..4f18d6e 100644
+--- a/tests/ods2_large_file_selftest.c
++++ b/tests/ods2_large_file_selftest.c
+@@ -98,6 +98,22 @@ static uint8_t *pattern(size_t len, unsigned seed)
+ }
+ 
+ /* Free clusters according to BITMAP.SYS (VBN 1 is the SCB). */
++/* A content source that delivers zeros, then fails after
++   `fail_after` bytes, recording the largest chunk asked for. */
++typedef struct {
++    size_t delivered, fail_after, largest;
++} failing_source_t;
++
++static bool failing_read(void *ctx_, uint8_t *buf, size_t n)
++{
++    failing_source_t *fs = (failing_source_t *) ctx_;
++    if (n > fs->largest) fs->largest = n;
++    if (fs->delivered + n > fs->fail_after) return false;
++    memset(buf, 0, n);
++    fs->delivered += n;
++    return true;
++}
++
+ static size_t free_clusters(ods2_volume_t *vol)
+ {
+     uint8_t bh[512];
+@@ -278,6 +294,38 @@ int main(void)
+                    "block and file number (%s)\n", r.problem);
+         }
+ 
++        /* Streamed content (issue #16): a source that fails part way,
++           after some chunks are already on the disk, leaves no file
++           and gives everything back. */
++        {
++            failing_source_t fs;
++            ods2_content_source_t src;
++            ods2_record_attrs_t attrs;
++            fs.delivered = 0;
++            fs.fail_after = 3u * ODS2_STREAM_CHUNK;
++            fs.largest = 0;
++            src.length = 5u * ODS2_STREAM_CHUNK + 123u;
++            src.read = failing_read;
++            src.ctx = &fs;
++            src.problem = NULL;
++            attrs.rtype = ODS2_RFM_UDF;
++            attrs.rattrib = 0;
++            attrs.rsize = 0;
++            attrs.maxrec = 0;
++            assert(ods2_read_header(&vol, 4, root).ok);
++            r = ods2_create_file_source(&vol, root, "BROKEN.BIN", &src, &attrs, &fid);
++            assert(!r.ok);
++            assert(fs.delivered > 0 && fs.delivered <= fs.fail_after);
++            assert(fs.largest <= ODS2_STREAM_CHUNK);
++            assert(free_clusters(&vol) == free_before);
++            assert(used_file_numbers(&vol) == files_before);
++            assert(ods2_read_header(&vol, 4, root).ok);
++            assert(!ods2_lookup_name(&vol, root, "BROKEN.BIN", &fid).ok);
++            printf("PASS: a streamed source failing after %zu of %zu bytes leaves no "
++                   "file and gives back every block and file number (%s)\n",
++                   fs.delivered, src.length, r.problem);
++        }
++
+         /* Content that takes every hole leaves no room for INDEXF.SYS
+            to grow for the extension headers: the volume really is
+            full, and the copy must fail without leaking anything. */
+diff --git a/tools/ods2.c b/tools/ods2.c
+index daf93bc..3b4cdf4 100644
+--- a/tools/ods2.c
++++ b/tools/ods2.c
+@@ -103,6 +103,8 @@
+ #include <string.h>
+ #include <ctype.h>
+ #include <stdarg.h>
++#include <errno.h>
++#include <sys/stat.h>
+ #include "ods2_volume.h"
+ #include "ods2_path.h"
+ #include "ods2_wildcard.h"
+@@ -547,56 +549,90 @@ static void cmd_create_directory(ods2_volume_t *vol, const ods2_parsed_path_t *p
+     printf("%%ODS2-I-CREATED, created [%s]\n", effective_path);
+ }
+ 
+-/* Reads all of `path` into a malloc'd buffer (*buf_out, *len_out),
+-   however large: sized from the file's own length, growing as needed
+-   for something without one (a pipe). Returns false and prints why
+-   on failure. */
+-static bool read_whole_file(const char *path, uint8_t **buf_out, size_t *len_out)
++/* A host file opened for COPY, read in order a chunk at a time
++   rather than all at once (issue #16). `length` is known before
++   anything is allocated on the volume: from the file itself if it is
++   a regular file, otherwise (a pipe, /dev/stdin) by first copying it
++   to a temporary file, which keeps memory use flat either way. */
++typedef struct {
++    FILE *f;
++    const char *path;
++    size_t length;
++    char problem[256];
++} host_input_t;
++
++static bool host_input_read(void *ctx_, uint8_t *buf, size_t n)
+ {
++    host_input_t *in = (host_input_t *) ctx_;
++    size_t got = fread(buf, 1, n, in->f);
++    if (got == n) return true;
++    if (ferror(in->f)) {
++        snprintf(in->problem, sizeof(in->problem), "error reading %s", in->path);
++    } else {
++        snprintf(in->problem, sizeof(in->problem),
++                 "%s became shorter while being copied (expected %zu bytes)",
++                 in->path, in->length);
++    }
++    return false;
++}
++
++/* Opens `path` for COPY, finding its length. Returns false and prints
++   why on failure. */
++static bool host_input_open(const char *path, host_input_t *in)
++{
++    struct stat st;
+     FILE *f = fopen(path, "rb");
+-    uint8_t *buf = NULL;
+-    size_t cap = 0, len = 0;
+-    long size;
+ 
++    memset(in, 0, sizeof(*in));
++    in->path = path;
+     if (f == NULL) {
+         report_error("%%ODS2-E-OPENIN, could not open %s\n", path);
+         return false;
+     }
+-    if (fseek(f, 0, SEEK_END) == 0 && (size = ftell(f)) >= 0 && fseek(f, 0, SEEK_SET) == 0) {
+-        cap = (size_t) size + 1; /* +1: a read that fills it means the file grew */
+-    } else {
+-        clearerr(f);
+-        cap = 1u << 20;
++    if (fstat(fileno(f), &st) == 0 && S_ISREG(st.st_mode)) {
++        in->f = f;
++        in->length = (size_t) st.st_size;
++        return true;
+     }
+-    for (;;) {
+-        size_t n;
+-        if (len == cap || buf == NULL) {
+-            uint8_t *grown;
+-            if (buf != NULL) cap *= 2;
+-            grown = realloc(buf, cap);
+-            if (grown == NULL) {
+-                report_error("%%ODS2-E-NOMEM, could not allocate %zu bytes to read %s\n",
+-                        cap, path);
+-                free(buf);
++    /* No length to go by: spool it to a temporary file first. */
++    {
++        static uint8_t buf[1 << 16];
++        FILE *spool = tmpfile();
++        size_t n, total = 0;
++
++        if (spool == NULL) {
++            report_error("%%ODS2-E-OPENIN, could not create a temporary file to "
++                         "hold %s: %s\n", path, strerror(errno));
++            fclose(f);
++            return false;
++        }
++        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
++            if (fwrite(buf, 1, n, spool) != n) {
++                report_error("%%ODS2-E-WRITEERR, could not write the temporary copy of "
++                             "%s (is the temporary directory full?)\n", path);
+                 fclose(f);
++                fclose(spool);
+                 return false;
+             }
+-            buf = grown;
++            total += n;
++        }
++        if (ferror(f)) {
++            report_error("%%ODS2-E-READERR, error reading %s\n", path);
++            fclose(f);
++            fclose(spool);
++            return false;
+         }
+-        n = fread(buf + len, 1, cap - len, f);
+-        len += n;
+-        if (n == 0) break;
+-    }
+-    if (ferror(f)) {
+-        report_error("%%ODS2-E-READERR, error reading %s\n", path);
+-        free(buf);
+         fclose(f);
+-        return false;
++        if (fflush(spool) != 0 || fseek(spool, 0, SEEK_SET) != 0) {
++            report_error("%%ODS2-E-READERR, could not reread the temporary copy of %s\n",
++                         path);
++            fclose(spool);
++            return false;
++        }
++        in->f = spool;
++        in->length = total;
++        return true;
+     }
+-    fclose(f);
+-    *buf_out = buf;
+-    *len_out = len;
+-    return true;
+ }
+ 
+ /* Case-insensitive: is `word` (length `len`) `name`, or an
+@@ -762,8 +798,8 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
+ {
+     uint8_t dir_header[512];
+     ods2_fid_t dir_fid, new_fid;
+-    uint8_t *buf;
+-    size_t content_len;
++    host_input_t in;
++    ods2_content_source_t src;
+     ods2_result_t r;
+     const char *name;
+ 
+@@ -785,7 +821,7 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
+     }
+     name = p->filename;
+ 
+-    if (!read_whole_file(local_file, &buf, &content_len)) {
++    if (!host_input_open(local_file, &in)) {
+         return;
+     }
+ 
+@@ -796,13 +832,17 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
+     }
+     if (!r.ok) {
+         report_error("%%ODS2-E-DIRERR, %s\n", r.problem);
+-        free(buf);
++        fclose(in.f);
+         return;
+     }
+-    r = ods2_create_file_attrs(vol, dir_header, name, buf, content_len, attrs, &new_fid);
++    src.length = in.length;
++    src.read = host_input_read;
++    src.ctx = &in;
++    src.problem = in.problem;
++    r = ods2_create_file_source(vol, dir_header, name, &src, attrs, &new_fid);
++    fclose(in.f);
+     if (!r.ok) {
+         report_error("%%ODS2-E-COPYERR, %s\n", r.problem);
+-        free(buf);
+         return;
+     }
+     {
+@@ -812,9 +852,14 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
+         if (!ods2_make_file_name(name, stored, sizeof(stored), &why)) {
+             snprintf(stored, sizeof(stored), "%s", name);
+         }
+-        printf("%%ODS2-I-COPIED, %zu bytes to %s;1\n", content_len, stored);
++        printf("%%ODS2-I-COPIED, %zu bytes to %s;1\n", in.length, stored);
+     }
+-    free(buf);
++}
++
++static bool stdout_sink(void *ctx, const uint8_t *data, size_t n)
++{
++    (void) ctx;
++    return fwrite(data, 1, n, stdout) == n;
+ }
+ 
+ static void cmd_type(ods2_volume_t *vol, const ods2_parsed_path_t *p)
+@@ -822,9 +867,6 @@ static void cmd_type(ods2_volume_t *vol, const ods2_parsed_path_t *p)
+     uint8_t dir_header[512], file_header[512];
+     ods2_fid_t dir_fid, file_fid;
+     ods2_result_t r;
+-    uint8_t *buf;
+-    size_t buf_size;
+-    size_t bytes_read = 0;
+     char spec[ODS2_PATH_MAX + 16];
+ 
+     if (p->filename[0] == '\0') {
+@@ -856,32 +898,22 @@ static void cmd_type(ods2_volume_t *vol, const ods2_parsed_path_t *p)
+         report_error("%%ODS2-E-READERR, %s\n", r.problem);
+         return;
+     }
+-    /* Sized from the file's own end-of-file mark rather than a fixed
+-       guess, so any size of file can be typed. */
+-    buf_size = ods2_file_content_length(file_header);
+-    if (buf_size > ods2_file_allocated_bytes(file_header)) {
+-        report_error("%%ODS2-E-READERR, %s: end-of-file mark lies beyond the "
+-                        "file's allocated blocks (corrupt header?)\n", spec);
+-        return;
+-    }
+-    buf = malloc(buf_size > 0 ? buf_size : 1);
+-    if (buf == NULL) {
+-        report_error("%%ODS2-E-NOMEM, could not allocate %zu-byte read buffer\n", buf_size);
+-        return;
+-    }
+-    r = ods2_read_file(vol, file_header, buf, buf_size, &bytes_read);
+-    if (!r.ok) {
+-        report_error("%%ODS2-E-READERR, %s\n", r.problem);
+-        free(buf);
+-        return;
+-    }
+-    /* A short write (a full disk, a closed pipe) is a failed TYPE:
+-       whatever was extracting the file got less than all of it. */
+-    if (fwrite(buf, 1, bytes_read, stdout) != bytes_read || fflush(stdout) != 0) {
+-        report_error("%%ODS2-E-WRITEERR, %s: could not write all %zu bytes to output\n",
+-                     spec, bytes_read);
++    /* Streamed a chunk at a time, so any size of file can be typed
++       without holding it in memory (issue #16). A short write (a full
++       disk, a closed pipe) is a failed TYPE: whatever was extracting
++       the file got less than all of it. */
++    {
++        bool sink_failed = false;
++        size_t bytes = 0;
++        r = ods2_read_file_stream(vol, file_header, stdout_sink, NULL, &bytes, &sink_failed);
++        if (r.ok && fflush(stdout) != 0) sink_failed = true;
++        if (sink_failed) {
++            report_error("%%ODS2-E-WRITEERR, %s: could not write all %zu bytes to output\n",
++                         spec, ods2_file_content_length(file_header));
++        } else if (!r.ok) {
++            report_error("%%ODS2-E-READERR, %s: %s\n", spec, r.problem);
++        }
+     }
+-    free(buf);
+ }
+ 
+ static void cmd_delete(ods2_volume_t *vol, const ods2_parsed_path_t *p)
+-- 
+2.43.0

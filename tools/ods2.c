@@ -58,11 +58,19 @@
  *                                 ... with chosen RMS record attributes,
  *                                 in SET FILE/ATTRIBUTES syntax (see
  *                                 parse_copy_qualifiers())
+ *   COPY/CONVERT <local-file> <path>
+ *                                 a text file as variable-length
+ *                                 records (RFM:VAR, RAT:CR), one per
+ *                                 line - VMS's native text format
  *   TYPE path                     print a file's content
  *   DELETE path                   delete a file (one version) or an
  *                                 empty directory
  *   SET DEFAULT path              set the current default directory
  *   SHOW DEFAULT                  show the current default directory
+ *   SET VOLUME/LABEL=name         relabel the volume: every home block
+ *                                 copy, checksums recomputed
+ *   SHOW VOLUME                   label, owner, cluster size, maximum
+ *                                 files, total and free blocks
  *   HELP                          show this command list
  *   EXIT / QUIT                   leave the interactive shell
  *
@@ -103,10 +111,13 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include "ods2_volume.h"
 #include "ods2_path.h"
 #include "ods2_wildcard.h"
 #include "ods2_directory_write.h"
+#include "ods2_text_var.h"
 
 #define MAX_LINE 1024
 #define MAX_TOKENS 8
@@ -547,56 +558,90 @@ static void cmd_create_directory(ods2_volume_t *vol, const ods2_parsed_path_t *p
     printf("%%ODS2-I-CREATED, created [%s]\n", effective_path);
 }
 
-/* Reads all of `path` into a malloc'd buffer (*buf_out, *len_out),
-   however large: sized from the file's own length, growing as needed
-   for something without one (a pipe). Returns false and prints why
-   on failure. */
-static bool read_whole_file(const char *path, uint8_t **buf_out, size_t *len_out)
-{
-    FILE *f = fopen(path, "rb");
-    uint8_t *buf = NULL;
-    size_t cap = 0, len = 0;
-    long size;
+/* A host file opened for COPY, read in order a chunk at a time
+   rather than all at once (issue #16). `length` is known before
+   anything is allocated on the volume: from the file itself if it is
+   a regular file, otherwise (a pipe, /dev/stdin) by first copying it
+   to a temporary file, which keeps memory use flat either way. */
+typedef struct {
+    FILE *f;
+    const char *path;
+    size_t length;
+    char problem[256];
+} host_input_t;
 
+static bool host_input_read(void *ctx_, uint8_t *buf, size_t n)
+{
+    host_input_t *in = (host_input_t *) ctx_;
+    size_t got = fread(buf, 1, n, in->f);
+    if (got == n) return true;
+    if (ferror(in->f)) {
+        snprintf(in->problem, sizeof(in->problem), "error reading %s", in->path);
+    } else {
+        snprintf(in->problem, sizeof(in->problem),
+                 "%s became shorter while being copied (expected %zu bytes)",
+                 in->path, in->length);
+    }
+    return false;
+}
+
+/* Opens `path` for COPY, finding its length. Returns false and prints
+   why on failure. */
+static bool host_input_open(const char *path, host_input_t *in)
+{
+    struct stat st;
+    FILE *f = fopen(path, "rb");
+
+    memset(in, 0, sizeof(*in));
+    in->path = path;
     if (f == NULL) {
         report_error("%%ODS2-E-OPENIN, could not open %s\n", path);
         return false;
     }
-    if (fseek(f, 0, SEEK_END) == 0 && (size = ftell(f)) >= 0 && fseek(f, 0, SEEK_SET) == 0) {
-        cap = (size_t) size + 1; /* +1: a read that fills it means the file grew */
-    } else {
-        clearerr(f);
-        cap = 1u << 20;
+    if (fstat(fileno(f), &st) == 0 && S_ISREG(st.st_mode)) {
+        in->f = f;
+        in->length = (size_t) st.st_size;
+        return true;
     }
-    for (;;) {
-        size_t n;
-        if (len == cap || buf == NULL) {
-            uint8_t *grown;
-            if (buf != NULL) cap *= 2;
-            grown = realloc(buf, cap);
-            if (grown == NULL) {
-                report_error("%%ODS2-E-NOMEM, could not allocate %zu bytes to read %s\n",
-                        cap, path);
-                free(buf);
+    /* No length to go by: spool it to a temporary file first. */
+    {
+        static uint8_t buf[1 << 16];
+        FILE *spool = tmpfile();
+        size_t n, total = 0;
+
+        if (spool == NULL) {
+            report_error("%%ODS2-E-OPENIN, could not create a temporary file to "
+                         "hold %s: %s\n", path, strerror(errno));
+            fclose(f);
+            return false;
+        }
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+            if (fwrite(buf, 1, n, spool) != n) {
+                report_error("%%ODS2-E-WRITEERR, could not write the temporary copy of "
+                             "%s (is the temporary directory full?)\n", path);
                 fclose(f);
+                fclose(spool);
                 return false;
             }
-            buf = grown;
+            total += n;
         }
-        n = fread(buf + len, 1, cap - len, f);
-        len += n;
-        if (n == 0) break;
-    }
-    if (ferror(f)) {
-        report_error("%%ODS2-E-READERR, error reading %s\n", path);
-        free(buf);
+        if (ferror(f)) {
+            report_error("%%ODS2-E-READERR, error reading %s\n", path);
+            fclose(f);
+            fclose(spool);
+            return false;
+        }
         fclose(f);
-        return false;
+        if (fflush(spool) != 0 || fseek(spool, 0, SEEK_SET) != 0) {
+            report_error("%%ODS2-E-READERR, could not reread the temporary copy of %s\n",
+                         path);
+            fclose(spool);
+            return false;
+        }
+        in->f = spool;
+        in->length = total;
+        return true;
     }
-    fclose(f);
-    *buf_out = buf;
-    *len_out = len;
-    return true;
 }
 
 /* Case-insensitive: is `word` (length `len`) `name`, or an
@@ -611,24 +656,43 @@ static bool keyword(const char *word, size_t len, const char *name, size_t min)
     return true;
 }
 
+/* COPY's options beyond the record attributes themselves. */
+typedef struct {
+    bool convert;   /* /CONVERT: host text lines -> VAR records */
+    bool mrs_given; /* MRS:n was given */
+} copy_options_t;
+
 /* Parses COPY's qualifiers - everything after "COPY" in the command
- * word - into the record attributes of the new file. The one qualifier
- * is /ATTRIBUTES, in the syntax of VMS's SET FILE/ATTRIBUTES:
+ * word - into the record attributes of the new file. /ATTRIBUTES is in
+ * the syntax of VMS's SET FILE/ATTRIBUTES:
  *
  *   COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) kit.pcsi [000000]KIT.PCSI
  *
- *   RFM:fmt   record format - FIX, STMLF, STM, STMCR or UDF
+ *   RFM:fmt   record format - FIX, STMLF, STM, STMCR or UDF, or VAR
+ *             with /CONVERT
  *   MRS:n     maximum record size; for FIX, the record size
  *   LRL:n     longest record length (for FIX, the same as MRS)
  *   RAT:x     record attributes - NONE, CR, FTN, PRN, BLK, NOBLK;
  *             repeat RAT for more than one (RAT:CR,RAT:BLK)
  *
+ * /CONVERT (issue #15) turns a host text file into variable-length
+ * records, one per line (see ods2_text_var.h) - VMS's native text
+ * format, as VMS FTP writes it in ASCII mode:
+ *
+ *   COPY/CONVERT notes.txt [DOC]NOTES.TXT
+ *   COPY/ATTRIBUTES=(RFM:VAR,RAT:CR)/CONVERT notes.txt [DOC]NOTES.TXT
+ *
+ * With /CONVERT the format is VAR and, unless a RAT was given, RAT:CR;
+ * the longest record length comes from the file, and MRS is 0 (no
+ * limit) unless given.
+ *
  * With no qualifier the file is Stream_LF, as always. A fixed format
  * with no size given is 512-byte records. Returns false after
  * reporting the problem. */
-static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a)
+static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a,
+                                  copy_options_t *opts)
 {
-    bool mrs_given = false, lrl_given = false;
+    bool mrs_given = false, lrl_given = false, rfm_given = false, rat_given = false;
     const char *q = quals;
 
     while (*q == '/') {
@@ -638,9 +702,18 @@ static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a)
 
         while (*q && *q != '=' && *q != '/') q++;
         name_len = (size_t) (q - name);
+        if (keyword(name, name_len, "CONVERT", 4)) {
+            if (*q == '=') {
+                report_error("%%ODS2-E-NOVALUE, /CONVERT takes no value\n");
+                return false;
+            }
+            opts->convert = true;
+            continue;
+        }
         if (!keyword(name, name_len, "ATTRIBUTES", 4)) {
             report_error("%%ODS2-E-IVQUAL, unrecognized qualifier /%.*s - COPY takes "
-                         "/ATTRIBUTES=(RFM:fmt,MRS:size,RAT:attr)\n", (int) name_len, name);
+                         "/ATTRIBUTES=(RFM:fmt,MRS:size,RAT:attr) and /CONVERT\n",
+                         (int) name_len, name);
             return false;
         }
         if (*q != '=') {
@@ -681,6 +754,7 @@ static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a)
 
             if (keyword(item, key_len, "RFM", 3)) {
                 const char *v = colon + 1;
+                rfm_given = true;
                 if (keyword(v, val_len, "FIXED", 3)) a->rtype = ODS2_RFM_FIX;
                 else if (keyword(v, val_len, "STMLF", 5) || keyword(v, val_len, "STREAM_LF", 8))
                     a->rtype = ODS2_RFM_STMLF;
@@ -694,7 +768,8 @@ static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a)
                 else if (keyword(v, val_len, "VFC", 3)) a->rtype = ODS2_RFM_VFC;
                 else {
                     report_error("%%ODS2-E-BADVALUE, RFM:%.*s - record format must be FIX, "
-                                 "STMLF, STM, STMCR or UDF\n", (int) val_len, v);
+                                 "STMLF, STM, STMCR or UDF, or VAR with /CONVERT\n",
+                                 (int) val_len, v);
                     return false;
                 }
             } else if (keyword(item, key_len, "MRS", 3) || keyword(item, key_len, "LRL", 3)) {
@@ -724,6 +799,7 @@ static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a)
                 }
             } else if (keyword(item, key_len, "RAT", 3)) {
                 const char *v = colon + 1;
+                rat_given = true;
                 if (keyword(v, val_len, "NONE", 4)) a->rattrib &= (uint8_t) ~0x07u;
                 else if (keyword(v, val_len, "CR", 2)) a->rattrib |= ODS2_RAT_CR;
                 else if (keyword(v, val_len, "FTN", 3)) a->rattrib |= ODS2_RAT_FTN;
@@ -747,6 +823,27 @@ static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a)
         return false;
     }
 
+    opts->mrs_given = mrs_given;
+    if (opts->convert) {
+        if (!rfm_given) a->rtype = ODS2_RFM_VAR;
+        if (a->rtype != ODS2_RFM_VAR) {
+            report_error("%%ODS2-E-CONFQUAL, /CONVERT makes variable-length records: "
+                         "use it with RFM:VAR, or no RFM at all\n");
+            return false;
+        }
+        if (!rat_given) a->rattrib = ODS2_RAT_CR;
+        if (lrl_given) {
+            report_error("%%ODS2-E-CONFQUAL, with /CONVERT the longest record length "
+                         "(LRL) comes from the file - leave LRL out\n");
+            return false;
+        }
+    } else if (a->rtype == ODS2_RFM_VAR) {
+        report_error("%%ODS2-E-CONFQUAL, RFM:VAR needs /CONVERT: each variable-length "
+                     "record starts with a byte count the host file doesn't have, so "
+                     "COPY/CONVERT makes one record per line\n");
+        return false;
+    }
+
     /* A fixed record's size is both RSIZE and MRS: either one sets
        both, as VMS keeps them equal; neither means 512. */
     if (a->rtype == ODS2_RFM_FIX) {
@@ -757,13 +854,72 @@ static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a)
     return true;
 }
 
+/* /CONVERT's second pass: the encoder reads the host file through
+   this, and its problem is passed on to the content source. */
+typedef struct {
+    host_input_t *in;
+    ods2_text_var_encoder_t *enc;
+    ods2_content_source_t *src;
+} convert_ctx_t;
+
+static size_t convert_read_some(void *ctx_, uint8_t *buf, size_t n, bool *error_out)
+{
+    host_input_t *in = (host_input_t *) ctx_;
+    size_t got = fread(buf, 1, n, in->f);
+    if (got == 0 && ferror(in->f)) *error_out = true;
+    return got;
+}
+
+static bool convert_read(void *ctx_, uint8_t *buf, size_t n)
+{
+    convert_ctx_t *c = (convert_ctx_t *) ctx_;
+    if (ods2_text_var_read(c->enc, buf, n)) return true;
+    snprintf(c->in->problem, sizeof(c->in->problem), "%s: %s", c->in->path,
+             ods2_text_var_problem(c->enc));
+    c->src->problem = c->in->problem;
+    return false;
+}
+
+/* /CONVERT's first pass: reads the whole host file through the
+   scanner, then rewinds it. Returns false after reporting a problem
+   (a read error, or a line too long to be a record). */
+static bool convert_scan(host_input_t *in, ods2_text_var_scan_t *scan)
+{
+    static uint8_t buf[1 << 16];
+    size_t n;
+
+    ods2_text_var_scan_init(scan);
+    while ((n = fread(buf, 1, sizeof(buf), in->f)) > 0) {
+        ods2_text_var_scan_feed(scan, buf, n);
+    }
+    if (ferror(in->f)) {
+        report_error("%%ODS2-E-READERR, error reading %s\n", in->path);
+        return false;
+    }
+    ods2_text_var_scan_finish(scan);
+    if (scan->too_long_line != 0) {
+        report_error("%%ODS2-E-RECTOOBIG, %s: line %zu is longer than a variable-length "
+                     "record can be (%u bytes)\n", in->path, scan->too_long_line,
+                     ODS2_VAR_MAX_RECORD);
+        return false;
+    }
+    if (fseek(in->f, 0, SEEK_SET) != 0) {
+        report_error("%%ODS2-E-READERR, could not reread %s\n", in->path);
+        return false;
+    }
+    return true;
+}
+
 static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_parsed_path_t *p,
-                     const ods2_record_attrs_t *attrs)
+                     const ods2_record_attrs_t *attrs_in, const copy_options_t *opts)
 {
     uint8_t dir_header[512];
     ods2_fid_t dir_fid, new_fid;
-    uint8_t *buf;
-    size_t content_len;
+    host_input_t in;
+    ods2_content_source_t src;
+    ods2_record_attrs_t attrs = *attrs_in;
+    ods2_text_var_scan_t scan;
+    convert_ctx_t conv;
     ods2_result_t r;
     const char *name;
 
@@ -785,8 +941,26 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
     }
     name = p->filename;
 
-    if (!read_whole_file(local_file, &buf, &content_len)) {
+    if (!host_input_open(local_file, &in)) {
         return;
+    }
+    memset(&src, 0, sizeof(src));
+    memset(&conv, 0, sizeof(conv));
+    if (opts->convert) {
+        if (!convert_scan(&in, &scan)) {
+            fclose(in.f);
+            return;
+        }
+        attrs.rsize = (uint16_t) scan.longest;
+        if (!opts->mrs_given) attrs.maxrec = 0;
+        conv.in = &in;
+        conv.src = &src;
+        conv.enc = ods2_text_var_encoder_new(convert_read_some, &in);
+        if (conv.enc == NULL) {
+            report_error("%%ODS2-E-NOMEM, could not allocate the record converter\n");
+            fclose(in.f);
+            return;
+        }
     }
 
     {
@@ -796,13 +970,43 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
     }
     if (!r.ok) {
         report_error("%%ODS2-E-DIRERR, %s\n", r.problem);
-        free(buf);
+        ods2_text_var_encoder_free(conv.enc);
+        fclose(in.f);
         return;
     }
-    r = ods2_create_file_attrs(vol, dir_header, name, buf, content_len, attrs, &new_fid);
+    if (opts->convert) {
+        src.length = scan.converted_length;
+        src.read = convert_read;
+        src.ctx = &conv;
+        src.var_records = true;
+    } else {
+        src.length = in.length;
+        src.read = host_input_read;
+        src.ctx = &in;
+        src.problem = in.problem;
+    }
+    r = ods2_create_file_source(vol, dir_header, name, &src, &attrs, &new_fid);
+    if (r.ok) {
+        /* More content than was measured means the host file grew
+           while it was copied: what's on the volume is its earlier
+           length, and with /CONVERT may end part way through a record. */
+        uint8_t extra;
+        bool grew = opts->convert ? ods2_text_var_read(conv.enc, &extra, 1)
+                                  : (fgetc(in.f) != EOF);
+        if (grew && opts->convert) {
+            report_error("%%ODS2-E-CHANGED, %s changed while being converted: its last "
+                         "record may be cut short - delete it and copy again\n",
+                         local_file);
+        } else if (grew) {
+            fprintf(stderr, "%%ODS2-W-CHANGED, %s grew while being copied; only its "
+                    "first %zu bytes were written - copy it again\n",
+                    local_file, in.length);
+        }
+    }
+    ods2_text_var_encoder_free(conv.enc);
+    fclose(in.f);
     if (!r.ok) {
         report_error("%%ODS2-E-COPYERR, %s\n", r.problem);
-        free(buf);
         return;
     }
     {
@@ -812,9 +1016,145 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
         if (!ods2_make_file_name(name, stored, sizeof(stored), &why)) {
             snprintf(stored, sizeof(stored), "%s", name);
         }
-        printf("%%ODS2-I-COPIED, %zu bytes to %s;1\n", content_len, stored);
+        if (opts->convert) {
+            printf("%%ODS2-I-COPIED, %zu bytes to %s;1 as %zu variable-length "
+                   "record%s (longest %zu)\n", in.length, stored, scan.records,
+                   scan.records == 1 ? "" : "s", scan.longest);
+        } else {
+            printf("%%ODS2-I-COPIED, %zu bytes to %s;1\n", in.length, stored);
+        }
     }
-    free(buf);
+}
+
+/* "VOLUME", abbreviated to at least "VOL", with any qualifiers after
+   it ("VOLUME/LABEL=X"). */
+static bool is_volume_word(const char *token)
+{
+    const char *slash = strchr(token, '/');
+    size_t len = slash ? (size_t) (slash - token) : strlen(token);
+    return keyword(token, len, "VOLUME", 3);
+}
+
+/* A 12-byte, space-padded name field, without its padding. */
+static void print_name(const char *what, const char *field)
+{
+    int len = 12;
+    while (len > 0 && (field[len - 1] == ' ' || field[len - 1] == '\0')) len--;
+    printf("  %-20s%.*s\n", what, len, field);
+}
+
+/* SET VOLUME/LABEL=name (issue #13), as on VMS; the qualifier may also
+   come as a separate word ("SET VOLUME /LABEL=name"). */
+static void cmd_set_volume(ods2_volume_t *vol, char **tokens, int n)
+{
+    const char *label = NULL;
+    int i;
+
+    for (i = 1; i < n; i++) {
+        const char *q = (i == 1) ? strchr(tokens[1], '/') : tokens[i];
+        while (q != NULL && *q == '/') {
+            const char *name = ++q, *value = NULL;
+            size_t name_len;
+            while (*q && *q != '=' && *q != '/') q++;
+            name_len = (size_t) (q - name);
+            if (*q == '=') {
+                value = ++q;
+                while (*q && *q != '/') q++;
+            }
+            if (!keyword(name, name_len, "LABEL", 3)) {
+                report_error("%%ODS2-E-IVQUAL, unrecognized qualifier /%.*s - SET VOLUME "
+                             "takes /LABEL=name\n", (int) name_len, name);
+                return;
+            }
+            if (value == NULL || value == q) {
+                report_error("%%ODS2-E-VALREQ, /LABEL needs a value, e.g. "
+                             "SET VOLUME/LABEL=ITANKITS\n");
+                return;
+            }
+            {
+                static char buf[64];
+                size_t len = (size_t) (q - value);
+                if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+                memcpy(buf, value, len);
+                buf[len] = '\0';
+                label = buf;
+            }
+        }
+        if (i > 1 && (tokens[i][0] != '/')) {
+            report_error("%%ODS2-E-MAXPARM, SET VOLUME takes no parameters here - the "
+                         "volume is the disk image (unexpected \"%s\")\n", tokens[i]);
+            return;
+        }
+    }
+    if (label == NULL) {
+        report_error("%%ODS2-E-NOPARM, usage: SET VOLUME/LABEL=name\n");
+        return;
+    }
+    {
+        unsigned copies = 0;
+        char old[13];
+        ods2_result_t r;
+        memcpy(old, vol->home.volname, 12);
+        old[12] = '\0';
+        r = ods2_set_volume_label(vol, label, &copies);
+        if (!r.ok) {
+            report_error("%%ODS2-E-SETVOL, %s\n", r.problem);
+            return;
+        }
+        {
+            int len = 12;
+            while (len > 0 && old[len - 1] == ' ') len--;
+            old[len] = '\0';
+        }
+        {
+            int len = 12;
+            while (len > 0 && vol->home.volname[len - 1] == ' ') len--;
+            printf("%%ODS2-I-RELABELED, volume label changed from %s to %.*s "
+                   "(%u home block copies)\n", old, len, vol->home.volname, copies);
+        }
+    }
+}
+
+/* SHOW VOLUME (issue #13): the home block's identification, and space. */
+static void cmd_show_volume(ods2_volume_t *vol)
+{
+    const ods2_home_t *h = &vol->home;
+    uint64_t total = 0, free_blocks = 0;
+    ods2_result_t r = ods2_volume_space(vol, &total, &free_blocks);
+    bool in_set = false;
+    int i;
+
+    for (i = 0; i < 12; i++) {
+        if (h->strucname[i] != ' ' && h->strucname[i] != '\0') in_set = true;
+    }
+    print_name("Volume label:", h->volname);
+    print_name("Owner name:", h->ownername);
+    print_name("Format:", h->format);
+    printf("  %-20sODS-%u, version %u\n", "Structure level:", h->struclev >> 8,
+           h->struclev & 0xffu);
+    printf("  %-20s%u\n", "Cluster size:", h->cluster);
+    printf("  %-20s%u\n", "Maximum files:", (unsigned) h->maxfiles);
+    printf("  %-20s[%o,%o]\n", "Volume owner UIC:", h->volowner_uic[1], h->volowner_uic[0]);
+    if (in_set || h->rvn != 0) {
+        int len = 12;
+        while (len > 0 && (h->strucname[len - 1] == ' ' || h->strucname[len - 1] == '\0')) len--;
+        printf("  %-20s%.*s, volume %u of %u\n", "Volume set:", len, h->strucname,
+               h->rvn, h->setcount);
+    } else {
+        printf("  %-20snone\n", "Volume set:");
+    }
+    if (r.ok) {
+        printf("  %-20s%llu\n", "Total blocks:", (unsigned long long) total);
+        printf("  %-20s%llu\n", "Free blocks:", (unsigned long long) free_blocks);
+    } else {
+        report_error("%%ODS2-E-READERR, could not count free space: %s\n", r.problem);
+    }
+}
+
+static bool stdout_sink(void *ctx, const uint8_t *data, size_t n)
+{
+    (void) ctx;
+    return fwrite(data, 1, n, stdout) == n;
 }
 
 static void cmd_type(ods2_volume_t *vol, const ods2_parsed_path_t *p)
@@ -822,9 +1162,6 @@ static void cmd_type(ods2_volume_t *vol, const ods2_parsed_path_t *p)
     uint8_t dir_header[512], file_header[512];
     ods2_fid_t dir_fid, file_fid;
     ods2_result_t r;
-    uint8_t *buf;
-    size_t buf_size;
-    size_t bytes_read = 0;
     char spec[ODS2_PATH_MAX + 16];
 
     if (p->filename[0] == '\0') {
@@ -856,32 +1193,22 @@ static void cmd_type(ods2_volume_t *vol, const ods2_parsed_path_t *p)
         report_error("%%ODS2-E-READERR, %s\n", r.problem);
         return;
     }
-    /* Sized from the file's own end-of-file mark rather than a fixed
-       guess, so any size of file can be typed. */
-    buf_size = ods2_file_content_length(file_header);
-    if (buf_size > ods2_file_allocated_bytes(file_header)) {
-        report_error("%%ODS2-E-READERR, %s: end-of-file mark lies beyond the "
-                        "file's allocated blocks (corrupt header?)\n", spec);
-        return;
+    /* Streamed a chunk at a time, so any size of file can be typed
+       without holding it in memory (issue #16). A short write (a full
+       disk, a closed pipe) is a failed TYPE: whatever was extracting
+       the file got less than all of it. */
+    {
+        bool sink_failed = false;
+        size_t bytes = 0;
+        r = ods2_read_file_stream(vol, file_header, stdout_sink, NULL, &bytes, &sink_failed);
+        if (r.ok && fflush(stdout) != 0) sink_failed = true;
+        if (sink_failed) {
+            report_error("%%ODS2-E-WRITEERR, %s: could not write all %zu bytes to output\n",
+                         spec, ods2_file_content_length(file_header));
+        } else if (!r.ok) {
+            report_error("%%ODS2-E-READERR, %s: %s\n", spec, r.problem);
+        }
     }
-    buf = malloc(buf_size > 0 ? buf_size : 1);
-    if (buf == NULL) {
-        report_error("%%ODS2-E-NOMEM, could not allocate %zu-byte read buffer\n", buf_size);
-        return;
-    }
-    r = ods2_read_file(vol, file_header, buf, buf_size, &bytes_read);
-    if (!r.ok) {
-        report_error("%%ODS2-E-READERR, %s\n", r.problem);
-        free(buf);
-        return;
-    }
-    /* A short write (a full disk, a closed pipe) is a failed TYPE:
-       whatever was extracting the file got less than all of it. */
-    if (fwrite(buf, 1, bytes_read, stdout) != bytes_read || fflush(stdout) != 0) {
-        report_error("%%ODS2-E-WRITEERR, %s: could not write all %zu bytes to output\n",
-                     spec, bytes_read);
-    }
-    free(buf);
 }
 
 static void cmd_delete(ods2_volume_t *vol, const ods2_parsed_path_t *p)
@@ -964,10 +1291,16 @@ static void print_help(void)
            "                             ... with chosen record attributes: RFM: FIX,\n"
            "                             STMLF, STM, STMCR or UDF; MRS: record size;\n"
            "                             RAT: NONE, CR, FTN, PRN, BLK (one per RAT:)\n"
+           "  COPY/CONVERT <local-file> <path>\n"
+           "                             a text file as variable-length records with\n"
+           "                             CR carriage control (VMS's native text), one\n"
+           "                             per line; with /ATTRIBUTES for other RAT/MRS\n"
            "  TYPE path                  print a file's content\n"
            "  DELETE path                delete a file (one version) or empty directory\n"
            "  SET DEFAULT path           set the current default directory\n"
            "  SHOW DEFAULT               show the current default directory\n"
+           "  SET VOLUME/LABEL=name      relabel the volume (all home block copies)\n"
+           "  SHOW VOLUME                label, owner, cluster size, files, free space\n"
            "  HELP                       show this command list\n"
            "  EXIT / QUIT                leave the interactive shell\n"
            "\n"
@@ -1024,6 +1357,14 @@ static bool execute_line(ods2_volume_t *vol, char *line)
     }
     if (matches(tokens[0], "HELP") || matches(tokens[0], "?")) {
         print_help();
+        return true;
+    }
+    if (matches(tokens[0], "SET") && n > 1 && is_volume_word(tokens[1])) {
+        cmd_set_volume(vol, tokens, n);
+        return true;
+    }
+    if (matches(tokens[0], "SHOW") && n > 1 && is_volume_word(tokens[1])) {
+        cmd_show_volume(vol);
         return true;
     }
     if (matches(tokens[0], "SET") && n > 1 &&
@@ -1117,12 +1458,14 @@ static bool execute_line(ods2_volume_t *vol, char *line)
     if (matches(verb, "COPY") || matches(verb, "PUT") || matches(verb, "IMPORT")) {
         ods2_parsed_path_t p;
         ods2_record_attrs_t attrs;
+        copy_options_t opts;
+        memset(&opts, 0, sizeof(opts));
         /* COPY's default: Stream_LF, as before qualifiers existed. */
         attrs.rtype = ODS2_RFM_STMLF;
         attrs.rattrib = 0;
         attrs.rsize = 512;
         attrs.maxrec = 512;
-        if (quals != NULL && !parse_copy_qualifiers(quals, &attrs)) {
+        if (quals != NULL && !parse_copy_qualifiers(quals, &attrs, &opts)) {
             return true;
         }
         if (n < 3) {
@@ -1134,7 +1477,7 @@ static bool execute_line(ods2_volume_t *vol, char *line)
             return true;
         }
         if (refuse_wild_dir(&p, "COPY", tokens[2])) return true;
-        cmd_copy(vol, tokens[1], &p, &attrs);
+        cmd_copy(vol, tokens[1], &p, &attrs, &opts);
         return true;
     }
     if (matches(tokens[0], "TYPE") || matches(tokens[0], "CAT")) {

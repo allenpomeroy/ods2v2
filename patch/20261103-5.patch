@@ -1,0 +1,48 @@
+From 1b7988b838cd51e7c77d065a39b164adacc8d368 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 13:26:14 -0600
+Subject: [PATCH] COPY: report a host file that grew while it was being copied
+
+COPY measures the host file before allocating, then streams exactly
+that many bytes (#16), so a file still being written ends up on the
+volume at its earlier length. Now COPY checks for more content once the
+file is written: plain COPY warns (%ODS2-W-CHANGED, exit status still
+0, as for any warning), and COPY/CONVERT (#15) reports an error, since
+its last record may then be cut short.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WA1cTxSh5f8UrT87d9WhcQ
+---
+ tools/ods2.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/tools/ods2.c b/tools/ods2.c
+index 561ad8b..8b67ed1 100644
+--- a/tools/ods2.c
++++ b/tools/ods2.c
+@@ -986,6 +986,23 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
+         src.problem = in.problem;
+     }
+     r = ods2_create_file_source(vol, dir_header, name, &src, &attrs, &new_fid);
++    if (r.ok) {
++        /* More content than was measured means the host file grew
++           while it was copied: what's on the volume is its earlier
++           length, and with /CONVERT may end part way through a record. */
++        uint8_t extra;
++        bool grew = opts->convert ? ods2_text_var_read(conv.enc, &extra, 1)
++                                  : (fgetc(in.f) != EOF);
++        if (grew && opts->convert) {
++            report_error("%%ODS2-E-CHANGED, %s changed while being converted: its last "
++                         "record may be cut short - delete it and copy again\n",
++                         local_file);
++        } else if (grew) {
++            fprintf(stderr, "%%ODS2-W-CHANGED, %s grew while being copied; only its "
++                    "first %zu bytes were written - copy it again\n",
++                    local_file, in.length);
++        }
++    }
+     ods2_text_var_encoder_free(conv.enc);
+     fclose(in.f);
+     if (!r.ok) {
+-- 
+2.43.0

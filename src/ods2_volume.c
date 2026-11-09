@@ -1328,8 +1328,9 @@ ods2_result_t ods2_create_directory(ods2_volume_t *vol, const uint8_t *parent_he
     spec.extents = &extent;
     spec.extent_count = 1;
     spec.hiblk = content_blocks;
-    spec.efblk = 1;   /* just the sentinel block so far */
-    spec.ffbyte = 2;  /* sentinel is 2 bytes */
+    spec.efblk = 2;   /* one block in use: EFBLK 2, FFBYTE 0, as VMS writes */
+    spec.ffbyte = 0;  /* (a directory is whole blocks; OpenVMS VAX copies FFBYTE
+                         into the directories it creates inside this one) */
 
     {
         char ident[260]; /* dirname is already bounded (<256-4 chars,
@@ -1825,6 +1826,19 @@ static bool below_highwater(const uint8_t *header, unsigned vbn)
     return core->highwater == 0 || vbn < core->highwater;
 }
 
+/* True when the end-of-file is what VMS writes for `used` blocks:
+   EFBLK used+1, FFBYTE 0. Earlier versions made directories with EFBLK 1
+   / FFBYTE 2, and OpenVMS VAX V7.3 copies the parent's FFBYTE into the
+   directory CREATE/DIRECTORY makes in it, which gave EOF (2,2): a second
+   block of two bytes that is not a directory block (ANALYZE/DISK:
+   BAD_DIRSIZE, BAD_DIRTYPE; SYSTEM-W-BADIRECTORY). Writing to a
+   directory puts its end-of-file right. */
+static bool dir_eof_standard(const uint8_t *dir_header, unsigned used)
+{
+    const ods2_head_core_t *core = (const ods2_head_core_t *) dir_header;
+    return core->recattr.ffbyte == 0 && ods2_word_swap32(core->recattr.efblk) == used + 1u;
+}
+
 static ods2_result_t store_directory(ods2_volume_t *vol, unsigned dir_file_number,
                                      uint8_t *dir_header, const uint8_t *blocks,
                                      unsigned used, unsigned old_used, unsigned first_changed)
@@ -1959,6 +1973,15 @@ static ods2_result_t load_directory(ods2_volume_t *vol, const uint8_t *dir_heade
             return r;
         }
     }
+    /* Trailing blocks that are all zeros (not even an end-of-records
+       marker) are not directory blocks: the VAX-made directory with EOF
+       (2,2) has one inside its end-of-file. They are dropped from `used`
+       so that a write puts the end-of-file right (block 1 stays and
+       carries the marker). */
+    while (used > 1 && blocks[(size_t) (used - 1) * 512] == 0 &&
+           blocks[(size_t) (used - 1) * 512 + 1] == 0) {
+        used--;
+    }
     *blocks_out = blocks;
     *used_out = used;
     return ok();
@@ -1989,7 +2012,7 @@ ods2_result_t ods2_insert_into_directory(ods2_volume_t *vol, unsigned dir_file_n
 
     t = ods2_dir_choose_block(blocks, used, name);
     if (ods2_insert_dir_entry(blocks + (size_t) t * 512, 512, name, version, fid)) {
-        if (ods2_file_content_length(dir_header) == 0 ||
+        if (ods2_file_content_length(dir_header) == 0 || !dir_eof_standard(dir_header, used) ||
             !below_highwater(dir_header, t + 1)) {
             /* An end-of-file that didn't cover even block 1, or a block
                VMS would read as zeros until the high-water mark moves */
@@ -2231,7 +2254,7 @@ ods2_result_t ods2_delete_version(ods2_volume_t *vol, unsigned dir_file_number,
                 memmove(block, block + 512, (size_t) (used - v - 1) * 512);
                 r = store_directory(vol, dir_file_number, dir_header, blocks, used - 1,
                                     used, v);
-            } else if (!below_highwater(dir_header, v + 1)) {
+            } else if (!below_highwater(dir_header, v + 1) || !dir_eof_standard(dir_header, used)) {
                 r = store_directory(vol, dir_file_number, dir_header, blocks, used,
                                     used, v);
             } else {

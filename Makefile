@@ -41,7 +41,7 @@ MAIN_TOOLS = ods2
 DEV_TOOLS = read_home_block read_file_header ods2_ls ods2_cat ods2_mkdir \
             ods2_put ods2_check_headers ods2_dump_root ods2_dump_header ods2_rm
 
-TESTS = $(BUILD)/ods2_ondisk_selftest $(BUILD)/ods2_checksum_selftest $(BUILD)/ods2_validate_selftest $(BUILD)/ods2_bitmap_selftest $(BUILD)/ods2_indexf_selftest $(BUILD)/ods2_retrieval_selftest $(BUILD)/ods2_root_header_selftest $(BUILD)/ods2_directory_selftest $(BUILD)/ods2_volume_selftest $(BUILD)/ods2_wildcard_selftest $(BUILD)/ods2_read_file_selftest $(BUILD)/ods2_header_build_selftest $(BUILD)/ods2_directory_write_selftest $(BUILD)/ods2_path_selftest $(BUILD)/ods2_versions_selftest $(BUILD)/ods2_time_selftest $(BUILD)/ods2_file_alloc_selftest $(BUILD)/ods2_dir_order_selftest $(BUILD)/ods2_dir_eof_selftest $(BUILD)/ods2_verlimit_selftest $(BUILD)/ods2_large_file_selftest $(BUILD)/ods2_record_attrs_selftest $(BUILD)/ods2_indexf_large_selftest $(BUILD)/ods2_text_var_selftest
+TESTS = $(BUILD)/ods2_ondisk_selftest $(BUILD)/ods2_checksum_selftest $(BUILD)/ods2_validate_selftest $(BUILD)/ods2_bitmap_selftest $(BUILD)/ods2_indexf_selftest $(BUILD)/ods2_retrieval_selftest $(BUILD)/ods2_root_header_selftest $(BUILD)/ods2_directory_selftest $(BUILD)/ods2_volume_selftest $(BUILD)/ods2_wildcard_selftest $(BUILD)/ods2_read_file_selftest $(BUILD)/ods2_header_build_selftest $(BUILD)/ods2_directory_write_selftest $(BUILD)/ods2_path_selftest $(BUILD)/ods2_versions_selftest $(BUILD)/ods2_time_selftest $(BUILD)/ods2_file_alloc_selftest $(BUILD)/ods2_dir_order_selftest $(BUILD)/ods2_dir_eof_selftest $(BUILD)/ods2_verlimit_selftest $(BUILD)/ods2_fid_selftest $(BUILD)/ods2_large_file_selftest $(BUILD)/ods2_record_attrs_selftest $(BUILD)/ods2_indexf_large_selftest $(BUILD)/ods2_text_var_selftest
 
 .PHONY: all test tools dev-tools release clean starter-volume
 
@@ -122,6 +122,9 @@ $(BUILD)/ods2_file_alloc_selftest: tests/ods2_file_alloc_selftest.c $(VOLUME_SRC
 
 $(BUILD)/ods2_dir_order_selftest: tests/ods2_dir_order_selftest.c $(VOLUME_SRCS) include/ods2_volume.h include/ods2_directory.h samples/synthetic_disk.img | $(BUILD)
 	$(CC) $(CFLAGS) $(SANFLAGS) tests/ods2_dir_order_selftest.c $(VOLUME_SRCS) -o $@
+
+$(BUILD)/ods2_fid_selftest: tests/ods2_fid_selftest.c $(VOLUME_SRCS) include/ods2_volume.h samples/synthetic_disk.img | $(BUILD)
+	$(CC) $(CFLAGS) $(SANFLAGS) tests/ods2_fid_selftest.c $(VOLUME_SRCS) -o $@
 
 $(BUILD)/ods2_verlimit_selftest: tests/ods2_verlimit_selftest.c $(VOLUME_SRCS) include/ods2_volume.h samples/synthetic_disk.img | $(BUILD)
 	$(CC) $(CFLAGS) $(SANFLAGS) tests/ods2_verlimit_selftest.c $(VOLUME_SRCS) -o $@
@@ -222,6 +225,8 @@ test: $(TESTS) tools ods2_put ods2_dump_header
 	@$(BUILD)/ods2_dir_eof_selftest
 	@echo "--- ods2_verlimit_selftest ---"
 	@$(BUILD)/ods2_verlimit_selftest
+	@echo "--- ods2_fid_selftest ---"
+	@$(BUILD)/ods2_fid_selftest
 	@echo "--- ods2_large_file_selftest ---"
 	@$(BUILD)/ods2_large_file_selftest
 	@echo "--- ods2_record_attrs_selftest ---"
@@ -282,5 +287,5 @@ release: test
 clean:
 	rm -rf $(BUILD)
 	rm -f samples/synthetic_disk.img samples/synthetic_disk_working.img
-	rm -f samples/versions_disk.img samples/versions_cli_disk.img samples/cli_wildcard_disk.img samples/file_alloc_disk.img samples/dir_order_disk.img samples/dir_eof_disk.img samples/verlimit_disk.img samples/large_file_disk.img samples/cli_status_disk.img samples/cli_attrs_disk.img samples/record_attrs_disk.img samples/indexf_large_disk.img samples/text_var_disk.img samples/cli_label_disk.img samples/cli_label_orig.img samples/cli_verlimit_disk.img
+	rm -f samples/versions_disk.img samples/versions_cli_disk.img samples/cli_wildcard_disk.img samples/file_alloc_disk.img samples/dir_order_disk.img samples/dir_eof_disk.img samples/verlimit_disk.img samples/fid_disk.img samples/large_file_disk.img samples/cli_status_disk.img samples/cli_attrs_disk.img samples/record_attrs_disk.img samples/indexf_large_disk.img samples/text_var_disk.img samples/cli_label_disk.img samples/cli_label_orig.img samples/cli_verlimit_disk.img
 	rm -f $(TOOLS)

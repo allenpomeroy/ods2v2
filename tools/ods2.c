@@ -282,7 +282,7 @@ static ods2_result_t resolve_dir(ods2_volume_t *vol, const char *dir_path,
 {
     ods2_result_t r = ods2_lookup_path(vol, dir_path, dir_fid_out);
     if (!r.ok) return r;
-    return ods2_read_header(vol, dir_fid_out->fid_num, dir_header_out);
+    return ods2_read_header_fid(vol, *dir_fid_out, dir_header_out);
 }
 
 /* Splits a dot-separated dir_path into its parent path and its own
@@ -475,7 +475,7 @@ static void walk_directories(dir_walk_t *w, const char *abs_path, const char *re
         }
         /* Is it really a directory? Checked via its own header's
            FH2$M_DIRECTORY bit (0x2000), not just the .DIR suffix. */
-        r = ods2_read_header(w->vol, entries[i].fid.fid_num, sub_header);
+        r = ods2_read_header_fid(w->vol, entries[i].fid, sub_header);
         if (!r.ok || !(((ods2_head_core_t *) sub_header)->filechar & 0x2000u)) {
             continue;
         }
@@ -1276,7 +1276,7 @@ static void cmd_type(ods2_volume_t *vol, const ods2_parsed_path_t *p)
         report_error("%%ODS2-E-FNF, %s not found\n", spec);
         return;
     }
-    r = ods2_read_header(vol, file_fid.fid_num, file_header);
+    r = ods2_read_header_fid(vol, file_fid, file_header);
     if (!r.ok) {
         report_error("%%ODS2-E-READERR, %s\n", r.problem);
         return;
@@ -1504,7 +1504,7 @@ static bool execute_line(ods2_volume_t *vol, char *line)
             report_error("%%ODS2-E-DIRERR, %s\n", r.problem);
             return true;
         }
-        r = ods2_read_header(vol, fid.fid_num, header);
+        r = ods2_read_header_fid(vol, fid, header);
         if (r.ok && !(((ods2_head_core_t *) header)->filechar & 0x2000u)) {
             report_error("%%ODS2-E-NOTDIR, %s is not a directory\n", tokens[2]);
             return true;

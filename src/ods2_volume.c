@@ -198,6 +198,45 @@ ods2_result_t ods2_read_header(ods2_volume_t *vol, unsigned file_number, uint8_t
     return ok();
 }
 
+/* The header a directory entry's FID names. An entry names a file by number AND sequence number AND relative volume
+   number AND extended file number (FID_NMX: the file number is NMX << 16 | NUM). The header used to be found by the low
+   16 bits of the number alone, so an entry with an RVN (a file on another volume of a set) or an NMX (a file number
+   above 65,535) read some other file's header, silently: it is refused here, as is an entry whose sequence number is
+   not the header's (the file was deleted and its number reused: VMS gives a reused number a new sequence number, and
+   lists such an entry as "no such file") or whose header is marked for delete. */
+const char ods2_stale_entry[] = "no such file: a dangling directory entry, a stale alias (the file it names was deleted; "
+                                "its file number may have been reused)";
+
+bool ods2_header_is_file(const uint8_t *header, ods2_fid_t fid)
+{
+    const ods2_head_core_t *core = (const ods2_head_core_t *) header;
+    return core->fid.fid_num == fid.fid_num && core->fid.fid_seq == fid.fid_seq &&
+           core->fid.fid_nmx == fid.fid_nmx && core->fid.fid_rvn == fid.fid_rvn &&
+           !(core->filechar & 0x8000u);
+}
+
+ods2_result_t ods2_check_fid(ods2_fid_t fid)
+{
+    if (fid.fid_rvn != 0) {
+        return fail("volume sets are not supported (a directory entry names a file on another volume of a set)");
+    }
+    if (fid.fid_nmx != 0) {
+        return fail("file numbers above 65,535 are not supported (a directory entry names a file whose number needs "
+                    "FID_NMX)");
+    }
+    return ok();
+}
+
+ods2_result_t ods2_read_header_fid(ods2_volume_t *vol, ods2_fid_t fid, uint8_t *header_out)
+{
+    ods2_result_t r = ods2_check_fid(fid);
+    if (!r.ok) return r;
+    r = ods2_read_header(vol, fid.fid_num, header_out);
+    if (!r.ok) return r;
+    if (!ods2_header_is_file(header_out, fid)) return fail(ods2_stale_entry);
+    return ok();
+}
+
 ods2_result_t ods2_write_header(ods2_volume_t *vol, unsigned file_number, const uint8_t *header_in)
 {
     uint32_t lbn;
@@ -396,14 +435,16 @@ ods2_result_t ods2_decode_all_extents(ods2_volume_t *vol, const uint8_t *header,
         }
         total += n;
 
-        if (core->ext_fid.fid_num == 0) {
+        if (core->ext_fid.fid_num == 0 && core->ext_fid.fid_nmx == 0) {
             /* No further extension header - done. */
             *count_out = total;
             return ok();
         }
 
         {
-            ods2_result_t r = ods2_read_header(vol, core->ext_fid.fid_num, current);
+            ods2_result_t r = ods2_check_fid(core->ext_fid);
+            if (!r.ok) return r;
+            r = ods2_read_header(vol, core->ext_fid.fid_num, current);
             if (!r.ok) return r;
         }
     }
@@ -1243,12 +1284,23 @@ ods2_result_t ods2_lookup_path(ods2_volume_t *vol, const char *path, ods2_fid_t 
         component[len] = '\0';
         if (*p == '.') p++;
 
-        r = ods2_read_header(vol, current.fid_num, header);
+        r = ods2_read_header_fid(vol, current, header);
         if (!r.ok) return r;
 
         strcat(component, ".DIR");
         r = ods2_lookup_name(vol, header, component, &current);
         if (!r.ok) return r;
+        {
+            /* the entry's FID must name a header that is a directory: a file called X.DIR is not one (a writer
+               would rewrite its data as directory blocks), and an entry with another RVN / NMX / sequence number
+               names no file here */
+            uint8_t next_header[512];
+            r = ods2_read_header_fid(vol, current, next_header);
+            if (!r.ok) return r;
+            if (!(((const ods2_head_core_t *) next_header)->filechar & 0x2000u)) {
+                return fail("a directory name in the path is a file that is not a directory");
+            }
+        }
     }
 
     *fid_out = current;

@@ -101,6 +101,15 @@ ods2_result_t ods2_write_header(ods2_volume_t *vol, unsigned file_number,
 ods2_result_t ods2_read_file_block(ods2_volume_t *vol, const uint8_t *header,
                                     unsigned vbn, uint8_t *block_out);
 
+/* The header a directory entry's FID names (see ods2_read_header_fid in ods2_volume.c): refuses a FID with a relative
+   volume number or an extended file number, and an entry whose sequence number is not the header's or whose header is
+   marked for delete (a stale alias: the problem is ods2_stale_entry, which a caller may compare r.problem with). Use
+   this, not ods2_read_header(), for any FID that came out of a directory entry or a back link. */
+extern const char ods2_stale_entry[];
+ods2_result_t ods2_check_fid(ods2_fid_t fid);
+ods2_result_t ods2_read_header_fid(ods2_volume_t *vol, ods2_fid_t fid, uint8_t *header_out);
+bool ods2_header_is_file(const uint8_t *header, ods2_fid_t fid);
+
 /* Looks up `name` (case-insensitive, e.g. "NETLIB020.DIR", no
    ";version") within the directory whose header is `dir_header`,
    returning the FID of its HIGHEST version. Equivalent to

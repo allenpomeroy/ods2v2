@@ -402,6 +402,11 @@ ods2_result_t ods2_read_file_stream(ods2_volume_t *vol, const uint8_t *header,
                                      bool (*sink)(void *ctx, const uint8_t *data, size_t n),
                                      void *ctx, size_t *bytes_out, bool *sink_failed_out);
 
+/* SET FILE/VERSION_LIMIT: sets the version limit of the entries named `name` in the directory (all versions); *changed
+ * is the number of directory records changed. For volumes written before ods2v2 gave entries VMS's limit (32767). */
+ods2_result_t ods2_set_entry_version_limit(ods2_volume_t *vol, unsigned dir_file_number, const char *name,
+                                           uint16_t limit, unsigned *changed);
+
 /* Inserts (name, version, fid) into the directory whose header is at
  * `dir_file_number`, trying each of its existing content blocks
  * first; if none have room, allocates a new block, extends the

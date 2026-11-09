@@ -1331,6 +1331,9 @@ ods2_result_t ods2_create_directory(ods2_volume_t *vol, const uint8_t *parent_he
     spec.efblk = 2;   /* one block in use: EFBLK 2, FFBYTE 0, as VMS writes */
     spec.ffbyte = 0;  /* (a directory is whole blocks; OpenVMS VAX copies FFBYTE
                          into the directories it creates inside this one) */
+    /* a directory made in one with a default version limit passes it on (AXP1SYS: 114 of 114 directories under a
+       default of 3 carry 3); a directory in one without gets none */
+    spec.versions = parent_core->recattr.versions;
 
     {
         char ident[260]; /* dirname is already bounded (<256-4 chars,
@@ -2000,6 +2003,7 @@ ods2_result_t ods2_insert_into_directory(ods2_volume_t *vol, unsigned dir_file_n
     uint8_t dir_header[512];
     uint8_t *blocks = NULL;
     unsigned used, t;
+    uint16_t verlimit;
     ods2_result_t r;
 
     if (!vol->writable) {
@@ -2011,7 +2015,8 @@ ods2_result_t ods2_insert_into_directory(ods2_volume_t *vol, unsigned dir_file_n
     if (!r.ok) return r;
 
     t = ods2_dir_choose_block(blocks, used, name);
-    if (ods2_insert_dir_entry(blocks + (size_t) t * 512, 512, name, version, fid)) {
+    verlimit = ((const ods2_head_core_t *) dir_header)->recattr.versions;   /* the directory's default version limit */
+    if (ods2_insert_dir_entry_vl(blocks + (size_t) t * 512, 512, name, version, fid, verlimit)) {
         if (ods2_file_content_length(dir_header) == 0 || !dir_eof_standard(dir_header, used) ||
             !below_highwater(dir_header, t + 1)) {
             /* An end-of-file that didn't cover even block 1, or a block
@@ -2024,7 +2029,7 @@ ods2_result_t ods2_insert_into_directory(ods2_volume_t *vol, unsigned dir_file_n
         uint8_t combined[1024];
         memcpy(combined, blocks + (size_t) t * 512, 512);
         memset(combined + 512, 0, 512);
-        if (!ods2_insert_dir_entry(combined, sizeof(combined), name, version, fid)) {
+        if (!ods2_insert_dir_entry_vl(combined, sizeof(combined), name, version, fid, verlimit)) {
             free(blocks);
             return fail("internal error: a block plus one record overflowed 1024 "
                         "bytes (should be unreachable)");
@@ -2038,6 +2043,36 @@ ods2_result_t ods2_insert_into_directory(ods2_volume_t *vol, unsigned dir_file_n
                         "(should be unreachable)");
         }
         r = store_directory(vol, dir_file_number, dir_header, blocks, used + 1, used, t);
+    }
+    free(blocks);
+    return r;
+}
+
+/* SET FILE/VERSION_LIMIT: the version limit of the directory entries named `name` in a directory, block by block.
+   *changed gets the number of records changed (0 when the name is not there or already has the limit). */
+ods2_result_t ods2_set_entry_version_limit(ods2_volume_t *vol, unsigned dir_file_number, const char *name,
+                                           uint16_t limit, unsigned *changed)
+{
+    uint8_t dir_header[512];
+    uint8_t *blocks = NULL;
+    unsigned used, v;
+    ods2_result_t r;
+
+    *changed = 0;
+    if (!vol->writable) {
+        return fail("volume was not mounted for write (use ods2_mount_write)");
+    }
+    r = ods2_read_header(vol, dir_file_number, dir_header);
+    if (!r.ok) return r;
+    r = load_directory(vol, dir_header, 0, &blocks, &used);
+    if (!r.ok) return r;
+    for (v = 0; v < used && r.ok; v++) {
+        int n = ods2_set_dir_entry_verlimit(blocks + (size_t) v * 512, 512, name, limit);
+        if (n < 0) { r = fail("a directory block is damaged: not changed"); break; }
+        if (n > 0) {
+            *changed += (unsigned) n;
+            r = ods2_write_file_block(vol, dir_header, v + 1, blocks + (size_t) v * 512);
+        }
     }
     free(blocks);
     return r;

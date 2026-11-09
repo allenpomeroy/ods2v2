@@ -149,6 +149,20 @@ bool ods2_valid_dir_name(const char *name, const char **why)
 bool ods2_insert_dir_entry(uint8_t *block, size_t block_size,
                             const char *name, uint16_t version, ods2_fid_t fid)
 {
+    return ods2_insert_dir_entry_vl(block, block_size, name, version, fid, 0);
+}
+
+bool ods2_insert_dir_entry_vl(uint8_t *block, size_t block_size,
+                              const char *name, uint16_t version, ods2_fid_t fid,
+                              uint16_t verlimit_in)
+{
+    /* The version limit of the entry (DIR$W_VERLIMIT) is what VMS shows as the file's "Version limit" and what it
+       purges to: when version 2 of a name is made and the limit is 1, VMS deletes version 1. A new entry gets the
+       default version limit of the directory it goes into (its FAT$W_VERSIONS) when that is set, and 32767, no
+       limit, otherwise: every user file of every VMS-made volume checked (OpenVMS VAX V7.3, Alpha V7.3-2 and V8.4)
+       has one or the other. The 1 this function used to write made VMS purge version 1 of an ods2v2 file as soon as
+       a COPY or an edit made version 2. */
+    uint16_t verlimit = verlimit_in != 0 ? verlimit_in : 32767;
     size_t pos = 0;
     size_t insert_pos = (size_t) -1; /* not yet found */
     size_t end_pos; /* position of the sentinel (or end of valid content) */
@@ -209,12 +223,7 @@ bool ods2_insert_dir_entry(uint8_t *block, size_t block_size,
             (end_pos + 2) - insert_pos);
 
     write_word(block + insert_pos, (uint16_t) (record_total - 2));
-    write_word(block + insert_pos + 2, 1);      /* verlimit - spec says "ignored", but
-                                                     every real VMS-written record examined
-                                                     shows 1, never 0; since ANALYZE/DISK's
-                                                     BAD_DIRTYPE finding suggests this
-                                                     field is validated more strictly
-                                                     than the spec implies */
+    write_word(block + insert_pos + 2, verlimit); /* DIR$W_VERLIMIT: see above */
     block[insert_pos + 4] = 0;                   /* flags - confirmed must be 0 */
     block[insert_pos + 5] = (uint8_t) namecount;
     memcpy(block + insert_pos + 6, name, namecount);
@@ -283,6 +292,36 @@ bool ods2_remove_dir_entry(uint8_t *block, size_t block_size, const char *name)
     memset(block + end_pos + 2 - match_record_total, 0, match_record_total);
 
     return true;
+}
+
+/* Sets the version limit of every record in `block` whose name is `name` (case-insensitive; a name's versions may
+   span several records). Returns how many records it changed (0: not in this block), or -1 if a record is malformed
+   (nothing is changed then). */
+int ods2_set_dir_entry_verlimit(uint8_t *block, size_t block_size, const char *name, uint16_t limit)
+{
+    size_t pos = 0;
+    int changed = 0;
+    size_t namecount = strlen(name);
+
+    while (pos + 6 <= block_size) {
+        uint16_t size = read_word(block + pos);
+        if (size == 0xffff || size == 0) break;
+        if ((size_t) size + 2 + pos > block_size || size < 6 + 8 - 2 || (size_t) block[pos + 5] + 6 > (size_t) size + 2) {
+            return -1;
+        }
+        pos += (size_t) size + 2;
+    }
+    for (pos = 0; pos + 6 <= block_size; ) {
+        uint16_t size = read_word(block + pos);
+        if (size == 0xffff || size == 0) break;
+        if (compare_names(block + pos + 6, block[pos + 5], name) == 0 && block[pos + 5] == namecount &&
+            read_word(block + pos + 2) != limit) {
+            write_word(block + pos + 2, limit);
+            changed++;
+        }
+        pos += (size_t) size + 2;
+    }
+    return changed;
 }
 
 bool ods2_remove_dir_version(uint8_t *block, size_t block_size, const char *name,

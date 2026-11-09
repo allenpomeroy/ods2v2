@@ -50,6 +50,8 @@ typedef struct {
     uint8_t        rattrib;    /* FAT$B_RATTRIB */
     uint16_t       rsize;      /* FAT$W_RSIZE */
     uint16_t       maxrec;     /* FAT$W_MAXREC */
+    uint16_t       versions;   /* FAT$W_VERSIONS: 0 for a file; for a directory the default version limit it passes on
+                                  (VMS gives a directory made inside one with a default the same default) */
     const ods2_extent_t *extents;
     int            extent_count;
     uint32_t       hiblk;      /* total allocated blocks (plain value -

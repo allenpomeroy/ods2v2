@@ -1657,6 +1657,15 @@ int main(int argc, char **argv)
     }
 
     r = ods2_mount_write(argv[1], &vol);
+    if (!r.ok && strstr(r.problem, "locked") != NULL) {
+        /* another process has the image open (one writer or many readers): read it, refuse every write */
+        ods2_result_t r_read = ods2_mount(argv[1], &vol);
+        if (r_read.ok) {
+            fprintf(stderr, "%%ODS2-W-READONLY, %s: the image is locked by another process; mounted read-only\n",
+                    argv[1]);
+            r = r_read;
+        }
+    }
     if (!r.ok) {
         fprintf(stderr, "%%ODS2-F-MOUNTERR, %s: %s\n", argv[1], r.problem);
         return 1;
@@ -1697,6 +1706,14 @@ int main(int argc, char **argv)
         exit_code = g_command_failed ? 1 : 0;
     }
 
+    {
+        /* a write that did not reach the disk is a command that failed */
+        ods2_result_t synced = ods2_sync(&vol);
+        if (!synced.ok) {
+            report_error("%%ODS2-E-SYNCERR, %s: %s\n", argv[1], synced.problem);
+            exit_code = 1;
+        }
+    }
     ods2_dismount(&vol);
     return exit_code;
 }

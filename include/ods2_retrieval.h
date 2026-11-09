@@ -46,8 +46,12 @@ typedef struct {
  * of extents actually decoded, or -1 on a format it doesn't recognize
  * (Format 0 - placement data - is skipped, not decoded as an extent,
  * since it describes allocation hints, not an extent itself; Formats
- * 1, 2 and 3 are all decoded).
+ * 1, 2 and 3 are all decoded). If the pointers describe more than
+ * `max_extents` extents the result is ODS2_DECODE_TOO_MANY, never a
+ * shortened list: a caller that went on with part of a file's extents
+ * would read it short, or free only part of it.
  */
+#define ODS2_DECODE_TOO_MANY (-2)
 int ods2_decode_retrieval_pointers(const uint8_t *map_area, size_t word_count,
                                     ods2_extent_t *extents_out, size_t max_extents);
 

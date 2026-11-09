@@ -64,6 +64,10 @@ bool ods2_insert_dir_entry(uint8_t *block, size_t block_size,
  */
 bool ods2_remove_dir_entry(uint8_t *block, size_t block_size, const char *name);
 
+/* True if every record of the directory block is well formed and inside it (size word, name count, padding, whole
+ * 8-byte version entries): a directory block is changed only if it is. */
+bool ods2_dir_block_ok(const uint8_t *block, size_t block_size);
+
 /* The same, with the entry's version limit (DIR$W_VERLIMIT): the default version limit of the directory the entry goes
  * into, or 0 for none (stored as 32767, as VMS does). ods2_insert_dir_entry() passes 0. */
 bool ods2_insert_dir_entry_vl(uint8_t *block, size_t block_size,

@@ -60,6 +60,10 @@ typedef struct {
     const char *problem; /* NULL if ok */
 } ods2_result_t;
 
+/* Makes the blocks written so far durable (fflush and fdatasync). A caller that reports a change as done calls this
+ * first; ods2_dismount() closes the file. */
+ods2_result_t ods2_sync(ods2_volume_t *vol);
+
 /* Opens `path` and reads/validates the home block, then reads and
    decodes INDEXF.SYS's own header so later header lookups can walk
    its extents. `vol` is caller-allocated; on failure vol->fp is

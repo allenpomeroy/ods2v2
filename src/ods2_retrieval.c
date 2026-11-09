@@ -110,6 +110,7 @@ int ods2_decode_retrieval_pointers(const uint8_t *map_area, size_t word_count,
 {
     size_t word_pos = 0;
     size_t extent_count = 0;
+    bool overflow = false;
 
     while (word_pos < word_count) {
         uint16_t word0 = read_word(map_area + word_pos * 2);
@@ -135,6 +136,8 @@ int ods2_decode_retrieval_pointers(const uint8_t *map_area, size_t word_count,
                 extents_out[extent_count].lbn = ((uint32_t) high_lbn << 16) | word1;
                 extents_out[extent_count].block_count = count + 1;
                 extent_count++;
+            } else {
+                overflow = true; /* more extents than the caller's array: never dropped silently */
             }
             word_pos += 2;
         } else if (format == 2) {
@@ -151,6 +154,8 @@ int ods2_decode_retrieval_pointers(const uint8_t *map_area, size_t word_count,
                 extents_out[extent_count].lbn = (uint32_t) w1 | ((uint32_t) w2 << 16);
                 extents_out[extent_count].block_count = count + 1;
                 extent_count++;
+            } else {
+                overflow = true; /* more extents than the caller's array: never dropped silently */
             }
             word_pos += 3;
         } else { /* format == 3 */
@@ -169,10 +174,13 @@ int ods2_decode_retrieval_pointers(const uint8_t *map_area, size_t word_count,
                 extents_out[extent_count].lbn = (uint32_t) w2 | ((uint32_t) w3 << 16);
                 extents_out[extent_count].block_count = count + 1;
                 extent_count++;
+            } else {
+                overflow = true; /* more extents than the caller's array: never dropped silently */
             }
             word_pos += 4;
         }
     }
 
+    if (overflow) return ODS2_DECODE_TOO_MANY;
     return (int) extent_count;
 }

@@ -58,6 +58,40 @@ int ods2_dir_name_compare(const char *a, size_t a_len, const char *b, size_t b_l
     }
 }
 
+/* Is the record at `pos` (its size word is neither the end marker nor zero) well formed and entirely inside the
+   block? Size word, a name of at least one byte, its padding, and then a whole number of 8-byte version entries (at
+   least one): the layout every VMS-written record has. The name count and the size word are fields of a block that
+   may be damaged, so nothing reads a record's name or shifts the bytes after it before this passes: a name count of
+   255 near the end of a block read 250 bytes past it. */
+static bool record_ok(const uint8_t *block, size_t pos, size_t block_size)
+{
+    size_t size, total, namecount, padded;
+
+    if (pos + 2 > block_size) return false;
+    size = read_word(block + pos);
+    if (size == 0 || size == 0xffff) return false;
+    total = size + 2;
+    if (total < 16 || pos + total > block_size) return false;
+    namecount = block[pos + 5];
+    if (namecount == 0) return false;
+    padded = namecount + (namecount % 2);
+    if (6 + padded + 8 > total || (total - 6 - padded) % 8 != 0) return false;
+    return true;
+}
+
+bool ods2_dir_block_ok(const uint8_t *block, size_t block_size)
+{
+    size_t pos = 0;
+
+    while (pos + 6 <= block_size) {
+        uint16_t size = read_word(block + pos);
+        if (size == 0xffff || size == 0) return true; /* end marker, or an unused rest */
+        if (!record_ok(block, pos, block_size)) return false;
+        pos += (size_t) size + 2;
+    }
+    return true;
+}
+
 /* An on-disk record's name (namecount bytes, not nul-terminated)
    against a caller's nul-terminated name. */
 static int compare_names(const uint8_t *disk_name, size_t disk_len, const char *name)
@@ -195,6 +229,9 @@ bool ods2_insert_dir_entry_vl(uint8_t *block, size_t block_size,
         if (size == 0) {
             break; /* empty/uninitialized rest of block, no real sentinel yet */
         }
+        if (!record_ok(block, pos, block_size)) {
+            return false; /* a damaged block: nothing is shifted or inserted */
+        }
         existing_namecount = block[pos + 5];
         if (insert_pos == (size_t) -1 &&
             compare_names(block + pos + 6, existing_namecount, name) > 0) {
@@ -303,14 +340,7 @@ int ods2_set_dir_entry_verlimit(uint8_t *block, size_t block_size, const char *n
     int changed = 0;
     size_t namecount = strlen(name);
 
-    while (pos + 6 <= block_size) {
-        uint16_t size = read_word(block + pos);
-        if (size == 0xffff || size == 0) break;
-        if ((size_t) size + 2 + pos > block_size || size < 6 + 8 - 2 || (size_t) block[pos + 5] + 6 > (size_t) size + 2) {
-            return -1;
-        }
-        pos += (size_t) size + 2;
-    }
+    if (!ods2_dir_block_ok(block, block_size)) return -1;
     for (pos = 0; pos + 6 <= block_size; ) {
         uint16_t size = read_word(block + pos);
         if (size == 0xffff || size == 0) break;

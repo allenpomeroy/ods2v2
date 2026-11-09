@@ -423,6 +423,52 @@ int main(void)
                "a record that runs past it are not rewritten: the change is refused, nothing is written\n");
     }
 
+    /* ---- the order of CREATE/DIRECTORY ---- (ods5-st's crash campaign: 52 states over 14,605 runs left a valid but
+       unlisted directory header over a first block that was never initialised: written first, the header made a directory
+       out of garbage). The first block, with its end marker, is written before the header, the header before the entry:
+       after any number of writes, a header that is a live directory has a first block that is a valid empty block, or the
+       entry is listed. */
+    {
+        long k2, full2 = -1;
+        unsigned num;
+        uint16_t sq;
+
+        assert(ods2_find_free_file_number(&vol, 1, 4000, &num, &sq).ok);
+        for (k2 = 0; k2 < 40 && full2 < 0; k2++) {
+            ods2_fid_t nd;
+            uint8_t nh[512], nb[512], rh[512];
+            assert(ods2_read_header(&vol, 4, rh).ok);
+            arm(k2);
+            r = ods2_create_directory(&vol, rh, "CRASHDIR", &nd);
+            if (r.ok) {
+                full2 = disarm(k2);
+                ods2_fault_forget();
+                assert(count_named(&vol, 4, "CRASHDIR.DIR") == 1);
+                break;
+            }
+            disarm(k2);
+            if (ods2_read_header(&vol, num, nh).ok) {
+                const ods2_head_core_t *c2 = (const ods2_head_core_t *) nh;
+                ods2_fid_t guess;
+                guess.fid_num = c2->fid.fid_num; guess.fid_seq = c2->fid.fid_seq; guess.fid_rvn = 0; guess.fid_nmx = 0;
+                if ((c2->filechar & 0x2000u) && !(c2->filechar & 0x8000u) && ods2_header_is_file(nh, guess) &&
+                    count_named(&vol, 4, "CRASHDIR.DIR") == 0) {
+                    /* a live directory header that nobody lists: its first block must be a valid empty block */
+                    assert(ods2_read_file_block(&vol, nh, 1, nb).ok);
+                    if (!(nb[0] == 0xff && nb[1] == 0xff)) {
+                        fprintf(stderr, "CREATE/DIRECTORY interrupted after %ld writes: an unlisted directory header over "
+                                        "an uninitialised first block\n", k2);
+                    }
+                    assert(nb[0] == 0xff && nb[1] == 0xff);
+                }
+            }
+            ods2_fault_rollback(&vol);
+        }
+        assert(full2 > 0 && k2 < 40);
+        printf("PASS: CREATE/DIRECTORY interrupted after each of its writes (0 to %ld): no unlisted directory header over "
+               "an uninitialised block\n", full2);
+    }
+
     /* ---- a refusal leaves nothing behind (review 15) ---- */
     {
         uint8_t h[512], blk[512], pb[512];

@@ -129,6 +129,29 @@ static void check_listed_file_intact(ods2_volume_t *vol, unsigned dir_num, const
     }
 }
 
+/* The invariant of review 7 (R7-1): no header that could be finished or recovered maps a free cluster. Every header
+   slot that holds a header marked for delete with its FID still intact must map only allocated clusters. */
+static void check_no_marked_header_maps_free(ods2_volume_t *vol)
+{
+    unsigned num;
+    uint8_t h[512];
+    ods2_extent_t ex[ODS2_MAX_EXTENTS];
+    int n, i;
+
+    for (num = 1; num < 80; num++) {
+        const ods2_head_core_t *core = (const ods2_head_core_t *) h;
+        if (!ods2_read_header(vol, num, h).ok) continue;
+        if (!(core->filechar & 0x8000u) || core->fid.fid_num == 0) continue;
+        if (!ods2_decode_all_extents(vol, h, ex, ODS2_MAX_EXTENTS, &n).ok) continue;
+        for (i = 0; i < n; i++) assert(!cluster_free(vol, ex[i].lbn));
+    }
+}
+
+static ods2_fid_t root_fid_of(const uint8_t *root_hdr)
+{
+    return ((const ods2_head_core_t *) root_hdr)->fid;
+}
+
 static unsigned count_named(ods2_volume_t *vol, unsigned dir_num, const char *name)
 {
     uint8_t dh[512];
@@ -207,6 +230,7 @@ int main(void)
             } else {
                 disarm(k);
                 check_listed_file_intact(&vol, 4, "VICTIM.DAT");
+                check_no_marked_header_maps_free(&vol);
                 check_listed_file_intact(&vol, 4, "NEIGHBOUR.DAT");
                 ods2_fault_rollback(&vol);
             }
@@ -372,27 +396,13 @@ int main(void)
         sum = ods2_checksum(h, 255);
         h[510] = (uint8_t) (sum & 0xff); h[511] = (uint8_t) (sum >> 8);
         assert(ods2_write_header(&vol, d1.fid_num, h).ok);
-        {
-            /* entries that fit are written into the block without touching the header; the insert that needs the
-               directory to grow rewrites the header (and stores into it at IDOFFSET), and is refused */
-            char nm[64];
-            int inserted = 0;
-            for (n = 0; n < 40; n++) {
-                snprintf(nm, sizeof(nm), "Q%03d_PADDING_TO_MAKE_A_LONG_NAME.DAT", n);
-                arm(NOLIMIT);
-                r = ods2_insert_into_directory(&vol, d1.fid_num, nm, 1, f1);
-                if (!r.ok) {
-                    assert(strstr(r.problem, "damaged") != NULL);
-                    assert(disarm(NOLIMIT) == 0);
-                    ods2_fault_forget();
-                    break;
-                }
-                disarm(NOLIMIT);
-                ods2_fault_forget();
-                inserted++;
-            }
-            assert(inserted > 0 && n < 40);
-        }
+        /* even an entry that fits is refused: a directory is checked as a whole before any change (a refusal only
+           where the header is first rewritten would leave the volume half changed) */
+        arm(NOLIMIT);
+        r = ods2_insert_into_directory(&vol, d1.fid_num, "X.TXT", 1, f1);
+        assert(!r.ok && strstr(r.problem, "damaged") != NULL);
+        assert(disarm(NOLIMIT) == 0);
+        ods2_fault_forget();
 
         /* a directory block with a record whose name count runs past the block */
         assert(ods2_create_directory(&vol, root, "ODDBLK", &d2).ok);
@@ -411,6 +421,223 @@ int main(void)
         ods2_fault_forget();
         printf("PASS: a header with a wrong checksum, a directory header with a wrong IDOFFSET and a directory block with "
                "a record that runs past it are not rewritten: the change is refused, nothing is written\n");
+    }
+
+    /* ---- a refusal leaves nothing behind (review 15) ---- */
+    {
+        uint8_t h[512], blk[512], pb[512];
+        ods2_fid_t victim, pfid, tail, big;
+        ods2_extent_t ex[4];
+        int n;
+        ods2_head_core_t *core;
+        uint16_t sum;
+        unsigned pos;
+
+        /* a directory whose first block holds A.TXT and then a record the read side accepts but the write side
+           refuses (a name count of 0): the lookup finds A.TXT, so a delete used to mark its header before the
+           directory was first checked for writing */
+        assert(ods2_create_file(&vol, root, "VICTIM2.DAT", (const uint8_t *) "victim\n", 7, 5, &victim).ok);
+        assert(ods2_create_directory(&vol, root, "PREF", &pfid).ok);
+        assert(ods2_insert_into_directory(&vol, pfid.fid_num, "A.TXT", 1, victim).ok);
+        assert(ods2_read_header(&vol, pfid.fid_num, pb).ok);
+        assert(ods2_decode_all_extents(&vol, pb, ex, 4, &n).ok && n >= 1);
+        assert(ods2_read_file_block(&vol, pb, 1, blk).ok);
+        for (pos = 0; pos + 6 <= 512; ) {                    /* the end marker after the last real record */
+            uint16_t size = (uint16_t) (blk[pos] | (blk[pos + 1] << 8));
+            if (size == 0xffff || size == 0) break;
+            pos += (unsigned) size + 2;
+        }
+        assert(pos + 16 <= 512);
+        blk[pos] = 12; blk[pos + 1] = 0;                     /* record size 12 (14 with the size word) ... */
+        blk[pos + 2] = 1; blk[pos + 3] = 0;
+        blk[pos + 4] = 0; blk[pos + 5] = 0;                  /* ... a name count of 0 */
+        memset(blk + pos + 6, 0, 8);
+        blk[pos + 14] = 0xff; blk[pos + 15] = 0xff;
+        assert(ods2_write_block(&vol, ex[0].lbn, blk).ok);
+        {
+            ods2_fid_t found;
+            assert(ods2_read_header(&vol, pfid.fid_num, pb).ok);
+            assert(ods2_lookup_name(&vol, pb, "A.TXT", &found).ok);   /* the read side lists it */
+        }
+
+        /* R15-1: DELETE [PREF]A.TXT is refused, and the header is not marked for delete */
+        arm(NOLIMIT);
+        r = ods2_delete_version(&vol, pfid.fid_num, "A.TXT", 1, NULL);
+        assert(!r.ok && strstr(r.problem, "damaged") != NULL);
+        assert(disarm(NOLIMIT) == 0);
+        ods2_fault_forget();
+        assert(ods2_read_header(&vol, victim.fid_num, h).ok);
+        assert(!(((const ods2_head_core_t *) h)->filechar & 0x8000u));
+        assert(ods2_header_is_file(h, victim));
+
+        /* R15-2: COPY and CREATE/DIRECTORY into it are refused before anything is allocated: no lost file */
+        {
+            ods2_fid_t nf;
+            arm(NOLIMIT);
+            r = ods2_create_file(&vol, pb, "NEW.TXT", (const uint8_t *) "x", 1, 5, &nf);
+            assert(!r.ok);
+            assert(disarm(NOLIMIT) == 0);
+            ods2_fault_forget();
+            arm(NOLIMIT);
+            r = ods2_create_directory(&vol, pb, "NEWDIR", &nf);
+            assert(!r.ok);
+            assert(disarm(NOLIMIT) == 0);
+            ods2_fault_forget();
+            /* and the file number it would have taken is still free (nothing lost) */
+            {
+                unsigned num1, num2;
+                uint16_t sq;
+                assert(ods2_find_free_file_number(&vol, 1, 4000, &num1, &sq).ok);
+                assert(ods2_create_file(&vol, root, "CHECK.DAT", (const uint8_t *) "x", 1, 5, &nf).ok);
+                assert(nf.fid_num == num1);
+                (void) num2;
+            }
+        }
+
+        /* the same with a parent directory header that has a wrong checksum */
+        assert(ods2_read_header(&vol, pfid.fid_num, h).ok);
+        h[300] ^= 0x33;
+        assert(ods2_write_header(&vol, pfid.fid_num, h).ok);
+        {
+            ods2_fid_t nf;
+            arm(NOLIMIT);
+            r = ods2_create_file(&vol, h, "NEW2.TXT", (const uint8_t *) "x", 1, 5, &nf);
+            assert(!r.ok);
+            assert(disarm(NOLIMIT) == 0);
+            ods2_fault_forget();
+            h[300] ^= 0x33;
+            assert(ods2_write_header(&vol, pfid.fid_num, h).ok);
+        }
+        printf("PASS: DELETE, COPY and CREATE/DIRECTORY into a directory that cannot be written are refused before the "
+               "first write: no marked header, no lost file\n");
+
+        /* R15-3: a header chain whose EXT_FID names an unrelated live file: the delete is refused, the file is not
+           destroyed */
+        assert(ods2_create_file(&vol, root, "CHAINED.DAT", (const uint8_t *) "chain\n", 6, 5, &big).ok);
+        assert(ods2_create_file(&vol, root, "TAIL.TXT", (const uint8_t *) "tail\n", 5, 5, &tail).ok);
+        assert(ods2_read_header(&vol, big.fid_num, h).ok);
+        core = (ods2_head_core_t *) h;
+        core->ext_fid = tail;
+        sum = ods2_checksum(h, 255);
+        h[510] = (uint8_t) (sum & 0xff); h[511] = (uint8_t) (sum >> 8);
+        assert(ods2_write_header(&vol, big.fid_num, h).ok);
+        arm(NOLIMIT);
+        r = ods2_delete_version(&vol, 4, "CHAINED.DAT", 1, NULL);
+        assert(!r.ok && strstr(r.problem, "extension") != NULL);
+        assert(disarm(NOLIMIT) == 0);
+        ods2_fault_forget();
+        assert(ods2_read_header(&vol, tail.fid_num, h).ok && ods2_header_is_file(h, tail));
+        assert(ods2_read_header(&vol, big.fid_num, pb).ok);
+        assert(!ods2_decode_all_extents(&vol, pb, ex, 4, &n).ok);
+        printf("PASS: an extension chain that is not this file's (EXT_FID names another live file) is refused for "
+               "reading and deleting: the other file is not destroyed\n");
+
+        /* R15-4: a directory with an extension header is not rewritten (the move would leave the extension behind) */
+        {
+            ods2_fid_t dx;
+            assert(ods2_create_directory(&vol, root, "WITHEXT", &dx).ok);
+            assert(ods2_read_header(&vol, dx.fid_num, h).ok);
+            core = (ods2_head_core_t *) h;
+            core->ext_fid = tail;                               /* any other header: the chain is not followed */
+            sum = ods2_checksum(h, 255);
+            h[510] = (uint8_t) (sum & 0xff); h[511] = (uint8_t) (sum >> 8);
+            assert(ods2_write_header(&vol, dx.fid_num, h).ok);
+            arm(NOLIMIT);
+            r = ods2_insert_into_directory(&vol, dx.fid_num, "Z.TXT", 1, victim);
+            assert(!r.ok);
+            assert(disarm(NOLIMIT) == 0);
+            ods2_fault_forget();
+        }
+        printf("PASS: a directory whose header has an extension header is not changed\n");
+
+        /* R15-6: a file whose header maps an extent beyond the storage bitmap: the delete is refused before the
+           header is marked (the free would have refused after the headers were final) */
+        {
+            ods2_fid_t bf;
+            ods2_header_spec_t spec;
+            ods2_extent_t beyond;
+            assert(ods2_create_file(&vol, root, "BEYOND.DAT", (const uint8_t *) "b", 1, 5, &bf).ok);
+            assert(ods2_read_header(&vol, bf.fid_num, h).ok);
+            memset(&spec, 0, sizeof(spec));
+            spec.fid = bf; spec.backlink = root_fid_of(root);
+            beyond.lbn = 4194300u - (4194300u % vol.home.cluster); beyond.block_count = vol.home.cluster;
+            spec.extents = &beyond; spec.extent_count = 1; spec.hiblk = vol.home.cluster; spec.efblk = 2;
+            spec.rtype = 5; spec.rattrib = 2;
+            spec.ident_name = "BEYOND.DAT;1";
+            assert(ods2_build_file_header(h, &spec));
+            assert(ods2_write_header(&vol, bf.fid_num, h).ok);
+            arm(NOLIMIT);
+            r = ods2_delete_version(&vol, 4, "BEYOND.DAT", 1, NULL);
+            assert(!r.ok);
+            assert(disarm(NOLIMIT) == 0);
+            ods2_fault_forget();
+            assert(ods2_read_header(&vol, bf.fid_num, h).ok && !(((const ods2_head_core_t *) h)->filechar & 0x8000u));
+        }
+        printf("PASS: a file with an extent beyond the storage bitmap is refused before its header is marked\n");
+
+        /* R15-5: INDEXF.SYS's own header with a damaged IDOFFSET (checksum refreshed): a COPY is refused */
+        {
+            ods2_fid_t nf;
+            uint8_t ih[512];
+            assert(ods2_read_header(&vol, 1, ih).ok);
+            ((ods2_head_core_t *) ih)->idoffset = 250;
+            sum = ods2_checksum(ih, 255);
+            ih[510] = (uint8_t) (sum & 0xff); ih[511] = (uint8_t) (sum >> 8);
+            arm(NOLIMIT);                                       /* the journal puts header 1 back after */
+            assert(ods2_write_header(&vol, 1, ih).ok);
+            {
+                long before = ods2_fault_after_writes;
+                r = ods2_create_file(&vol, root, "INDEXDAMAGED.TXT", (const uint8_t *) "x", 1, 5, &nf);
+                assert(!r.ok && strstr(r.problem, "damaged") != NULL);
+                assert(before == ods2_fault_after_writes);       /* no write at all after the damage */
+            }
+            disarm(NOLIMIT);
+            ods2_fault_rollback(&vol);
+        }
+        printf("PASS: a damaged INDEXF.SYS header is not rewritten with a fresh checksum\n");
+
+        /* header_ok_for_write: offsets out of order, MPOFFSET at the end of the block (a header whose FID is not the entry's is
+           a stale entry, not damage: it is taken out alone, tested in ods2_fid_selftest) */
+        {
+            ods2_fid_t hf;
+            int variant;
+            assert(ods2_create_file(&vol, root, "HOK.DAT", (const uint8_t *) "x", 1, 5, &hf).ok);
+            for (variant = 0; variant < 2; variant++) {
+                assert(ods2_read_header(&vol, hf.fid_num, h).ok);
+                core = (ods2_head_core_t *) h;
+                if (variant == 0) core->acoffset = (uint8_t) (core->mpoffset - 1);          /* offsets out of order */
+                if (variant == 1) core->mpoffset = 255;                                      /* MPOFFSET at the very end */
+                sum = ods2_checksum(h, 255);
+                h[510] = (uint8_t) (sum & 0xff); h[511] = (uint8_t) (sum >> 8);
+                assert(ods2_write_header(&vol, hf.fid_num, h).ok);
+                arm(NOLIMIT);
+                r = ods2_delete_version(&vol, 4, "HOK.DAT", 1, NULL);
+                assert(!r.ok);
+                assert(disarm(NOLIMIT) == 0);
+                ods2_fault_forget();
+                assert(ods2_read_header(&vol, hf.fid_num, h).ok);
+                assert(!(((const ods2_head_core_t *) h)->filechar & 0x8000u));
+                /* put it right again for the next variant */
+                assert(ods2_read_header(&vol, hf.fid_num, h).ok);
+                core = (ods2_head_core_t *) h;
+                if (variant == 0) core->acoffset = core->rsoffset;
+                if (variant == 1) core->mpoffset = 100;
+                sum = ods2_checksum(h, 255);
+                h[510] = (uint8_t) (sum & 0xff); h[511] = (uint8_t) (sum >> 8);
+                assert(ods2_write_header(&vol, hf.fid_num, h).ok);
+            }
+        }
+        /* SET FILE/VERSION_LIMIT on the damaged directory of the first test: refused, nothing written */
+        {
+            unsigned changed = 0;
+            arm(NOLIMIT);
+            r = ods2_set_entry_version_limit(&vol, pfid.fid_num, "A.TXT", 3, &changed);
+            assert(!r.ok && strstr(r.problem, "damaged") != NULL);
+            assert(disarm(NOLIMIT) == 0);
+            ods2_fault_forget();
+        }
+        printf("PASS: a header with offsets out of order or an MPOFFSET at the block's end is not "
+               "rewritten; SET FILE/VERSION_LIMIT refuses a damaged directory\n");
     }
 
     ods2_dismount(&vol);

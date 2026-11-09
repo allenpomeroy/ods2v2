@@ -31,7 +31,7 @@ cp --sparse=always "$SYNTH" "$DISK" 2>/dev/null || cp "$SYNTH" "$DISK"
 echo "text" > "$DISK.txt"
 
 # another process holds the image for write (an exclusive lock) for a few seconds: nothing else may read or write it
-flock -x "$DISK" sleep 4 &
+flock -x "$DISK" sleep 8 &
 sleep 1
 out=$($ODS2 "$DISK" "DIR [000000]" 2>&1); rc=$?
 check "a writer holds the image: DIR is refused (exit 1): it is being written, its blocks are not consistent" "1 1" \
@@ -43,7 +43,7 @@ out=$($ODS2 "$DISK" "COPY $DISK.txt [000000]NEW.TXT" 2>&1); rc=$?
 check "the lock is gone: COPY works" "1 0" "$(echo "$out" | grep -c COPIED) $rc"
 
 # another process holds it for read (a shared lock): readers go on, a writer is refused
-flock -s "$DISK" sleep 4 &
+flock -s "$DISK" sleep 8 &
 sleep 1
 out=$($ODS2 "$DISK" "DIR [000000]" 2>&1); rc=$?
 check "a reader holds the image: DIR works, read-only, with a warning (exit 0)" "1 1 0" \

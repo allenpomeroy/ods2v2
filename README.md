@@ -77,7 +77,7 @@ implements basic command recall to ease repetitive command sequences.
 | `DIR [path] [wildcard]` | `DIR [DECUS] *.TXT` |
 | `DIR [path...] [wildcard]` | `DIR [...]*.*` — recursive, VMS's `...` notation |
 | `DIR [*...] [wildcard]` | `DIR [*...]*.COM` — wildcards in directory names (see below) |
-| `CREATE/DIRECTORY path` | `CREATE/DIRECTORY [DECUS.NETLIB020]` |
+| `CREATE/DIRECTORY path` | `CREATE/DIRECTORY [DECUS.NETLIB020]` — a directory name cannot start with `-`: VAX VMS (V7.3) reads a leading `-` as the parent directory and cannot reach files inside (`%RMS-F-SYN`; ODS-2 has no `^` escape), so it is refused |
 | `COPY <local-file> <path>` | `COPY readme.txt [DECUS]README.TXT` |
 | `COPY/ATTRIBUTES=(...) <local-file> <path>` | `COPY/ATTRIBUTES=(RFM:FIX,MRS:8192) kit.pcsi [KITS]KIT.PCSI` |
 | `COPY/CONVERT <local-file> <path>` | `COPY/CONVERT notes.txt [DOC]NOTES.TXT` — text as VAR records |
@@ -86,6 +86,7 @@ implements basic command recall to ease repetitive command sequences.
 | `SET DEFAULT path` | `SET DEFAULT [DECUS.NETLIB020]` |
 | `SHOW DEFAULT` | |
 | `SET VOLUME/LABEL=name` | `SET VOLUME/LABEL=ITANKITS` — relabel the volume |
+| `SET FILE/ATTRIBUTES=(MRS:0) spec` | `SET FILE/ATTRIBUTES=(MRS:0) [DECUS...]*.*` — repairs Stream, Stream_LF and Stream_CR files made with a maximum record size or with an LRL below their longest record (older ods2v2 gave them MRS = LRL = 512, and VMS cannot read such a file with a longer line in record mode: `%RMS-W-RTB`): MRS 0, LRL the longest record; the only attribute change implemented |
 | `SET FILE/VERSION_LIMIT=n spec` | `SET FILE/VERSION_LIMIT=32767 [DECUS...]*.*` — the version limit of the entries a spec names (wildcards and `[dir...]` as in `DIR`); 32767 or 0 is no limit, what VMS writes. For volumes written by an older ods2v2, whose entries carry 1: VMS purges version 1 of such a file when it makes version 2 |
 | `SHOW VOLUME` | label, owner, cluster size, maximum files, free blocks |
 | `HELP` | |
@@ -163,6 +164,16 @@ COPY/ATTRIBUTES=(RFM:STMLF,RAT:CR) notes.txt [DOC]NOTES.TXT
   number of records, and the size even (2-32766).
 - `RAT:` record attributes - `NONE`, `CR`, `FTN`, `PRN`, `BLK`, `NOBLK`;
   repeat `RAT:` for more than one.
+- A stream file (`STMLF`, `STM`, `STMCR`; also a plain `COPY`) or `UDF` file gets
+  MRS 0 and its own longest record as `LRL` (the longest record as RMS reads
+  it: `STMLF` ends at LF, `STMCR` at CR, `STM` at LF, FF or VT - that byte
+  stays in the record - or CR LF; the length for `UDF`; at most 32767), unless
+  `MRS:` or `LRL:` is given. A record longer than a given `MRS:` or `LRL:` is
+  refused (`%ODS2-E-RECTOOLONG`): VMS could not read the file in record mode
+  (`%RMS-W-RTB`, record too large for the user's buffer). (Before, MRS and LRL
+  were 512 whatever the lines; a file with a longer line failed `TYPE`, `COPY`
+  and `CHECKSUM` on VMS. `SET FILE/ATTRIBUTES=(MRS:0) spec` repairs such a
+  file: MRS 0 and LRL the longest record, the data untouched.)
 
 VMS's native text format is variable-length records with carriage-return
 carriage control (`RFM:VAR`, `RAT:CR`) - what VMS FTP writes in ASCII

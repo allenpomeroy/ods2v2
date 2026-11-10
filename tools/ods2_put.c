@@ -113,7 +113,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "  dir-path is dot-separated, no brackets (empty string for root)\n");
         fprintf(stderr, "  rtype: 5=FAB$C_STMLF (default, text), 1=FAB$C_FIX (fixed-length\n"
                         "         records, e.g. binary), 0=UDF, 4=STM, 6=STMCR\n");
-        fprintf(stderr, "  rsize: record size in bytes (default 512); for FIX the file must\n"
+        fprintf(stderr, "  rsize: record size in bytes (default 512 for FIX; the longest record for STMLF, STM, STMCR (MRS 0)); for FIX the file must\n"
                         "         be a whole number of records - e.g. 1 8192 for a PCSI kit\n");
         fprintf(stderr, "  rattrib: RMS record attributes (default 0; 2=CR carriage control)\n");
         return 1;
@@ -135,6 +135,15 @@ int main(int argc, char **argv)
 
     if (!read_whole_file(argv[2], &buf, &content_len)) {
         return 1;
+    }
+    if (ods2_stream_format(attrs.rtype) || attrs.rtype == ODS2_RFM_UDF) {
+        /* a stream or undefined-format file has MRS 0 and, unless rsize was given, its own longest record as LRL (MRS = 512
+           made RMS refuse a file with a longer line: %RMS-W-RTB) */
+        attrs.maxrec = 0;
+        if (argc < 7) {
+            size_t longest = attrs.rtype == ODS2_RFM_UDF ? content_len : ods2_longest_record(attrs.rtype, buf, content_len);
+            attrs.rsize = (uint16_t) (longest > 32767 ? 32767 : longest);
+        }
     }
     /* Checked before touching the volume. */
     why = ods2_check_record_attrs(&attrs, content_len);

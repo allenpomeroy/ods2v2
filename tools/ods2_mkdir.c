@@ -60,7 +60,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    r = ods2_read_header(&vol, parent_fid.fid_num, parent_header);
+    r = ods2_read_header_fid(&vol, parent_fid, parent_header);
     if (!r.ok) {
         fprintf(stderr, "could not read parent directory header: %s\n", r.problem);
         ods2_dismount(&vol);

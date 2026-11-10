@@ -60,6 +60,10 @@ typedef struct {
     const char *problem; /* NULL if ok */
 } ods2_result_t;
 
+/* Makes the blocks written so far durable (fflush and fdatasync). A caller that reports a change as done calls this
+ * first; ods2_dismount() closes the file. */
+ods2_result_t ods2_sync(ods2_volume_t *vol);
+
 /* Opens `path` and reads/validates the home block, then reads and
    decodes INDEXF.SYS's own header so later header lookups can walk
    its extents. `vol` is caller-allocated; on failure vol->fp is
@@ -100,6 +104,15 @@ ods2_result_t ods2_write_header(ods2_volume_t *vol, unsigned file_number,
    Map Area and walking its extents. */
 ods2_result_t ods2_read_file_block(ods2_volume_t *vol, const uint8_t *header,
                                     unsigned vbn, uint8_t *block_out);
+
+/* The header a directory entry's FID names (see ods2_read_header_fid in ods2_volume.c): refuses a FID with a relative
+   volume number or an extended file number, and an entry whose sequence number is not the header's or whose header is
+   marked for delete (a stale alias: the problem is ods2_stale_entry, which a caller may compare r.problem with). Use
+   this, not ods2_read_header(), for any FID that came out of a directory entry or a back link. */
+extern const char ods2_stale_entry[];
+ods2_result_t ods2_check_fid(ods2_fid_t fid);
+ods2_result_t ods2_read_header_fid(ods2_volume_t *vol, ods2_fid_t fid, uint8_t *header_out);
+bool ods2_header_is_file(const uint8_t *header, ods2_fid_t fid);
 
 /* Looks up `name` (case-insensitive, e.g. "NETLIB020.DIR", no
    ";version") within the directory whose header is `dir_header`,
@@ -401,6 +414,11 @@ ods2_result_t ods2_create_file_source(ods2_volume_t *vol, const uint8_t *parent_
 ods2_result_t ods2_read_file_stream(ods2_volume_t *vol, const uint8_t *header,
                                      bool (*sink)(void *ctx, const uint8_t *data, size_t n),
                                      void *ctx, size_t *bytes_out, bool *sink_failed_out);
+
+/* SET FILE/VERSION_LIMIT: sets the version limit of the entries named `name` in the directory (all versions); *changed
+ * is the number of directory records changed. For volumes written before ods2v2 gave entries VMS's limit (32767). */
+ods2_result_t ods2_set_entry_version_limit(ods2_volume_t *vol, unsigned dir_file_number, const char *name,
+                                           uint16_t limit, unsigned *changed);
 
 /* Inserts (name, version, fid) into the directory whose header is at
  * `dir_file_number`, trying each of its existing content blocks

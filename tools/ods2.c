@@ -69,6 +69,9 @@
  *   SHOW DEFAULT                  show the current default directory
  *   SET VOLUME/LABEL=name         relabel the volume: every home block
  *                                 copy, checksums recomputed
+ *   SET FILE/VERSION_LIMIT=n spec the version limit of the entries a spec
+ *                                 names ([dir...] and wildcards work as in
+ *                                 DIR); 32767 or 0 = no limit, as VMS writes
  *   SHOW VOLUME                   label, owner, cluster size, maximum
  *                                 files, total and free blocks
  *   HELP                          show this command list
@@ -279,7 +282,7 @@ static ods2_result_t resolve_dir(ods2_volume_t *vol, const char *dir_path,
 {
     ods2_result_t r = ods2_lookup_path(vol, dir_path, dir_fid_out);
     if (!r.ok) return r;
-    return ods2_read_header(vol, dir_fid_out->fid_num, dir_header_out);
+    return ods2_read_header_fid(vol, *dir_fid_out, dir_header_out);
 }
 
 /* Splits a dot-separated dir_path into its parent path and its own
@@ -324,6 +327,13 @@ static bool version_selected(const ods2_parsed_path_t *p, const ods2_dir_entry_t
  * at all for a directory with no matching entries, so a listing across
  * many directories shows only the ones that have something to show.
  * `dir_path` is absolute (from root). Returns the number shown. */
+/* A command that walks directories like DIR but does something to each matching entry (SET FILE/VERSION_LIMIT)
+   sets this: it is called, once per entry, in place of printing it. */
+typedef void (*entry_hook_fn)(void *ctx, ods2_volume_t *vol, const char *dir_path, const ods2_dir_entry_t *entry);
+static entry_hook_fn g_entry_hook = NULL;
+static void *g_entry_hook_ctx = NULL;
+static ods2_volume_t *g_entry_hook_vol = NULL;
+
 static int show_directory(const char *dir_path, const ods2_dir_entry_t *entries, int count,
                           const char *pattern, const ods2_parsed_path_t *p)
 {
@@ -335,6 +345,11 @@ static int show_directory(const char *dir_path, const ods2_dir_entry_t *entries,
         rank = (i > 0 && same_name(entries[i].name, entries[i - 1].name)) ? rank + 1 : 0;
         if (ods2_wildcard_match(pattern, entries[i].name) &&
             version_selected(p, &entries[i], rank)) {
+            if (g_entry_hook != NULL) {
+                g_entry_hook(g_entry_hook_ctx, g_entry_hook_vol, dir_path, &entries[i]);
+                shown++;
+                continue;
+            }
             if (shown == 0) {
                 printf("\nDirectory [%s%s]\n\n", (dir_path[0] == '\0') ? "000000" : "",
                        dir_path);
@@ -343,7 +358,7 @@ static int show_directory(const char *dir_path, const ods2_dir_entry_t *entries,
             shown++;
         }
     }
-    if (shown > 0) {
+    if (shown > 0 && g_entry_hook == NULL) {
         printf("\nTotal of %d file%s.\n", shown, (shown == 1) ? "" : "s");
     }
     return shown;
@@ -460,7 +475,7 @@ static void walk_directories(dir_walk_t *w, const char *abs_path, const char *re
         }
         /* Is it really a directory? Checked via its own header's
            FH2$M_DIRECTORY bit (0x2000), not just the .DIR suffix. */
-        r = ods2_read_header(w->vol, entries[i].fid.fid_num, sub_header);
+        r = ods2_read_header_fid(w->vol, entries[i].fid, sub_header);
         if (!r.ok || !(((ods2_head_core_t *) sub_header)->filechar & 0x2000u)) {
             continue;
         }
@@ -521,6 +536,79 @@ static void cmd_dir(ods2_volume_t *vol, const ods2_parsed_path_t *p)
                w.files_shown, (w.files_shown == 1) ? "" : "s");
     } else if (w.dirs_shown == 0 && w.errors == 0) {
         fprintf(stderr, "%%ODS2-W-NOFILES, no files found\n");
+    }
+}
+
+/* SET FILE/VERSION_LIMIT=n <spec>: the version limit of the directory entries the spec names (wildcards and [dir...]
+   work as in DIRECTORY). ods2v2 wrote 1 for the entries until it was fixed; VMS then purges version 1 when it makes
+   version 2 of such a file (COPY, EDIT). 32767 is "no limit", what VMS writes. */
+typedef struct {
+    uint16_t limit;
+    unsigned entries, records;     /* names looked at, directory records changed */
+    char last_dir[ODS2_PATH_MAX];
+    char last_name[ODS2_DIR_MAX_NAME + 8];
+    bool have_last;
+} verlimit_ctx_t;
+
+static void verlimit_entry(void *ctx_, ods2_volume_t *vol, const char *dir_spelling, const ods2_dir_entry_t *e)
+{
+    verlimit_ctx_t *x = (verlimit_ctx_t *) ctx_;
+    ods2_fid_t dfid;
+    unsigned changed = 0;
+    ods2_result_t r;
+
+    /* the reserved files and the master directory's own entry keep the limit VMS gave them (1) */
+    if (e->fid.fid_num >= 1 && e->fid.fid_num <= 10 && e->fid.fid_nmx == 0) return;
+    /* one call per name (the walk calls the hook once per version) */
+    if (x->have_last && strcmp(x->last_dir, dir_spelling) == 0 && same_name(x->last_name, e->name)) return;
+    snprintf(x->last_dir, sizeof(x->last_dir), "%s", dir_spelling);
+    snprintf(x->last_name, sizeof(x->last_name), "%s", e->name);
+    x->have_last = true;
+    x->entries++;
+    r = ods2_lookup_path(vol, dir_spelling, &dfid);
+    if (r.ok) r = ods2_set_entry_version_limit(vol, dfid.fid_num, e->name, x->limit, &changed);
+    if (!r.ok) {
+        report_error("%%ODS2-E-VERLIMIT, [%s]%s: %s\n", dir_spelling, e->name, r.problem);
+        return;
+    }
+    x->records += changed;
+}
+
+static void cmd_set_version_limit(ods2_volume_t *vol, const ods2_parsed_path_t *p, uint16_t limit)
+{
+    verlimit_ctx_t x;
+    char effective[ODS2_PATH_MAX], spec[ODS2_PATH_MAX + 4], start[ODS2_PATH_MAX], pattern[ODS2_PATH_MAX + 4];
+    const char *rest;
+    dir_walk_t w;
+
+    memset(&x, 0, sizeof(x));
+    x.limit = limit;
+    resolve_effective_path(p, effective, sizeof(effective));
+    snprintf(spec, sizeof(spec), "%s%s", effective, p->recursive ? "..." : "");
+    rest = ods2_dir_spec_split_prefix(spec, start, sizeof(start));
+    if (rest == NULL) {
+        report_error("%%ODS2-E-BADPATH, [%s]: invalid directory specification\n", spec);
+        return;
+    }
+    if (p->filename[0] == '\0') snprintf(pattern, sizeof(pattern), "*.*");
+    else if (strchr(p->filename, '.') == NULL) snprintf(pattern, sizeof(pattern), "%s.*", p->filename);
+    else snprintf(pattern, sizeof(pattern), "%s", p->filename);
+    memset(&w, 0, sizeof(w));
+    w.vol = vol;
+    w.spec = rest;
+    w.pattern = pattern;
+    w.p = p;
+    g_entry_hook = verlimit_entry;
+    g_entry_hook_ctx = &x;
+    g_entry_hook_vol = vol;
+    walk_directories(&w, start, "", 0);
+    g_entry_hook = NULL;
+    g_entry_hook_ctx = NULL;
+    if (x.entries == 0 && w.errors == 0) {
+        fprintf(stderr, "%%ODS2-W-NOFILES, no files found\n");
+    } else {
+        printf("%%ODS2-I-VERLIMIT, %u name%s looked at, %u directory record%s changed to version limit %u\n",
+               x.entries, x.entries == 1 ? "" : "s", x.records, x.records == 1 ? "" : "s", (unsigned) limit);
     }
 }
 
@@ -1188,7 +1276,7 @@ static void cmd_type(ods2_volume_t *vol, const ods2_parsed_path_t *p)
         report_error("%%ODS2-E-FNF, %s not found\n", spec);
         return;
     }
-    r = ods2_read_header(vol, file_fid.fid_num, file_header);
+    r = ods2_read_header_fid(vol, file_fid, file_header);
     if (!r.ok) {
         report_error("%%ODS2-E-READERR, %s\n", r.problem);
         return;
@@ -1300,6 +1388,9 @@ static void print_help(void)
            "  SET DEFAULT path           set the current default directory\n"
            "  SHOW DEFAULT               show the current default directory\n"
            "  SET VOLUME/LABEL=name      relabel the volume (all home block copies)\n"
+           "  SET FILE/VERSION_LIMIT=n spec   the version limit of the entries a spec names (32767 or 0 = no limit,\n"
+           "                             what VMS writes; volumes written before carry 1, and VMS then purges\n"
+           "                             version 1 when it makes version 2)\n"
            "  SHOW VOLUME                label, owner, cluster size, files, free space\n"
            "  HELP                       show this command list\n"
            "  EXIT / QUIT                leave the interactive shell\n"
@@ -1359,6 +1450,22 @@ static bool execute_line(ods2_volume_t *vol, char *line)
         print_help();
         return true;
     }
+    if (matches(tokens[0], "SET") && n > 1 && strncasecmp(tokens[1], "FILE/VERSION_LIMIT=", 19) == 0) {
+        /* SET FILE/VERSION_LIMIT=n <spec> */
+        ods2_parsed_path_t p;
+        char *end;
+        long limit = strtol(tokens[1] + 19, &end, 10);
+        if (n < 3 || *end != '\0' || limit < 0 || limit > 32767) {
+            report_error("%%ODS2-E-NOPARM, usage: SET FILE/VERSION_LIMIT=n <spec>   (n 0 to 32767; 0 is no limit)\n");
+            return true;
+        }
+        if (!ods2_parse_path(tokens[2], &p)) {
+            report_error("%%ODS2-E-BADPATH, could not parse %s\n", tokens[2]);
+            return true;
+        }
+        cmd_set_version_limit(vol, &p, (uint16_t) (limit == 0 ? 32767 : limit));
+        return true;
+    }
     if (matches(tokens[0], "SET") && n > 1 && is_volume_word(tokens[1])) {
         cmd_set_volume(vol, tokens, n);
         return true;
@@ -1397,7 +1504,7 @@ static bool execute_line(ods2_volume_t *vol, char *line)
             report_error("%%ODS2-E-DIRERR, %s\n", r.problem);
             return true;
         }
-        r = ods2_read_header(vol, fid.fid_num, header);
+        r = ods2_read_header_fid(vol, fid, header);
         if (r.ok && !(((ods2_head_core_t *) header)->filechar & 0x2000u)) {
             report_error("%%ODS2-E-NOTDIR, %s is not a directory\n", tokens[2]);
             return true;
@@ -1550,6 +1657,15 @@ int main(int argc, char **argv)
     }
 
     r = ods2_mount_write(argv[1], &vol);
+    if (!r.ok && strstr(r.problem, "locked") != NULL) {
+        /* another process has the image open (one writer or many readers): read it, refuse every write */
+        ods2_result_t r_read = ods2_mount(argv[1], &vol);
+        if (r_read.ok) {
+            fprintf(stderr, "%%ODS2-W-READONLY, %s: the image is locked by another process; mounted read-only\n",
+                    argv[1]);
+            r = r_read;
+        }
+    }
     if (!r.ok) {
         fprintf(stderr, "%%ODS2-F-MOUNTERR, %s: %s\n", argv[1], r.problem);
         return 1;
@@ -1590,6 +1706,14 @@ int main(int argc, char **argv)
         exit_code = g_command_failed ? 1 : 0;
     }
 
+    {
+        /* a write that did not reach the disk is a command that failed */
+        ods2_result_t synced = ods2_sync(&vol);
+        if (!synced.ok) {
+            report_error("%%ODS2-E-SYNCERR, %s: %s\n", argv[1], synced.problem);
+            exit_code = 1;
+        }
+    }
     ods2_dismount(&vol);
     return exit_code;
 }

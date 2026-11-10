@@ -94,6 +94,7 @@ bool ods2_build_file_header(uint8_t *header_out, const ods2_header_spec_t *spec)
     core->recattr.efblk = ods2_word_swap32(spec->efblk);
     core->recattr.ffbyte = spec->ffbyte;
     core->recattr.maxrec = spec->maxrec;
+    core->recattr.versions = spec->versions;
     core->filechar = spec->filechar;
     core->map_inuse = (uint8_t) (map_bytes / 2);
     /* FH2$L_FILEOWNER, FH2$W_FILEPROT, FH2$W_RECPROT: confirmed via

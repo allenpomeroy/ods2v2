@@ -86,6 +86,7 @@ implements basic command recall to ease repetitive command sequences.
 | `SET DEFAULT path` | `SET DEFAULT [DECUS.NETLIB020]` |
 | `SHOW DEFAULT` | |
 | `SET VOLUME/LABEL=name` | `SET VOLUME/LABEL=ITANKITS` — relabel the volume |
+| `SET FILE/VERSION_LIMIT=n spec` | `SET FILE/VERSION_LIMIT=32767 [DECUS...]*.*` — the version limit of the entries a spec names (wildcards and `[dir...]` as in `DIR`); 32767 or 0 is no limit, what VMS writes. For volumes written by an older ods2v2, whose entries carry 1: VMS purges version 1 of such a file when it makes version 2 |
 | `SHOW VOLUME` | label, owner, cluster size, maximum files, free blocks |
 | `HELP` | |
 | `EXIT` / `QUIT` | |
@@ -327,7 +328,13 @@ in every structural test.
   on the order of ten thousand files beyond the headers INITIALIZE
   preallocated (`/HEADERS`). INDEXF.SYS extension headers aren't
   written.
-- File numbers stop at 65,535 (the FID_NMX extension isn't used).
+- File numbers stop at 65,535 (the FID_NMX extension isn't used): a directory entry that names a file with an
+  extended file number, or on another volume of a set (a relative volume number), is refused, never read as some
+  other file. A file with more than 1,024 extents (header chains included) is refused for reading and deleting.
+- One writer or any number of readers: the image is `flock()`ed (`ODS2_NOLOCK=1` turns that off); a command that
+  finds it locked by another reader mounts it read-only.
+- The reserved files (INDEXF.SYS ... BADLOG.SYS, and SECURITY.SYS) can't be deleted, and a delete is written in the
+  order VMS uses, so that an interruption never leaves a listed file whose blocks are free.
 - A directory is limited to 256 blocks (a few thousand entries), the
   most one contiguous extent can map here.
 

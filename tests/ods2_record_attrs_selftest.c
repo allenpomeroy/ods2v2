@@ -128,6 +128,23 @@ int main(void)
 
     setvbuf(stdout, NULL, _IONBF, 0);
 
+    /* --- RAT:PRN (print-file carriage control) needs the VFC record format: with any other VMS TYPE refuses the file
+       (%RMS-F-RAT, measured on VAX V7.3 and Alpha V7.3-2) --- */
+    {
+        ods2_record_attrs_t p = attrs(ODS2_RFM_STMLF, ODS2_RAT_PRN, 0, 0);
+        const char *why;
+        assert(!accepted(ODS2_RFM_FIX, ODS2_RAT_PRN, 512, 512, 1024));
+        assert(!accepted(ODS2_RFM_STMLF, ODS2_RAT_PRN, 0, 0, 100));
+        assert(!accepted(ODS2_RFM_UDF, ODS2_RAT_PRN, 0, 0, 100));
+        why = ods2_check_record_attrs(&p, 100);
+        assert(why != NULL && strstr(why, "VFC") != NULL);
+        p = attrs(ODS2_RFM_VAR, ODS2_RAT_PRN, 80, 0);
+        why = ods2_check_var_record_attrs(&p, 100);
+        assert(why != NULL && strstr(why, "VFC") != NULL);
+        assert(accepted(ODS2_RFM_FIX, ODS2_RAT_CR, 512, 512, 1024));     /* the others stay */
+        printf("PASS: RAT:PRN is refused with every format that can be imported (VMS TYPE would fail with RMS-F-RAT)\n");
+    }
+
     /* --- What ods2_check_record_attrs() accepts --- */
     assert(accepted(ODS2_RFM_FIX, 0, 8192, 8192, 16384));
     assert(accepted(ODS2_RFM_FIX, 0, 8192, 8192, 0));          /* empty: zero records */

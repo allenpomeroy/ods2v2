@@ -47,6 +47,14 @@ int main(void)
     assert(n == 4);
     printf("PASS: decoded exactly 4 extents from real INDEXF.SYS map area\n");
 
+    /* more extents than the array holds is reported, not truncated without a word */
+    {
+        assert(ods2_decode_retrieval_pointers(real_map_area, 8, extents, 4) == 4);
+        assert(ods2_decode_retrieval_pointers(real_map_area, 8, extents, 3) == ODS2_DECODE_TOO_MANY);
+        assert(ods2_decode_retrieval_pointers(real_map_area, 8, extents, 0) == ODS2_DECODE_TOO_MANY);
+        printf("PASS: more extents than the caller's array is ODS2_DECODE_TOO_MANY, never a shortened list\n");
+    }
+
     /* Extent 1: boot block + home block + 4 filler blocks, at LBN 0. */
     assert(extents[0].lbn == 0);
     assert(extents[0].block_count == 6);

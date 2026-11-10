@@ -22,6 +22,10 @@
  * SOFTWARE.
  */
 
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE /* flock(), fileno(), fdatasync() */
+#endif
+
 #include "ods2_volume.h"
 #include "ods2_validate.h"
 #include "ods2_bitmap.h"
@@ -31,6 +35,9 @@
 #include "ods2_time.h"
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/file.h>
 #include <stdlib.h>
 
 static ods2_result_t ok(void)
@@ -65,6 +72,9 @@ static bool contains_wildcard(const char *name)
 {
     return strchr(name, '*') != NULL || strchr(name, '%') != NULL;
 }
+
+static ods2_result_t header_ok_for_write(const uint8_t *h, unsigned file_number);
+static ods2_result_t directory_ready(ods2_volume_t *vol, const uint8_t *dir_header, unsigned dir_file_number);
 
 static int decode_header_extents(const uint8_t *header, ods2_extent_t *extents_out, size_t max)
 {
@@ -107,6 +117,17 @@ static ods2_result_t mount_internal(const char *path, ods2_volume_t *vol,
         return fail("could not open disk image file");
     }
     vol->writable = writable;
+    /* One writer or any number of readers: two processes writing one image, or one writing an image another reads,
+       would corrupt it or read a half-done change. flock() is advisory: it stops another ods2v2, not a simulator that
+       has the image open; a file system without flock() gives no lock and no error. ODS2_NOLOCK=1 turns it off (a test
+       that holds a volume open while it mounts the same image again). */
+    if (getenv("ODS2_NOLOCK") == NULL &&
+        flock(fileno(vol->fp), (writable ? LOCK_EX : LOCK_SH) | LOCK_NB) != 0 && errno == EWOULDBLOCK) {
+        fclose(vol->fp);
+        vol->fp = NULL;
+        return fail(writable ? "the disk image is in use by another process (it is locked): not written"
+                             : "the disk image is being written by another process (it is locked)");
+    }
 
     if (fseek(vol->fp, 512, SEEK_SET) != 0 ||
         fread(&vol->home, 1, sizeof(vol->home), vol->fp) != sizeof(vol->home)) {
@@ -134,6 +155,10 @@ static ods2_result_t mount_internal(const char *path, ods2_volume_t *vol,
 
     vol->indexf_extent_count = decode_header_extents(indexf_header,
         vol->indexf_extents, ODS2_MAX_EXTENTS);
+    if (vol->indexf_extent_count == ODS2_DECODE_TOO_MANY) {
+        ods2_dismount(vol);
+        return fail("INDEXF.SYS has more extents than ods2v2 can hold (1,024): the volume is not mounted");
+    }
     if (vol->indexf_extent_count <= 0) {
         ods2_dismount(vol);
         return fail("could not decode INDEXF.SYS's own retrieval pointers");
@@ -153,11 +178,58 @@ ods2_result_t ods2_mount_write(const char *path, ods2_volume_t *vol)
     return mount_internal(path, vol, "r+b", true);
 }
 
+#ifdef ODS2_FAULT_INJECTION
+/* Test builds only (tests/ods2_integrity_selftest.c). ods2_fault_after_writes: the (n+1)th write after it is set to
+   n, and every one after it, fails, as if the machine stopped there; -1 is off. While ods2_fault_journal_on is set
+   every block written is kept with what it replaced, so that the test can put the image back
+   (ods2_fault_rollback) instead of copying a volume of 1.5 GB for each interruption it tries. */
+long ods2_fault_after_writes = -1;
+bool ods2_fault_journal_on = false;
+static struct { uint32_t lbn; uint8_t old[512]; } *fault_journal;
+static size_t fault_journal_n, fault_journal_cap;
+
+void ods2_fault_forget(void)
+{
+    fault_journal_n = 0;
+}
+
+void ods2_fault_rollback(ods2_volume_t *vol)
+{
+    while (fault_journal_n > 0) {
+        fault_journal_n--;
+        if (fseek(vol->fp, (long) fault_journal[fault_journal_n].lbn * 512, SEEK_SET) != 0 ||
+            fwrite(fault_journal[fault_journal_n].old, 1, 512, vol->fp) != 512) {
+            abort();
+        }
+    }
+    fflush(vol->fp);
+}
+#endif
+
 ods2_result_t ods2_write_block(ods2_volume_t *vol, uint32_t lbn, const uint8_t *block)
 {
     if (!vol->writable) {
         return fail("volume was not mounted for write (use ods2_mount_write)");
     }
+#ifdef ODS2_FAULT_INJECTION
+    if (ods2_fault_after_writes >= 0) {
+        if (ods2_fault_after_writes == 0) return fail("injected write failure");   /* and every write after it */
+        ods2_fault_after_writes--;
+    }
+    if (ods2_fault_journal_on) {
+        if (fault_journal_n == fault_journal_cap) {
+            fault_journal_cap = fault_journal_cap ? fault_journal_cap * 2 : 256;
+            fault_journal = realloc(fault_journal, fault_journal_cap * sizeof(*fault_journal));
+            if (fault_journal == NULL) abort();
+        }
+        fault_journal[fault_journal_n].lbn = lbn;
+        if (fseek(vol->fp, (long) lbn * 512, SEEK_SET) != 0 ||
+            fread(fault_journal[fault_journal_n].old, 1, 512, vol->fp) != 512) {
+            memset(fault_journal[fault_journal_n].old, 0, 512);
+        }
+        fault_journal_n++;
+    }
+#endif
     if (fseek(vol->fp, (long) lbn * 512, SEEK_SET) != 0 ||
         fwrite(block, 1, 512, vol->fp) != 512) {
         return fail("could not write block");
@@ -168,8 +240,19 @@ ods2_result_t ods2_write_block(ods2_volume_t *vol, uint32_t lbn, const uint8_t *
     return ok();
 }
 
+/* Makes what was written durable (fdatasync): a command whose writes sit in the host's cache is not done. */
+ods2_result_t ods2_sync(ods2_volume_t *vol)
+{
+    if (vol->fp == NULL || !vol->writable) return ok();
+    if (fflush(vol->fp) != 0 || fdatasync(fileno(vol->fp)) != 0) {
+        return fail("could not make the written blocks durable (fdatasync failed)");
+    }
+    return ok();
+}
+
 void ods2_dismount(ods2_volume_t *vol)
 {
+    if (vol->fp != NULL && vol->writable) ods2_sync(vol);   /* best effort: a tool that exits without calling it first */
     if (vol->fp != NULL) {
         fclose(vol->fp);
         vol->fp = NULL;
@@ -195,6 +278,45 @@ ods2_result_t ods2_read_header(ods2_volume_t *vol, unsigned file_number, uint8_t
         fread(header_out, 1, 512, vol->fp) != 512) {
         return fail("could not read file header block");
     }
+    return ok();
+}
+
+/* The header a directory entry's FID names. An entry names a file by number AND sequence number AND relative volume
+   number AND extended file number (FID_NMX: the file number is NMX << 16 | NUM). The header used to be found by the low
+   16 bits of the number alone, so an entry with an RVN (a file on another volume of a set) or an NMX (a file number
+   above 65,535) read some other file's header, silently: it is refused here, as is an entry whose sequence number is
+   not the header's (the file was deleted and its number reused: VMS gives a reused number a new sequence number, and
+   lists such an entry as "no such file") or whose header is marked for delete. */
+const char ods2_stale_entry[] = "no such file: a dangling directory entry, a stale alias (the file it names was deleted; "
+                                "its file number may have been reused)";
+
+bool ods2_header_is_file(const uint8_t *header, ods2_fid_t fid)
+{
+    const ods2_head_core_t *core = (const ods2_head_core_t *) header;
+    return core->fid.fid_num == fid.fid_num && core->fid.fid_seq == fid.fid_seq &&
+           core->fid.fid_nmx == fid.fid_nmx && core->fid.fid_rvn == fid.fid_rvn &&
+           !(core->filechar & 0x8000u);
+}
+
+ods2_result_t ods2_check_fid(ods2_fid_t fid)
+{
+    if (fid.fid_rvn != 0) {
+        return fail("volume sets are not supported (a directory entry names a file on another volume of a set)");
+    }
+    if (fid.fid_nmx != 0) {
+        return fail("file numbers above 65,535 are not supported (a directory entry names a file whose number needs "
+                    "FID_NMX)");
+    }
+    return ok();
+}
+
+ods2_result_t ods2_read_header_fid(ods2_volume_t *vol, ods2_fid_t fid, uint8_t *header_out)
+{
+    ods2_result_t r = ods2_check_fid(fid);
+    if (!r.ok) return r;
+    r = ods2_read_header(vol, fid.fid_num, header_out);
+    if (!r.ok) return r;
+    if (!ods2_header_is_file(header_out, fid)) return fail(ods2_stale_entry);
     return ok();
 }
 
@@ -375,6 +497,20 @@ ods2_result_t ods2_allocate_extent(ods2_volume_t *vol, unsigned max_blocks,
    looping forever. */
 #define ODS2_MAX_HEADER_SEGMENTS 64
 
+/* Is `h`, read for the EXT_FID `ext` of the header chain of file `primary_number`, really segment `segment` of that
+   file? Level 2, a sound checksum and offsets, its own FID (number and sequence) equal to the link that named it, its
+   segment number the next one, and its back link the primary header (spec 3.5.2.16). A chain read by number alone
+   follows a damaged EXT_FID into an unrelated live file: a delete would then destroy that file's header and free its
+   clusters, and a read would return its blocks as the tail of this one. */
+static bool extension_header_ok(const uint8_t *h, ods2_fid_t ext, unsigned primary_number, unsigned segment)
+{
+    const ods2_head_core_t *core = (const ods2_head_core_t *) h;
+
+    return (core->struclev >> 8) == 2 && ods2_validate_head(h).ok &&
+           core->fid.fid_num == ext.fid_num && core->fid.fid_seq == ext.fid_seq &&
+           core->seg_num == segment && core->backlink.fid_num == primary_number;
+}
+
 ods2_result_t ods2_decode_all_extents(ods2_volume_t *vol, const uint8_t *header,
                                        ods2_extent_t *extents_out, size_t max_extents,
                                        int *count_out)
@@ -382,6 +518,7 @@ ods2_result_t ods2_decode_all_extents(ods2_volume_t *vol, const uint8_t *header,
     uint8_t current[512];
     int total = 0;
     int segment;
+    unsigned primary_number = ((const ods2_head_core_t *) header)->fid.fid_num;
 
     memcpy(current, header, 512);
 
@@ -391,20 +528,32 @@ ods2_result_t ods2_decode_all_extents(ods2_volume_t *vol, const uint8_t *header,
                                        extents_out + total,
                                        (max_extents > (size_t) total)
                                            ? max_extents - (size_t) total : 0);
+        if (n == ODS2_DECODE_TOO_MANY) {
+            /* never go on with a shortened list: a file read short, or deleted with some of its clusters left
+               allocated, without a word */
+            return fail("the file has more extents than ods2v2 can hold (1,024): it is not read or changed");
+        }
         if (n < 0) {
             return fail("could not decode retrieval pointers for a header segment");
         }
         total += n;
 
-        if (core->ext_fid.fid_num == 0) {
+        if (core->ext_fid.fid_num == 0 && core->ext_fid.fid_nmx == 0) {
             /* No further extension header - done. */
             *count_out = total;
             return ok();
         }
 
         {
-            ods2_result_t r = ods2_read_header(vol, core->ext_fid.fid_num, current);
+            ods2_result_t r = ods2_check_fid(core->ext_fid);
             if (!r.ok) return r;
+            ods2_fid_t link = core->ext_fid;                 /* (core points into `current`, which is overwritten) */
+            r = ods2_read_header(vol, link.fid_num, current);
+            if (!r.ok) return r;
+            if (!extension_header_ok(current, link, primary_number, (unsigned) segment + 1)) {
+                return fail("damaged extension header chain (an extension header that is not this file's): not read or "
+                            "changed");
+            }
         }
     }
 
@@ -1056,6 +1205,10 @@ static ods2_result_t allocate_file_number(ods2_volume_t *vol, unsigned *file_num
     if (!r.ok) return r;
     r = ods2_read_header(vol, 1, indexf_header);
     if (!r.ok) return r;
+    /* INDEXF.SYS's own header is rewritten with a fresh checksum (and its backup with it): it must be sound first, or
+       the one header the volume hangs on would be made to look right */
+    r = header_ok_for_write(indexf_header, 1);
+    if (!r.ok) return r;
 
     vbn = header_vbn(vol, n);
     while (vbn > ods2_word_swap32(core->recattr.hiblk)) {
@@ -1243,12 +1396,23 @@ ods2_result_t ods2_lookup_path(ods2_volume_t *vol, const char *path, ods2_fid_t 
         component[len] = '\0';
         if (*p == '.') p++;
 
-        r = ods2_read_header(vol, current.fid_num, header);
+        r = ods2_read_header_fid(vol, current, header);
         if (!r.ok) return r;
 
         strcat(component, ".DIR");
         r = ods2_lookup_name(vol, header, component, &current);
         if (!r.ok) return r;
+        {
+            /* the entry's FID must name a header that is a directory: a file called X.DIR is not one (a writer
+               would rewrite its data as directory blocks), and an entry with another RVN / NMX / sequence number
+               names no file here */
+            uint8_t next_header[512];
+            r = ods2_read_header_fid(vol, current, next_header);
+            if (!r.ok) return r;
+            if (!(((const ods2_head_core_t *) next_header)->filechar & 0x2000u)) {
+                return fail("a directory name in the path is a file that is not a directory");
+            }
+        }
     }
 
     *fid_out = current;
@@ -1269,6 +1433,7 @@ ods2_result_t ods2_create_directory(ods2_volume_t *vol, const uint8_t *parent_he
     ods2_header_spec_t spec;
     uint8_t new_header[512];
     uint8_t content_block[512];
+    bool header_written = false;
     ods2_result_t r;
 
     if (!vol->writable) {
@@ -1292,10 +1457,13 @@ ods2_result_t ods2_create_directory(ods2_volume_t *vol, const uint8_t *parent_he
     /* Refuse to create a name that already exists matching VMS
        behavior (CREATE/DIRECTORY on an existing name fails) and
        avoids silently shadowing an existing directory. */
+    r = directory_ready(vol, parent_header, parent_core->fid.fid_num);
+    if (!r.ok) return r;
     r = ods2_lookup_name(vol, parent_header, dirname, &existing);
     if (r.ok) {
         return fail("a file or directory with this name already exists in the parent");
     }
+    if (strcmp(r.problem, "name not found in directory") != 0) return r;   /* any other failure is not "no such name" */
 
     /* A file number, its header slot inside INDEXF.SYS's end-of-file,
        and its bit marked in use. */
@@ -1308,7 +1476,10 @@ ods2_result_t ods2_create_directory(ods2_volume_t *vol, const uint8_t *parent_he
        block/extent) once it outgrows this, which is not yet
        implemented. */
     r = ods2_allocate_blocks(vol, vol->home.cluster, &content_lbn, &content_blocks);
-    if (!r.ok) return r;
+    if (!r.ok) {
+        mark_index_bitmap(vol, file_number, false);      /* the number taken first is given back */
+        return r;
+    }
 
     extent.lbn = content_lbn;
     extent.block_count = content_blocks;
@@ -1331,6 +1502,9 @@ ods2_result_t ods2_create_directory(ods2_volume_t *vol, const uint8_t *parent_he
     spec.efblk = 2;   /* one block in use: EFBLK 2, FFBYTE 0, as VMS writes */
     spec.ffbyte = 0;  /* (a directory is whole blocks; OpenVMS VAX copies FFBYTE
                          into the directories it creates inside this one) */
+    /* a directory made in one with a default version limit passes it on (AXP1SYS: 114 of 114 directories under a
+       default of 3 carry 3); a directory in one without gets none */
+    spec.versions = parent_core->recattr.versions;
 
     {
         char ident[260]; /* dirname is already bounded (<256-4 chars,
@@ -1342,7 +1516,8 @@ ods2_result_t ods2_create_directory(ods2_volume_t *vol, const uint8_t *parent_he
         spec.ident_name = ident;
 
         if (!ods2_build_file_header(new_header, &spec)) {
-            return fail("could not construct new directory's header");
+            r = fail("could not construct new directory's header");
+            goto undo;
         }
     }
 
@@ -1352,20 +1527,40 @@ ods2_result_t ods2_create_directory(ods2_volume_t *vol, const uint8_t *parent_he
     content_block[0] = 0xff;
     content_block[1] = 0xff;
 
+    /* The first block, with its end marker, before the header (and the header before the entry): whatever an
+       interruption leaves is a file number and a cluster that nothing refers to, never a valid directory header over a
+       block that is not a directory block (52 such states in 14,605 interrupted runs of the old order). */
+    r = ods2_write_block(vol, content_lbn, content_block);
+    if (!r.ok) goto undo;
     r = ods2_write_header(vol, file_number, new_header);
-    if (!r.ok) return r;
-
-    r = ods2_write_file_block(vol, new_header, 1, content_block);
-    if (!r.ok) return r;
+    if (!r.ok) goto undo;
+    header_written = true;
 
     /* Insert an entry for the new directory into the parent -
        growing the parent's own allocation automatically if none of
        its existing content blocks have room. */
     r = ods2_insert_into_directory(vol, parent_core->fid.fid_num, dirname, 1, spec.fid);
-    if (!r.ok) return r;
+    if (!r.ok) goto undo;
 
     *new_fid_out = spec.fid;
     return ok();
+
+undo:
+    /* Give back what was taken: the header is marked deleted (a slot holding a valid header is never reused), then the
+       cluster and the file number. A refused or failed CREATE/DIRECTORY leaves no directory nobody lists. */
+    if (header_written) {
+        ods2_head_core_t *core = (ods2_head_core_t *) new_header;
+        core->filechar |= 0x8000u;
+        core->fid.fid_num = 0;
+        core->fid.fid_nmx = 0;
+        core->fid.fid_rvn = 0;
+        new_header[510] = 0;
+        new_header[511] = 0;
+        ods2_write_header(vol, file_number, new_header);
+    }
+    ods2_free_blocks(vol, content_lbn, content_blocks);
+    mark_index_bitmap(vol, file_number, false);
+    return r;
 }
 
 /* Writes src->length bytes, read from `src` a chunk at a time, into
@@ -1494,6 +1689,13 @@ const char *ods2_check_record_attrs(const ods2_record_attrs_t *attrs, size_t con
     if (cc != 0 && (cc & (cc - 1)) != 0) {
         return "only one carriage control (FTN, CR or PRN) can be given";
     }
+    if (attrs->rattrib & ODS2_RAT_PRN) {
+        /* print-file carriage control reads the record's VFC header bytes: with any other format VMS TYPE refuses the
+           file (%RMS-F-RAT, measured on VAX V7.3, Alpha V7.3-2 and V8.4-2L2; plain V8.4 prints such files), and the formats that have a VFC header can't be
+           imported here: such a file is never made */
+        return "RAT:PRN needs the VFC record format, which can't be imported (VMS V7.3, V7.3-2 and V8.4-2L2 refuse TYPE of "
+               "any other: RMS-F-RAT; plain V8.4 prints it - refused here to be safe)";
+    }
     return NULL;
 }
 
@@ -1522,6 +1724,13 @@ const char *ods2_check_var_record_attrs(const ods2_record_attrs_t *attrs, size_t
     }
     if (cc != 0 && (cc & (cc - 1)) != 0) {
         return "only one carriage control (FTN, CR or PRN) can be given";
+    }
+    if (attrs->rattrib & ODS2_RAT_PRN) {
+        /* print-file carriage control reads the record's VFC header bytes: with any other format VMS TYPE refuses the
+           file (%RMS-F-RAT, measured on VAX V7.3, Alpha V7.3-2 and V8.4-2L2; plain V8.4 prints such files), and the formats that have a VFC header can't be
+           imported here: such a file is never made */
+        return "RAT:PRN needs the VFC record format, which can't be imported (VMS V7.3, V7.3-2 and V8.4-2L2 refuse TYPE of "
+               "any other: RMS-F-RAT; plain V8.4 prints it - refused here to be safe)";
     }
     return NULL;
 }
@@ -1629,10 +1838,15 @@ static ods2_result_t create_file(ods2_volume_t *vol, const uint8_t *parent_heade
     }
     name = upper_name; /* every use below now sees the on-disk name */
 
+    /* The parent must be a directory that can be written before anything is allocated: a refusal later (or a failed
+       insert) would leave a complete file that no directory lists. */
+    r = directory_ready(vol, parent_header, parent_core->fid.fid_num);
+    if (!r.ok) return r;
     r = ods2_lookup_name(vol, parent_header, name, &existing);
     if (r.ok) {
         return fail("a file or directory with this name already exists in the parent");
     }
+    if (strcmp(r.problem, "name not found in directory") != 0) return r;   /* any other failure is not "no such name" */
 
     blocks_needed = (content_len + 511) / 512;
     if (blocks_needed == 0) blocks_needed = 1; /* a zero-length file still needs one block for EFBLK=1... */
@@ -1772,7 +1986,7 @@ static ods2_result_t create_file(ods2_volume_t *vol, const uint8_t *parent_heade
        parent's own allocation automatically if none of its existing
        content blocks have room. */
     r = ods2_insert_into_directory(vol, parent_core->fid.fid_num, name, 1, spec.fid);
-    if (!r.ok) return r;
+    if (!r.ok) goto undo;       /* a file nobody lists is given back, not left */
 
     *new_fid_out = spec.fid;
     return ok();
@@ -1847,11 +2061,19 @@ static ods2_result_t store_directory(ods2_volume_t *vol, unsigned dir_file_numbe
     ods2_extent_t old_extents[ODS2_MAX_EXTENTS];
     int old_count, i;
     unsigned allocated = 0, v;
-    bool moved = false;
+    bool moved = false, in_place_growth = false;
     uint8_t zero[512];
     ods2_result_t r;
 
     memset(zero, 0, sizeof(zero));
+    /* the header is rewritten with a fresh checksum (and its identification area is stored into at IDOFFSET): it must
+       be a sound one, or the damage would be made to look right */
+    r = header_ok_for_write(dir_header, core->fid.fid_num);
+    if (!r.ok) return r;
+    if (core->ext_fid.fid_num != 0 || core->ext_fid.fid_nmx != 0 || core->ext_fid.fid_rvn != 0) {
+        return fail("this directory has an extension header: it is not changed (a move would leave the extension "
+                    "behind)");
+    }
     r = ods2_decode_all_extents(vol, dir_header, old_extents, ODS2_MAX_EXTENTS, &old_count);
     if (!r.ok) return r;
     for (i = 0; i < old_count; i++) allocated += old_extents[i].block_count;
@@ -1895,6 +2117,19 @@ static ods2_result_t store_directory(ods2_volume_t *vol, unsigned dir_file_numbe
         core->map_inuse = (uint8_t) (ptr_size / 2);
         core->recattr.hiblk = ods2_word_swap32(got);
         moved = true;
+    } else if (used == old_used + 1 && first_changed < old_used) {
+        /* A block that splits, with the next blocks moving down one: the blocks are rewritten in an order in which
+           every name stays listed at every write, a name listed twice for a moment being harmless and a name missing
+           not. (Written in ascending order, as before, the block that split lost the names of its second half until
+           the next block was written, and each following block lost its names to the one before it: an interruption
+           anywhere in between left names unlisted, their files unreachable.) First the old last block's copy goes
+           into the block just past the end-of-file (invisible there); the header then moves the end-of-file over it
+           (below); then each block takes the place of the one before it, from the end back to the block that split,
+           which is rewritten last: until then its names are all still there, and the new second half is a second copy
+           of the names the old block still holds. */
+        in_place_growth = true;
+        r = ods2_write_file_block(vol, dir_header, used, blocks + (size_t) (used - 1) * 512);
+        if (!r.ok) return r;
     } else {
         for (v = first_changed; v < used; v++) {
             r = ods2_write_file_block(vol, dir_header, v + 1, blocks + (size_t) v * 512);
@@ -1936,6 +2171,13 @@ static ods2_result_t store_directory(ods2_volume_t *vol, unsigned dir_file_numbe
     r = ods2_write_header(vol, dir_file_number, dir_header);
     if (!r.ok) return r;
 
+    if (in_place_growth) {
+        for (v = used - 1; v > first_changed; v--) {     /* blocks[v - 1] .. blocks[first_changed], last first */
+            r = ods2_write_file_block(vol, dir_header, v, blocks + (size_t) (v - 1) * 512);
+            if (!r.ok) return r;
+        }
+    }
+
     if (moved) {
         for (i = 0; i < old_count; i++) {
             r = ods2_free_blocks(vol, old_extents[i].lbn, old_extents[i].block_count);
@@ -1963,6 +2205,9 @@ static ods2_result_t load_directory(ods2_volume_t *vol, const uint8_t *dir_heade
     if (allocated == 0) return fail("directory has no blocks allocated");
     used = dir_blocks_in_use(dir_header, allocated);
     if (used == 0) used = 1;
+    if (used > 65536u) {
+        return fail("directory claims more than 65536 blocks: damaged, or too big to change here");
+    }
 
     blocks = calloc((size_t) used + spare, 512);
     if (blocks == NULL) return fail("could not allocate memory for the directory");
@@ -1982,9 +2227,41 @@ static ods2_result_t load_directory(ods2_volume_t *vol, const uint8_t *dir_heade
            blocks[(size_t) (used - 1) * 512 + 1] == 0) {
         used--;
     }
+    /* A directory is changed only if every block of it is well formed: a record whose name count or size runs past
+       its block would be read, shifted or split on trust. */
+    for (v = 0; v < used; v++) {
+        if (!ods2_dir_block_ok(blocks + (size_t) v * 512, 512)) {
+            free(blocks);
+            return fail("a directory block is damaged (a record runs past the block): the directory is not "
+                        "changed - run ANALYZE/DISK_STRUCTURE/REPAIR on VMS");
+        }
+    }
     *blocks_out = blocks;
     *used_out = used;
     return ok();
+}
+
+/* A directory that is about to be changed in any way: its header must be one that may be rewritten (checksum, offsets,
+   IDOFFSET room, its own file number), it must not have an extension header (a move or a split would replace only the
+   primary header's map and leave the extension behind, its extents free, and the next growth would write into them),
+   and every block of it must be well formed. Every operation that changes a directory (or creates something that is
+   to be listed in one) asks this before its first write, so that a refusal leaves nothing behind: no header marked for
+   delete, no file nobody lists. */
+static ods2_result_t directory_ready(ods2_volume_t *vol, const uint8_t *dir_header, unsigned dir_file_number)
+{
+    const ods2_head_core_t *core = (const ods2_head_core_t *) dir_header;
+    uint8_t *blocks = NULL;
+    unsigned used;
+    ods2_result_t r = header_ok_for_write(dir_header, dir_file_number);
+
+    if (!r.ok) return r;
+    if (core->ext_fid.fid_num != 0 || core->ext_fid.fid_nmx != 0 || core->ext_fid.fid_rvn != 0) {
+        return fail("this directory has an extension header: it is not changed (a move would leave the extension "
+                    "behind)");
+    }
+    r = load_directory(vol, dir_header, 0, &blocks, &used);
+    free(blocks);
+    return r;
 }
 
 /* Inserts (name, version, fid) where it belongs in the directory's
@@ -2000,6 +2277,7 @@ ods2_result_t ods2_insert_into_directory(ods2_volume_t *vol, unsigned dir_file_n
     uint8_t dir_header[512];
     uint8_t *blocks = NULL;
     unsigned used, t;
+    uint16_t verlimit;
     ods2_result_t r;
 
     if (!vol->writable) {
@@ -2007,11 +2285,14 @@ ods2_result_t ods2_insert_into_directory(ods2_volume_t *vol, unsigned dir_file_n
     }
     r = ods2_read_header(vol, dir_file_number, dir_header);
     if (!r.ok) return r;
+    r = directory_ready(vol, dir_header, dir_file_number);
+    if (!r.ok) return r;
     r = load_directory(vol, dir_header, 1, &blocks, &used);
     if (!r.ok) return r;
 
     t = ods2_dir_choose_block(blocks, used, name);
-    if (ods2_insert_dir_entry(blocks + (size_t) t * 512, 512, name, version, fid)) {
+    verlimit = ((const ods2_head_core_t *) dir_header)->recattr.versions;   /* the directory's default version limit */
+    if (ods2_insert_dir_entry_vl(blocks + (size_t) t * 512, 512, name, version, fid, verlimit)) {
         if (ods2_file_content_length(dir_header) == 0 || !dir_eof_standard(dir_header, used) ||
             !below_highwater(dir_header, t + 1)) {
             /* An end-of-file that didn't cover even block 1, or a block
@@ -2024,7 +2305,7 @@ ods2_result_t ods2_insert_into_directory(ods2_volume_t *vol, unsigned dir_file_n
         uint8_t combined[1024];
         memcpy(combined, blocks + (size_t) t * 512, 512);
         memset(combined + 512, 0, 512);
-        if (!ods2_insert_dir_entry(combined, sizeof(combined), name, version, fid)) {
+        if (!ods2_insert_dir_entry_vl(combined, sizeof(combined), name, version, fid, verlimit)) {
             free(blocks);
             return fail("internal error: a block plus one record overflowed 1024 "
                         "bytes (should be unreachable)");
@@ -2043,7 +2324,46 @@ ods2_result_t ods2_insert_into_directory(ods2_volume_t *vol, unsigned dir_file_n
     return r;
 }
 
+/* SET FILE/VERSION_LIMIT: the version limit of the directory entries named `name` in a directory, block by block.
+   *changed gets the number of records changed (0 when the name is not there or already has the limit). */
+ods2_result_t ods2_set_entry_version_limit(ods2_volume_t *vol, unsigned dir_file_number, const char *name,
+                                           uint16_t limit, unsigned *changed)
+{
+    uint8_t dir_header[512];
+    uint8_t *blocks = NULL;
+    unsigned used, v;
+    ods2_result_t r;
+
+    *changed = 0;
+    if (!vol->writable) {
+        return fail("volume was not mounted for write (use ods2_mount_write)");
+    }
+    r = ods2_read_header(vol, dir_file_number, dir_header);
+    if (!r.ok) return r;
+    r = load_directory(vol, dir_header, 0, &blocks, &used);
+    if (!r.ok) return r;
+    for (v = 0; v < used && r.ok; v++) {
+        int n = ods2_set_dir_entry_verlimit(blocks + (size_t) v * 512, 512, name, limit);
+        if (n < 0) { r = fail("a directory block is damaged: not changed"); break; }
+        if (n > 0) {
+            *changed += (unsigned) n;
+            r = ods2_write_file_block(vol, dir_header, v + 1, blocks + (size_t) v * 512);
+        }
+    }
+    free(blocks);
+    return r;
+}
+
+/* The checks of ods2_free_blocks() without the writes: a caller that is about to change headers asks first, so that a range
+   the free would refuse does not fire after the headers are final. */
+static ods2_result_t free_blocks_impl(ods2_volume_t *vol, uint32_t lbn, unsigned block_count, bool dry_run);
+
 ods2_result_t ods2_free_blocks(ods2_volume_t *vol, uint32_t lbn, unsigned block_count)
+{
+    return free_blocks_impl(vol, lbn, block_count, false);
+}
+
+static ods2_result_t free_blocks_impl(ods2_volume_t *vol, uint32_t lbn, unsigned block_count, bool dry_run)
 {
     uint8_t bitmap_header[512];
     ods2_extent_t extents[ODS2_MAX_EXTENTS];
@@ -2091,6 +2411,7 @@ ods2_result_t ods2_free_blocks(ods2_volume_t *vol, uint32_t lbn, unsigned block_
     if (last_block >= bits_blocks) {
         return fail("block range to free is beyond BITMAP.SYS's own extent");
     }
+    if (dry_run) return ok();
 
     for (i = first_block; i <= last_block; i++) {
         uint8_t bitmap_block[512];
@@ -2123,9 +2444,111 @@ ods2_result_t ods2_free_blocks(ods2_volume_t *vol, uint32_t lbn, unsigned block_
     return ok();
 }
 
+/* A header read for a change: nothing on the write path may rewrite a header with a fresh checksum without looking at it,
+   or the damage would be made to look right. The checksum, the level, the offsets in order and inside the block, room
+   for the identification area the writers store into (revision count and revision date), and the FID's own file
+   number. A header that fails is not changed. */
+static ods2_result_t header_ok_for_write(const uint8_t *h, unsigned file_number)
+{
+    const ods2_head_core_t *core = (const ods2_head_core_t *) h;
+
+    if (ods2_checksum(h, 255) != (uint16_t) (h[510] | (h[511] << 8)) ||
+        (core->struclev >> 8) != 2 ||
+        core->idoffset < 40 || core->idoffset > core->mpoffset || core->mpoffset > core->acoffset ||
+        core->acoffset > core->rsoffset ||
+        (size_t) core->idoffset * 2 + 38 > (size_t) core->mpoffset * 2 ||
+        (size_t) core->mpoffset * 2 >= 510 ||
+        core->fid.fid_num != file_number || core->fid.fid_nmx != 0 || core->fid.fid_rvn != 0) {
+        return fail("a file header is damaged (checksum, offsets or file number): it is not changed - "
+                    "run ANALYZE/DISK_STRUCTURE/REPAIR on VMS");
+    }
+    return ok();
+}
+
+/* The file name an ODS-2 header carries in its identification area ("NAME.EXT;VER", 20 bytes and a continuation of
+   66), without the version, upper-cased. False if the area is not there. */
+static bool header_name(const uint8_t *header, char *out, size_t cap)
+{
+    const ods2_head_core_t *core = (const ods2_head_core_t *) header;
+    const uint8_t *ident = header + (size_t) core->idoffset * 2;
+    char buf[100];
+    size_t n = 0, i;
+
+    if ((size_t) core->idoffset * 2 + 120 > (size_t) core->mpoffset * 2 || (core->struclev >> 8) != 2) return false;
+    memcpy(buf, ident, 20);
+    memcpy(buf + 20, ident + 54, 66 < sizeof(buf) - 20 ? 66 : sizeof(buf) - 20);
+    n = 20 + (66 < sizeof(buf) - 20 ? 66 : sizeof(buf) - 20);   /* only what was copied: nothing past it is read */
+    while (n > 0 && (buf[n - 1] == ' ' || buf[n - 1] == '\0')) n--;
+    for (i = 0; i < n; i++) if (buf[i] == ';') { n = i; break; }
+    if (n + 1 > cap) return false;
+    for (i = 0; i < n; i++) out[i] = (char) toupper((unsigned char) buf[i]);
+    out[n] = '\0';
+    return true;
+}
+
+/* True for a file number the volume reserves for its own files: 1-9 always, and 10 (SECURITY.SYS) when the entry is
+   SECURITY.SYS in the master file directory. Deleting one frees clusters the volume still depends on. */
+static bool is_reserved_file(unsigned dir_file_number, const char *name, unsigned file_number)
+{
+    static const char security[] = "SECURITY.SYS";
+    size_t i;
+
+    if (file_number >= 1 && file_number <= 9) return true;
+    if (file_number != 10 || dir_file_number != 4 || strlen(name) != sizeof(security) - 1) return false;
+    for (i = 0; i < sizeof(security) - 1; i++) {
+        if (toupper((unsigned char) name[i]) != security[i]) return false;
+    }
+    return true;
+}
+
+/* File 10 is SECURITY.SYS on a volume INITIALIZE made, and a user file on an older one: judged by what its header
+   says, wherever the entry that names it is (an alias in another directory is refused too). */
+static bool file10_is_security(const uint8_t *header)
+{
+    const ods2_head_core_t *core = (const ods2_head_core_t *) header;
+    char name[100];
+
+    return core->backlink.fid_num == 4 && header_name(header, name, sizeof(name)) && strcmp(name, "SECURITY.SYS") == 0;
+}
+
 ods2_result_t ods2_delete(ods2_volume_t *vol, unsigned dir_file_number, const char *name)
 {
     return ods2_delete_version(vol, dir_file_number, name, ODS2_VERSION_HIGHEST, NULL);
+}
+
+/* Takes the entry (name, version) of the directory out: just that version's, trying each block in use until the record
+   holding it is found. Removing the whole record instead (as an earlier version did) would also drop every other
+   version of the name stored there, leaving their headers allocated but unreachable. A block left with no entries is
+   removed and the blocks after it move up, as the VMS file system does, so every block inside the end-of-file holds
+   entries. */
+static ods2_result_t remove_directory_entry(ods2_volume_t *vol, unsigned dir_file_number, uint8_t *dir_header,
+                                            const char *name, uint16_t version)
+{
+    uint8_t *blocks = NULL;
+    unsigned used, v;
+    bool removed = false;
+    ods2_result_t r = load_directory(vol, dir_header, 0, &blocks, &used);
+
+    if (!r.ok) return r;
+    for (v = 0; v < used && !removed && r.ok; v++) {
+        uint8_t *block = blocks + (size_t) v * 512;
+        if (!ods2_remove_dir_version(block, 512, name, version)) continue;
+        removed = true;
+        if (used > 1 && ods2_dir_block_is_empty(block)) {
+            memmove(block, block + 512, (size_t) (used - v - 1) * 512);
+            r = store_directory(vol, dir_file_number, dir_header, blocks, used - 1, used, v);
+        } else if (!below_highwater(dir_header, v + 1) || !dir_eof_standard(dir_header, used)) {
+            r = store_directory(vol, dir_file_number, dir_header, blocks, used, used, v);
+        } else {
+            r = ods2_write_file_block(vol, dir_header, v + 1, block);
+        }
+    }
+    free(blocks);
+    if (!r.ok) return r;
+    if (!removed) {
+        return fail("internal error: entry existed at lookup time but was not found for removal (should be unreachable)");
+    }
+    return ok();
 }
 
 ods2_result_t ods2_delete_version(ods2_volume_t *vol, unsigned dir_file_number,
@@ -2139,8 +2562,10 @@ ods2_result_t ods2_delete_version(ods2_volume_t *vol, unsigned dir_file_number,
     ods2_extent_t extents[ODS2_MAX_EXTENTS];
     int extent_count;
     int i;
+    uint8_t ext_headers[ODS2_MAX_HEADER_SEGMENTS][512];
+    unsigned ext_numbers[ODS2_MAX_HEADER_SEGMENTS];
+    int ext_count = 0;
     ods2_result_t r;
-    bool removed = false;
 
     if (!vol->writable) {
         return fail("volume was not mounted for write (use ods2_mount_write)");
@@ -2152,14 +2577,44 @@ ods2_result_t ods2_delete_version(ods2_volume_t *vol, unsigned dir_file_number,
     r = ods2_lookup_name_version(vol, dir_header, name, version, &target_fid, &target_version);
     if (!r.ok) return r;
 
+    /* An entry's FID names a file by number, sequence, relative volume number and extended number; this code finds a
+       file by the number alone, in this volume. An entry with an RVN or an NMX (a volume set member, a file number
+       above 65,535) would resolve to some other file's header: refused. */
+    r = ods2_check_fid(target_fid);
+    if (!r.ok) return r;
+
+    /* The volume's own files cannot be deleted, whichever directory lists them: INDEXF.SYS, BITMAP.SYS, BADBLK.SYS,
+       the master file directory, CORIMG.SYS, VOLSET.SYS, CONTIN.SYS, BACKUP.SYS and BADLOG.SYS are file numbers 1-9;
+       SECURITY.SYS is 10 on a volume INITIALIZE made (an older one has no file 10, and a user file may hold the
+       number). Deleting one frees clusters the volume still depends on. */
+    if (is_reserved_file(dir_file_number, name, target_fid.fid_num)) {
+        return fail("this is one of the volume's reserved files (INDEXF.SYS, BITMAP.SYS, ... "
+                    "SECURITY.SYS): it cannot be deleted");
+    }
+
     r = ods2_read_header(vol, target_fid.fid_num, target_header);
     if (!r.ok) return r;
     target_core = (ods2_head_core_t *) target_header;
+    /* file 10 by what its header says, wherever the entry is (an alias in another directory is refused too; VMS's
+       SET FILE/REMOVE took such entries and left LOSTHEADER) */
+    if (target_fid.fid_num == 10 && ods2_header_is_file(target_header, target_fid) && file10_is_security(target_header)) {
+        return fail("this is one of the volume's reserved files (INDEXF.SYS, BITMAP.SYS, ... "
+                    "SECURITY.SYS): it cannot be deleted");
+    }
+    if (!ods2_header_is_file(target_header, target_fid)) {
+        /* A dangling entry: its file went with another name, and the header may be free or belong to another file
+           now. Deleting "the file" would free someone else's clusters: the entry is taken out and nothing else is
+           touched, as VMS does (a VMS state: the entries left when the primary one of a file with aliases is
+           deleted). */
+        r = remove_directory_entry(vol, dir_file_number, dir_header, name, target_version);
+        if (!r.ok) return r;
+        if (version_out != NULL) *version_out = target_version;
+        return ok();
+    }
 
-    /* Refuse to delete a non-empty directory - matches VMS's own
-       DELETE/DIRECTORY behavior and avoids silently orphaning its
-       contents (their headers would become unreachable but never
-       freed - a real, if recoverable via ANALYZE/DISK, leak). */
+    /* Refuse to delete a non-empty directory - matches VMS's own DELETE/DIRECTORY behavior and avoids silently
+       orphaning its contents (their headers would become unreachable but never freed - a real, if recoverable via
+       ANALYZE/DISK, leak). */
     if (target_core->filechar & 0x2000u) { /* FH2$M_DIRECTORY, confirmed value */
         int sub_count = 0;
         r = ods2_count_directory_entries(vol, target_header, &sub_count);
@@ -2170,104 +2625,119 @@ ods2_result_t ods2_delete_version(ods2_volume_t *vol, unsigned dir_file_number,
         }
     }
 
-    /* Free every content block back to BITMAP.SYS, walking all
-       extents (across any extension headers). */
-    r = ods2_decode_all_extents(vol, target_header, extents, ODS2_MAX_EXTENTS, &extent_count);
+    /* The header is rewritten (marked for delete) with a fresh checksum: it must be a sound one */
+    r = header_ok_for_write(target_header, target_fid.fid_num);
     if (!r.ok) return r;
-    for (i = 0; i < extent_count; i++) {
-        r = ods2_free_blocks(vol, extents[i].lbn, extents[i].block_count);
+    /* Everything that can refuse runs before the first write, so that a refusal leaves the file as it was: the
+       directory the entry comes out of (a header marked for delete whose entry then could not be removed would stay
+       listed, unreadable, until ANALYZE/DISK/REPAIR on VMS) and, for a directory, its own blocks (a damaged one counts
+       as empty). */
+    r = directory_ready(vol, dir_header, dir_file_number);
+    if (!r.ok) return r;
+    if (target_core->filechar & 0x2000u) {
+        r = directory_ready(vol, target_header, target_fid.fid_num);
         if (!r.ok) return r;
     }
 
-    /* Release any extension headers too (spec 3.3): each has its own
-       file number and header slot, freed and marked deleted exactly
-       like the primary below. Left alone they would stay allocated,
-       owned by nothing. */
+    /* Read everything the delete needs before anything is changed, so that a failure here (a damaged map, an
+       extension header that cannot be read, a file with more extents than this program holds) leaves the file as it
+       was. */
+    r = ods2_decode_all_extents(vol, target_header, extents, ODS2_MAX_EXTENTS, &extent_count);
+    if (!r.ok) return r;
+    for (i = 0; i < extent_count; i++) {
+        /* ods2_free_blocks() refuses an extent that is not whole clusters: refuse here, before anything is changed */
+        if (extents[i].lbn % vol->home.cluster != 0 || extents[i].block_count % vol->home.cluster != 0) {
+            return fail("an extent of this file is not a whole number of clusters at a cluster boundary "
+                        "(damaged map): not changed");
+        }
+        r = free_blocks_impl(vol, extents[i].lbn, extents[i].block_count, true);   /* the range, too, is checked now */
+        if (!r.ok) return r;
+    }
     {
         ods2_fid_t next = target_core->ext_fid;
-        int segments = 0;
-        while (next.fid_num != 0) {
-            uint8_t ext_header[512];
-            ods2_head_core_t *ext_core = (ods2_head_core_t *) ext_header;
-            unsigned ext_number = next.fid_num;
-
-            if (++segments > ODS2_MAX_HEADER_SEGMENTS) {
+        while (next.fid_num != 0 || next.fid_nmx != 0) {
+            if (ext_count >= ODS2_MAX_HEADER_SEGMENTS) {
                 return fail("extension header chain exceeded maximum segment limit "
                             "(possibly corrupted or circular ext_fid chain)");
             }
-            r = ods2_read_header(vol, ext_number, ext_header);
+            r = ods2_check_fid(next);
             if (!r.ok) return r;
-            next = ext_core->ext_fid;
-            r = mark_index_bitmap(vol, ext_number, false);
+            ext_numbers[ext_count] = next.fid_num;
+            r = ods2_read_header(vol, next.fid_num, ext_headers[ext_count]);
             if (!r.ok) return r;
-            ext_core->filechar |= 0x8000u; /* FH2$M_MARKDEL */
-            ext_core->fid.fid_num = 0;
-            ext_core->fid.fid_nmx = 0;
-            ext_core->fid.fid_rvn = 0;
-            ext_header[510] = 0;
-            ext_header[511] = 0;
-            r = ods2_write_header(vol, ext_number, ext_header);
-            if (!r.ok) return r;
+            if (!extension_header_ok(ext_headers[ext_count], next, target_fid.fid_num, (unsigned) ext_count + 1)) {
+                return fail("damaged extension header chain (an extension header that is not this file's): not "
+                            "changed");
+            }
+            next = ((ods2_head_core_t *) ext_headers[ext_count])->ext_fid;
+            ext_count++;
         }
     }
 
-    /* Free the file number in the index file's own bitmap. */
-    r = mark_index_bitmap(vol, target_fid.fid_num, false);
+    /* VMS's own order, so that an interruption never leaves a listed file whose clusters are free, nor a header that
+       still maps clusters another file may be given. The earlier order here (free the clusters, release the
+       extension headers, zero the header, and only then remove the entry) left, after every write but the last, a
+       directory entry naming a file whose blocks were free: a crash part way, or a full disk, and the next file
+       written took the blocks of a file still listed.
+       (a) mark the header for delete, FID and checksum intact; (b) remove the directory entry; (c) write the extension
+       headers and then the primary header in their final deleted form (FID zeroed, checksum 0); (d) free the blocks;
+       (e) clear the file numbers' bits. After (a) the file reads as gone (ods2_header_is_file); an interruption after
+       (a) leaves a marked header whose clusters are still allocated, and after (c) only clusters that nothing owns
+       (lost clusters, which ANALYZE/DISK/REPAIR frees): in no state does a header that could be finished or recovered
+       map free clusters. */
+    target_core->filechar |= 0x8000u; /* FH2$M_MARKDEL, confirmed value */
+    {
+        uint16_t checksum = ods2_checksum(target_header, 255);
+        target_header[510] = (uint8_t) (checksum & 0xff);
+        target_header[511] = (uint8_t) (checksum >> 8);
+    }
+    r = ods2_write_header(vol, target_fid.fid_num, target_header);
     if (!r.ok) return r;
 
-    /* Mark the header itself deleted, per spec 3.5.1's exact rules:
-       FH2$V_MARKDEL set, FID_NUM/NMX/RVN zeroed - but FH2$W_FID_SEQ
-       is explicitly NOT touched, since spec 5.1.7 requires it to
-       survive so the next use of this slot gets seq+1, not a fresh
-       seq of 1 (that rule is only for a slot that was never used at
-       all - "garbage" - which this no longer is). Checksum is set to
-       zero, not recomputed - also an explicit spec rule, not an
-       oversight. */
-    target_core->filechar |= 0x8000u; /* FH2$M_MARKDEL, confirmed value */
+    /* If the entry cannot be removed the header stays marked: the entry is then dangling and the file reads as gone,
+       a leak; writing the old header back could make a half-removed entry's file live and unlisted. */
+    r = remove_directory_entry(vol, dir_file_number, dir_header, name, target_version);
+    if (!r.ok) return r;
+
+    /* Extension headers (spec 3.3): each has its own file number and header slot, released like the primary. Left
+       alone they would stay allocated, owned by nothing. */
+    for (i = 0; i < ext_count; i++) {
+        ods2_head_core_t *ext_core = (ods2_head_core_t *) ext_headers[i];
+
+        ext_core->filechar |= 0x8000u;
+        ext_core->fid.fid_num = 0;
+        ext_core->fid.fid_nmx = 0;
+        ext_core->fid.fid_rvn = 0;
+        ext_headers[i][510] = 0;
+        ext_headers[i][511] = 0;
+        r = ods2_write_header(vol, ext_numbers[i], ext_headers[i]);
+        if (!r.ok) return r;
+    }
+
+    /* The header itself, per spec 3.5.1's exact rules: FH2$V_MARKDEL set, FID_NUM/NMX/RVN zeroed - but FH2$W_FID_SEQ
+       is explicitly NOT touched, since spec 5.1.7 requires it to survive so the next use of this slot gets seq+1, not
+       a fresh seq of 1 (that rule is only for a slot that was never used at all - "garbage" - which this no longer
+       is). Checksum is set to zero, not recomputed - also an explicit spec rule, not an oversight. */
     target_core->fid.fid_num = 0;
     target_core->fid.fid_nmx = 0;
     target_core->fid.fid_rvn = 0;
     target_header[510] = 0;
     target_header[511] = 0;
-
     r = ods2_write_header(vol, target_fid.fid_num, target_header);
     if (!r.ok) return r;
 
-    /* Remove just this version's entry from the parent - trying each
-       block in use until the record holding it is found. Removing the
-       whole record instead (as an earlier version did) would also drop
-       every other version of the name stored there, leaving their
-       headers allocated but unreachable. A block left with no entries
-       is removed and the blocks after it move up, as the VMS file
-       system does, so every block inside the end-of-file holds
-       entries. */
-    {
-        uint8_t *blocks = NULL;
-        unsigned used, v;
-        r = load_directory(vol, dir_header, 0, &blocks, &used);
-        if (!r.ok) return r;
-        for (v = 0; v < used && !removed; v++) {
-            uint8_t *block = blocks + (size_t) v * 512;
-            if (!ods2_remove_dir_version(block, 512, name, target_version)) continue;
-            removed = true;
-            if (used > 1 && ods2_dir_block_is_empty(block)) {
-                memmove(block, block + 512, (size_t) (used - v - 1) * 512);
-                r = store_directory(vol, dir_file_number, dir_header, blocks, used - 1,
-                                    used, v);
-            } else if (!below_highwater(dir_header, v + 1) || !dir_eof_standard(dir_header, used)) {
-                r = store_directory(vol, dir_file_number, dir_header, blocks, used,
-                                    used, v);
-            } else {
-                r = ods2_write_file_block(vol, dir_header, v + 1, block);
-            }
-        }
-        free(blocks);
+    for (i = 0; i < extent_count; i++) {
+        r = ods2_free_blocks(vol, extents[i].lbn, extents[i].block_count);
         if (!r.ok) return r;
     }
-    if (!removed) {
-        return fail("internal error: entry existed at lookup time but was not "
-                    "found for removal (should be unreachable)");
+
+    /* the file numbers are free in the index file's bitmap: the extension headers, the primary last */
+    for (i = 0; i < ext_count; i++) {
+        r = mark_index_bitmap(vol, ext_numbers[i], false);
+        if (!r.ok) return r;
     }
+    r = mark_index_bitmap(vol, target_fid.fid_num, false);
+    if (!r.ok) return r;
 
     if (version_out != NULL) *version_out = target_version;
     return ok();

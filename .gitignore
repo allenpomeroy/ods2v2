@@ -1,0 +1,17 @@
+# disk images
+*.dsk
+*.img
+
+# build directories and binaries
+build/
+ods2
+ods2_cat
+ods2_check_headers
+ods2_dump_header
+ods2_dump_root
+ods2_ls
+ods2_mkdir
+ods2_put
+ods2_rm
+read_file_header
+read_home_block

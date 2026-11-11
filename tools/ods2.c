@@ -64,7 +64,10 @@
  *                                 line - VMS's native text format
  *   TYPE path                     print a file's content
  *   DELETE path                   delete a file (one version) or an
- *                                 empty directory
+ *                                 empty directory; '*' and '%' in the
+ *                                 file name delete every match in that
+ *                                 one directory (highest version unless
+ *                                 ;n, ;-n or ;* is given)
  *   SET DEFAULT path              set the current default directory
  *   SHOW DEFAULT                  show the current default directory
  *   SET VOLUME/LABEL=name         relabel the volume: every home block
@@ -1410,6 +1413,68 @@ static void cmd_type(ods2_volume_t *vol, const ods2_parsed_path_t *p)
     }
 }
 
+/* DELETE with '*' or '%' in the file name: every entry of the one directory whose name matches, as DIR matches it.
+   The versions follow the rules for one file: NAME;* every version, NAME;n version n, NAME;-n the n-th lower one, and
+   no version (or ;0) the highest. The matches are listed first and then deleted by their exact version numbers, so
+   deleting never disturbs the list being worked through. A file that cannot be deleted (a reserved file, a directory
+   that is not empty) is reported and the rest are still deleted. */
+static void delete_wildcard(ods2_volume_t *vol, const uint8_t *dir_header, ods2_fid_t dir_fid,
+                            const char *pattern, const ods2_parsed_path_t *p)
+{
+    ods2_dir_entry_t *entries = NULL;
+    int count = 0, i, rank = 0, matched = 0, deleted = 0, failed = 0;
+    ods2_result_t r;
+    struct target { char name[ODS2_DIR_MAX_NAME + 1]; uint16_t version; } *targets;
+
+    r = ods2_list_directory_alloc(vol, dir_header, &entries, &count);
+    if (!r.ok) {
+        report_error("%%ODS2-E-DELETEERR, %s: %s\n", pattern, r.problem);
+        return;
+    }
+    targets = malloc(sizeof(*targets) * (size_t) (count > 0 ? count : 1));
+    if (targets == NULL) {
+        free(entries);
+        report_error("%%ODS2-E-DELETEERR, %s: out of memory\n", pattern);
+        return;
+    }
+    for (i = 0; i < count; i++) {
+        bool take;
+        rank = (i > 0 && same_name(entries[i].name, entries[i - 1].name)) ? rank + 1 : 0;
+        if (!ods2_wildcard_match(pattern, entries[i].name)) continue;
+        if (p->version_wildcard) take = true;                                   /* ;*  every version */
+        else if (!p->has_version || p->version == 0) take = (rank == 0);        /* the highest */
+        else if (p->version > 0) take = (entries[i].version == (unsigned) p->version);
+        else take = (rank == -p->version);                                       /* ;-n */
+        if (!take) continue;
+        snprintf(targets[matched].name, sizeof(targets[matched].name), "%s", entries[i].name);
+        targets[matched].version = entries[i].version;
+        matched++;
+    }
+    free(entries);
+
+    for (i = 0; i < matched; i++) {
+        uint16_t done = 0;
+        r = ods2_delete_version(vol, dir_fid.fid_num, targets[i].name, targets[i].version, &done);
+        if (r.ok) {
+            printf("%%ODS2-I-DELETED, deleted %s;%u\n", targets[i].name, done);
+            deleted++;
+        } else {
+            report_error("%%ODS2-E-DELETEERR, %s;%u: %s\n", targets[i].name, targets[i].version, r.problem);
+            failed++;
+        }
+    }
+    free(targets);
+
+    if (matched == 0) {
+        char spec[ODS2_PATH_MAX + 16];
+        format_file_spec(p, spec, sizeof(spec));
+        report_error("%%ODS2-E-DELETEERR, %s: no files match\n", spec);
+    } else if (deleted > 1 || failed > 0) {
+        printf("%%ODS2-I-TOTAL, %d file%s deleted%s\n", deleted, deleted == 1 ? "" : "s",
+               failed > 0 ? ", some could not be (see above)" : "");
+    }
+}
+
 static void cmd_delete(ods2_volume_t *vol, const ods2_parsed_path_t *p)
 {
     uint8_t dir_header[512];
@@ -1455,6 +1520,11 @@ static void cmd_delete(ods2_volume_t *vol, const ods2_parsed_path_t *p)
         return;
     }
 
+    if (p->filename[0] != '\0' && (strchr(name, '*') != NULL || strchr(name, '%') != NULL)) {
+        delete_wildcard(vol, dir_header, dir_fid, name, p);
+        return;
+    }
+
     /* One version (the one selected, the highest by default), or with
        ";*" every version - highest first, until none remain. */
     do {
@@ -1496,6 +1566,7 @@ static void print_help(void)
            "                             per line; with /ATTRIBUTES for other RAT/MRS\n"
            "  TYPE path                  print a file's content\n"
            "  DELETE path                delete a file (one version) or empty directory\n"
+           "  DELETE [dir]wild[;ver]     every match: F*.COM (highest), *.*;* (all versions)\n"
            "  SET DEFAULT path           set the current default directory\n"
            "  SHOW DEFAULT               show the current default directory\n"
            "  SET VOLUME/LABEL=name      relabel the volume (all home block copies)\n"

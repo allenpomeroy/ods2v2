@@ -417,6 +417,28 @@ static ods2_result_t allocate_clusters(ods2_volume_t *vol, unsigned blocks_neede
 
     total_bytes = (size_t) bits_blocks * 512;
     total_bits = total_bytes * 8;
+
+    /* Only clusters that lie wholly inside the volume may be handed out. The bitmap's last block has bits past the
+       last cluster, and when the volume size is not a multiple of the cluster size the last cluster is partial: a run
+       ending in either would map LBNs at or beyond SCB$L_VOLSIZE, writing past the end of the volume (on a SIMH
+       container, over its metadata footer, and growing the image). VMS marks those bits allocated, but nothing on
+       the write path may depend on that. */
+    {
+        uint8_t scb[512];
+        uint32_t volsize;
+        size_t usable_clusters;
+
+        r = ods2_read_file_block(vol, bitmap_header, 1, scb);
+        if (!r.ok) return r;
+        volsize = (uint32_t) scb[4] | ((uint32_t) scb[5] << 8) |
+                  ((uint32_t) scb[6] << 16) | ((uint32_t) scb[7] << 24); /* SCB$L_VOLSIZE, spec 5.2.1 */
+        if (volsize == 0) {
+            return fail("BITMAP.SYS's storage control block gives a volume size of 0: nothing is allocated");
+        }
+        usable_clusters = (size_t) volsize / vol->home.cluster;
+        if (usable_clusters < total_bits) total_bits = usable_clusters;
+    }
+
     bitmap_data = malloc(total_bytes);
     if (bitmap_data == NULL) {
         return fail("could not allocate memory to read the storage bitmap");

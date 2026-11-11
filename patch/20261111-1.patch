@@ -1,0 +1,183 @@
+From 38d379418c4bcdaf186646c6816ee4402f2d44b4 Mon Sep 17 00:00:00 2001
+From: Allen Pomeroy <allen@pomeroy.us>
+Date: Wed, 11 Nov 2026 11:18:50 -0600
+Subject: [PATCH] Never allocate clusters at or past the end of the volume
+ (SCB$L_VOLSIZE)
+
+The allocator searched every bit in BITMAP.SYS, including the bits past the
+last cluster in the bitmap's last block and a partial last cluster. Where
+those bits read free, a run there mapped LBNs at or beyond the volume's end:
+on a SIMH container that overwrites the metadata footer and grows the image.
+VMS INITIALIZE marks them allocated, so this did not happen on the 8 GB
+volume, but nothing on the write path now depends on it: the search is
+limited to clusters wholly inside SCB$L_VOLSIZE. tests/cli_volume_end_check.sh
+fails 6/6 on the old code and passes with this change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WA1cTvnJjW7a9acesLHq2C
+---
+ Makefile                      |  6 ++-
+ src/ods2_volume.c             | 22 ++++++++
+ tests/cli_volume_end_check.sh | 96 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 122 insertions(+), 2 deletions(-)
+ create mode 100644 tests/cli_volume_end_check.sh
+
+diff --git a/Makefile b/Makefile
+index 88aef12..d78380d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -258,6 +258,8 @@ test: $(TESTS) tools ods2_put ods2_dump_header
+ 	@sh tests/cli_stream_attrs_check.sh
+ 	@echo "--- cli_lock_check ---"
+ 	@sh tests/cli_lock_check.sh
++	@echo "--- cli_volume_end_check ---"
++	@sh tests/cli_volume_end_check.sh
+ 	@echo "--- CLI recursive DIR regression check ---"
+ 	@if command -v timeout >/dev/null 2>&1; then \
+ 		rm -f samples/cli_regression_disk.img; \
+@@ -296,6 +298,6 @@ release: test
+ clean:
+ 	rm -rf $(BUILD)
+ 	rm -f samples/synthetic_disk.img samples/synthetic_disk_working.img
+-	rm -f samples/versions_disk.img samples/versions_cli_disk.img samples/cli_wildcard_disk.img samples/file_alloc_disk.img samples/dir_order_disk.img samples/dir_eof_disk.img samples/verlimit_disk.img samples/fid_disk.img samples/integrity_disk.img samples/large_file_disk.img samples/cli_status_disk.img samples/cli_attrs_disk.img samples/record_attrs_disk.img samples/indexf_large_disk.img samples/text_var_disk.img samples/cli_label_disk.img samples/cli_label_orig.img samples/cli_verlimit_disk.img samples/cli_lock_disk.img samples/cli_stream_disk.img
+-	rm -rf samples/cli_stream_tmp
++	rm -f samples/versions_disk.img samples/versions_cli_disk.img samples/cli_wildcard_disk.img samples/file_alloc_disk.img samples/dir_order_disk.img samples/dir_eof_disk.img samples/verlimit_disk.img samples/fid_disk.img samples/integrity_disk.img samples/large_file_disk.img samples/cli_status_disk.img samples/cli_attrs_disk.img samples/record_attrs_disk.img samples/indexf_large_disk.img samples/text_var_disk.img samples/cli_label_disk.img samples/cli_label_orig.img samples/cli_verlimit_disk.img samples/cli_lock_disk.img samples/cli_stream_disk.img samples/cli_volend_disk.img samples/cli_volend_disk.img.bitmap
++	rm -rf samples/cli_stream_tmp samples/cli_volend_tmp
+ 	rm -f $(TOOLS)
+diff --git a/src/ods2_volume.c b/src/ods2_volume.c
+index 3eed8a3..6c4466e 100644
+--- a/src/ods2_volume.c
++++ b/src/ods2_volume.c
+@@ -417,6 +417,28 @@ static ods2_result_t allocate_clusters(ods2_volume_t *vol, unsigned blocks_neede
+ 
+     total_bytes = (size_t) bits_blocks * 512;
+     total_bits = total_bytes * 8;
++
++    /* Only clusters that lie wholly inside the volume may be handed out. The bitmap's last block has bits past the
++       last cluster, and when the volume size is not a multiple of the cluster size the last cluster is partial: a run
++       ending in either would map LBNs at or beyond SCB$L_VOLSIZE, writing past the end of the volume (on a SIMH
++       container, over its metadata footer, and growing the image). VMS marks those bits allocated, but nothing on
++       the write path may depend on that. */
++    {
++        uint8_t scb[512];
++        uint32_t volsize;
++        size_t usable_clusters;
++
++        r = ods2_read_file_block(vol, bitmap_header, 1, scb);
++        if (!r.ok) return r;
++        volsize = (uint32_t) scb[4] | ((uint32_t) scb[5] << 8) |
++                  ((uint32_t) scb[6] << 16) | ((uint32_t) scb[7] << 24); /* SCB$L_VOLSIZE, spec 5.2.1 */
++        if (volsize == 0) {
++            return fail("BITMAP.SYS's storage control block gives a volume size of 0: nothing is allocated");
++        }
++        usable_clusters = (size_t) volsize / vol->home.cluster;
++        if (usable_clusters < total_bits) total_bits = usable_clusters;
++    }
++
+     bitmap_data = malloc(total_bytes);
+     if (bitmap_data == NULL) {
+         return fail("could not allocate memory to read the storage bitmap");
+diff --git a/tests/cli_volume_end_check.sh b/tests/cli_volume_end_check.sh
+new file mode 100644
+index 0000000..2efc3cf
+--- /dev/null
++++ b/tests/cli_volume_end_check.sh
+@@ -0,0 +1,96 @@
++#!/bin/sh
++# MIT License - Copyright (c) 2026 Allen Pomeroy (see LICENSE)
++#
++# cli_volume_end_check.sh - nothing is ever allocated at or past the end
++# of the volume (SCB$L_VOLSIZE). The storage bitmap's last block has
++# bits for clusters past the last one, and a volume whose size is not a
++# multiple of its cluster size has a partial last cluster; VMS marks
++# both allocated, but ods2v2 used to trust whatever the bits said. On a
++# SIMH container the block just past the volume is the simulator's
++# metadata footer, so a run there overwrote it and grew the image.
++#
++# On a copy of the real starter volume (samples/empty_ods2_volume.dsk.gz,
++# a SIMH container: 2,940,951 blocks + a 512-byte footer) every real
++# cluster is marked in use and only the bits past the end are left free.
++# COPY must then fail for lack of space, the image must keep its size
++# and its footer, and the storage bitmap must not change. Called by
++# `make test`; run from the project root.
++
++GZ=samples/empty_ods2_volume.dsk.gz
++DISK=samples/cli_volend_disk.img
++ODS2=./ods2
++TMP=samples/cli_volend_tmp
++fails=0
++
++check() { # check <description> <expected> <actual>
++    if [ "$2" = "$3" ]; then
++        echo "PASS: $1"
++    else
++        echo "FAIL: $1"
++        echo "      expected: $2"
++        echo "      got:      $3"
++        fails=$((fails + 1))
++    fi
++}
++
++rm -rf "$TMP"; mkdir -p "$TMP"
++gunzip -c "$GZ" > "$DISK"
++printf 'hello\n' > "$TMP/hello.txt"
++
++# Fill the volume: every real cluster in use, only the bits past the last cluster free.
++python3 -I - "$DISK" <<'EOF'
++import struct, sys
++f = open(sys.argv[1], 'r+b')
++f.seek(512); h = f.read(512)
++cluster, = struct.unpack_from('<H', h, 14)
++ibmaplbn, = struct.unpack_from('<I', h, 24); ibmapsize, = struct.unpack_from('<H', h, 32)
++f.seek((ibmaplbn + ibmapsize + 1) * 512); bh = f.read(512)        # BITMAP.SYS header (file 2)
++mp = bh[1] * 2; w0, low = struct.unpack_from('<HH', bh, mp)
++assert w0 >> 14 == 1
++lbn = ((w0 >> 8) & 0x3f) << 16 | low; blocks = (w0 & 0xff) + 1
++f.seek(lbn * 512); volsize, = struct.unpack_from('<I', f.read(512), 4)
++clusters = (volsize + cluster - 1) // cluster
++nbits = (blocks - 1) * 4096
++bits = bytearray((blocks - 1) * 512)
++for k in range(clusters, nbits):
++    bits[k // 8] |= 1 << (k % 8)
++f.seek((lbn + 1) * 512); f.write(bits)
++open(sys.argv[1] + '.bitmap', 'wb').write(bits)
++print('volume of %d blocks, %d clusters; %d bits past the end left free' % (volsize, clusters, nbits - clusters))
++EOF
++
++SIZE_BEFORE=$(wc -c < "$DISK")
++tail -c 512 "$DISK" > "$TMP/footer.before"
++
++"$ODS2" "$DISK" "COPY $TMP/hello.txt HELLO.TXT" >/dev/null 2>&1
++check "COPY onto a volume with only out-of-volume bits free is refused" 1 $?
++
++check "the image keeps its size (nothing written past the volume)" "$SIZE_BEFORE" "$(wc -c < "$DISK")"
++tail -c 512 "$DISK" > "$TMP/footer.after"
++if cmp -s "$TMP/footer.before" "$TMP/footer.after"; then r=intact; else r=overwritten; fi
++check "the SIMH metadata footer is intact" intact "$r"
++
++r=$(python3 -I - "$DISK" <<'EOF'
++import struct, sys
++f = open(sys.argv[1], 'rb')
++f.seek(512); h = f.read(512)
++ibmaplbn, = struct.unpack_from('<I', h, 24); ibmapsize, = struct.unpack_from('<H', h, 32)
++f.seek((ibmaplbn + ibmapsize + 1) * 512); bh = f.read(512)
++mp = bh[1] * 2; w0, low = struct.unpack_from('<HH', bh, mp)
++lbn = ((w0 >> 8) & 0x3f) << 16 | low; blocks = (w0 & 0xff) + 1
++f.seek((lbn + 1) * 512)
++print('unchanged' if f.read((blocks - 1) * 512) == open(sys.argv[1] + '.bitmap', 'rb').read() else 'changed')
++EOF
++)
++check "the storage bitmap is unchanged" unchanged "$r"
++
++"$ODS2" "$DISK" "CREATE/DIRECTORY [NEWDIR]" >/dev/null 2>&1
++check "CREATE/DIRECTORY on the same volume is refused too" 1 $?
++check "...and the image still keeps its size" "$SIZE_BEFORE" "$(wc -c < "$DISK")"
++
++rm -rf "$TMP" "$DISK" "$DISK.bitmap"
++if [ "$fails" -ne 0 ]; then
++    echo "cli_volume_end_check: $fails check(s) FAILED"
++    exit 1
++fi
++echo "cli_volume_end_check: all checks passed"
+-- 
+2.43.0

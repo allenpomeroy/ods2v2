@@ -1735,6 +1735,70 @@ const char *ods2_check_var_record_attrs(const ods2_record_attrs_t *attrs, size_t
     return NULL;
 }
 
+bool ods2_stream_format(uint8_t rtype)
+{
+    return rtype == ODS2_RFM_STM || rtype == ODS2_RFM_STMLF || rtype == ODS2_RFM_STMCR;
+}
+
+/* The length of the records of stream content, as RMS reads them (measured on OpenVMS V8.4, V7.3-2 and VAX V7.3):
+     Stream_LF (STMLF)  a record ends at LF; the LF is not part of it; a CR before the LF stays in the record.
+     Stream_CR (STMCR)  a record ends at CR; the CR is not part of it.
+     Stream (STM)       a record ends at LF, FF or VT, and that byte STAYS in the record ("abc" LF is a record of 4 bytes);
+                        it also ends at CR LF, which is stripped ("abc" CR LF is 3 bytes); a lone CR is data.
+   The last record may have no terminator. A file whose longest record is longer than its LRL (or MRS, when not 0) cannot be
+   read in record mode (%RMS-F-RSZ, %RMS-W-RTB). One state machine, fed any number of pieces in order. */
+void ods2_reclen_init(ods2_reclen_t *s, uint8_t rtype)
+{
+    s->rtype = rtype;
+    s->cur = s->longest = 0;
+    s->prev_cr = false;
+}
+
+static void reclen_end(ods2_reclen_t *s, size_t len)
+{
+    if (len > s->longest) s->longest = len;
+    s->cur = 0;
+    s->prev_cr = false;
+}
+
+void ods2_reclen_feed(ods2_reclen_t *s, const uint8_t *data, size_t len)
+{
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        uint8_t c = data[i];
+        if (s->rtype == ODS2_RFM_STMCR) {
+            if (c == '\r') reclen_end(s, s->cur); else s->cur++;
+        } else if (s->rtype == ODS2_RFM_STM) {
+            if (c == '\n') {
+                /* CR LF: the CR (counted as data so far) is part of the terminator; a lone LF stays in the record */
+                reclen_end(s, s->prev_cr ? s->cur - 1 : s->cur + 1);
+            } else if (c == '\f' || c == '\v') {
+                reclen_end(s, s->cur + 1);
+            } else {
+                s->cur++;
+                s->prev_cr = (c == '\r');
+            }
+        } else {
+            if (c == '\n') reclen_end(s, s->cur); else s->cur++;
+        }
+    }
+}
+
+size_t ods2_reclen_longest(const ods2_reclen_t *s)
+{
+    return s->cur > s->longest ? s->cur : s->longest;
+}
+
+size_t ods2_longest_record(uint8_t rtype, const uint8_t *data, size_t len)
+{
+    ods2_reclen_t st;
+
+    ods2_reclen_init(&st, rtype);
+    ods2_reclen_feed(&st, data, len);
+    return ods2_reclen_longest(&st);
+}
+
 ods2_result_t ods2_create_file_attrs(ods2_volume_t *vol, const uint8_t *parent_header,
                                       const char *name, const uint8_t *content,
                                       size_t content_len, const ods2_record_attrs_t *attrs,
@@ -1742,6 +1806,28 @@ ods2_result_t ods2_create_file_attrs(ods2_volume_t *vol, const uint8_t *parent_h
 {
     memory_source_t ctx;
     ods2_content_source_t src;
+    if (ods2_stream_format(attrs->rtype)) {
+        /* RMS cannot read a stream file in record mode with a record longer than its MRS or its LRL (%RMS-W-RTB) */
+        size_t longest = ods2_longest_record(attrs->rtype, content, content_len);
+        if (attrs->maxrec != 0 && longest > attrs->maxrec) {
+            return fail("a record is longer than the maximum record size (MRS) given: VMS could not read the file back "
+                        "(RMS-W-RTB); use MRS 0");
+        }
+        if (attrs->rsize != 0 && attrs->rsize != 32767 && longest > attrs->rsize) {
+            return fail("a record is longer than the longest record length (LRL) given: VMS could not read the file back "
+                        "(RMS-W-RTB)");
+        }
+        if (attrs->rsize == 0) {                  /* no LRL given: the file's own longest record, as VMS stores it */
+            ods2_record_attrs_t own = *attrs;
+            own.rsize = (uint16_t) (longest > 32767 ? 32767 : longest);
+            return ods2_create_file_attrs(vol, parent_header, name, content, content_len, &own, new_fid_out);
+        }
+    } else if (attrs->rtype == ODS2_RFM_UDF && attrs->rsize == 0 && attrs->maxrec == 0 && content_len != 0) {
+        /* UDF given no LRL: the length, as ods2_create_file() and COPY give it */
+        ods2_record_attrs_t own = *attrs;
+        own.rsize = (uint16_t) (content_len > 32767 ? 32767 : content_len);
+        return ods2_create_file_attrs(vol, parent_header, name, content, content_len, &own, new_fid_out);
+    }
     ctx.data = content;
     ctx.pos = 0;
     src.length = content_len;
@@ -1774,6 +1860,17 @@ ods2_result_t ods2_create_file(ods2_volume_t *vol, const uint8_t *parent_header,
     attrs.rattrib = 0;
     attrs.rsize = 512;
     attrs.maxrec = 512;
+    if (ods2_stream_format(rtype)) {
+        /* A stream file has no maximum record size (MRS 0, as VMS makes it) and its longest record is its own: MRS 512 made
+           RMS refuse such a file with a longer line (%RMS-W-RTB, record too large for the user's buffer). A longer record than
+           any record length can be (32767) is VMS's own state for a binary stream file: LRL 32767. */
+        size_t longest = ods2_longest_record(rtype, content, content_len);
+        attrs.rsize = (uint16_t) (longest > 32767 ? 32767 : longest);
+        attrs.maxrec = 0;
+    } else if (rtype == ODS2_RFM_UDF) {
+        attrs.rsize = (uint16_t) (content_len > 32767 ? 32767 : content_len);
+        attrs.maxrec = 0;
+    }
     {
         memory_source_t ctx;
         ods2_content_source_t src;
@@ -2966,4 +3063,55 @@ ods2_result_t ods2_volume_space(ods2_volume_t *vol, uint64_t *total_blocks_out,
     if (vbn == 1) return fail("BITMAP.SYS is empty");
     *free_blocks_out = free_clusters * cluster;
     return ok();
+}
+
+/* SET FILE/ATTRIBUTES=(MRS:0): repairs a stream file made with a maximum record size (ods2v2 gave every stream file MRS = LRL =
+   512 whatever its lines, and RMS cannot read such a file with a longer line in record mode: %RMS-W-RTB), or with an LRL below
+   its longest record. MRS becomes 0 and LRL the file's own longest record (at most 32767), as VMS makes such files; the file's
+   data is not touched. Only a sound header of a sequential Stream, Stream_LF or Stream_CR file is changed, and only if it is
+   not already as VMS leaves such a file (MRS 0 and an LRL of at least the longest record, taken as at most 32767: a binary file
+   with a longer "record" is left that way by VMS and is skipped silently). *changed is 1 if the header was written. */
+ods2_result_t ods2_set_stream_record_sizes(ods2_volume_t *vol, ods2_fid_t fid, unsigned *changed)
+{
+    uint8_t h[512], blk[512];
+    ods2_head_core_t *core = (ods2_head_core_t *) h;
+    uint64_t bytes, done = 0;
+    unsigned vbn, rfm;
+    size_t longest;
+    ods2_reclen_t st;
+    uint16_t sum;
+    ods2_result_t r;
+
+    *changed = 0;
+    if (!vol->writable) return fail("volume was not mounted for write (use ods2_mount_write)");
+    r = ods2_read_header_fid(vol, fid, h);
+    if (!r.ok) return r;
+    r = header_ok_for_write(h, fid.fid_num);
+    if (!r.ok) return r;
+    rfm = core->recattr.rtype & 0x0Fu;
+    if ((core->recattr.rtype >> 4) != 0 || (rfm != ODS2_RFM_STM && rfm != ODS2_RFM_STMLF && rfm != ODS2_RFM_STMCR) ||
+        (core->filechar & 0x2000u)) {
+        return ok();
+    }
+    bytes = ((uint64_t) ods2_word_swap32(core->recattr.efblk) - 1) * 512u + core->recattr.ffbyte;
+    if (ods2_word_swap32(core->recattr.efblk) == 0) bytes = 0;
+    ods2_reclen_init(&st, (uint8_t) rfm);
+    for (vbn = 1; done < bytes; vbn++) {
+        size_t n = (bytes - done) < 512u ? (size_t) (bytes - done) : 512u;
+        r = ods2_read_file_block(vol, h, vbn, blk);
+        if (!r.ok) return r;
+        ods2_reclen_feed(&st, blk, n);
+        done += n;
+    }
+    longest = ods2_reclen_longest(&st);
+    if (longest > 32767) longest = 32767;        /* no record length can be more: VMS's state for such a binary file */
+    if (core->recattr.maxrec == 0 && core->recattr.rsize >= longest) return ok();
+    core->recattr.maxrec = 0;
+    core->recattr.rsize = (uint16_t) longest;
+    sum = ods2_checksum(h, 255);
+    h[510] = (uint8_t) (sum & 0xff);
+    h[511] = (uint8_t) (sum >> 8);
+    r = ods2_write_header(vol, fid.fid_num, h);
+    if (r.ok) *changed = 1;
+    return r;
 }

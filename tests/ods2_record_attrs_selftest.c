@@ -209,7 +209,7 @@ int main(void)
 
     /* --- Other formats and attributes, as given --- */
     create_and_check(&vol, "NOTES.TXT", (const uint8_t *) "one\ntwo\n", 8,
-                     attrs(ODS2_RFM_STMLF, ODS2_RAT_CR, 0, 0));
+                     attrs(ODS2_RFM_STMLF, ODS2_RAT_CR, 3, 0));     /* LRL 0 asked: the file's own longest line, 3 */
     create_and_check(&vol, "RAW.DAT", kit, 777, attrs(ODS2_RFM_UDF, 0, 512, 512));
     create_and_check(&vol, "CARDS.DAT", kit, 800, attrs(ODS2_RFM_FIX, ODS2_RAT_CR, 80, 80));
     create_and_check(&vol, "EMPTY.PCSI", kit, 0, attrs(ODS2_RFM_FIX, 0, 8192, 8192));
@@ -238,17 +238,70 @@ int main(void)
                "anything is allocated (%s)\n", r.problem);
     }
 
-    /* --- ods2_create_file() unchanged --- */
+    /* --- ods2_create_file(): a stream file has MRS 0 and its own longest record (it was MRS 512, which RMS refuses when a
+       line is longer: %RMS-W-RTB), a fixed one is unchanged --- */
     {
         uint8_t root[512], h[512];
         const ods2_head_core_t *core = (const ods2_head_core_t *) h;
+        static uint8_t longline[2000];
         ods2_fid_t fid;
         assert(ods2_read_header(&vol, 4, root).ok);
-        assert(ods2_create_file(&vol, root, "LEGACY.TXT", kit, 10, ODS2_RFM_STMLF, &fid).ok);
+        memset(longline, 'x', sizeof(longline));
+        longline[1500] = '\n';                 /* a line of 1500 bytes, then one of 499 */
+        assert(ods2_create_file(&vol, root, "LEGACY.TXT", longline, sizeof(longline), ODS2_RFM_STMLF, &fid).ok);
         assert(ods2_read_header(&vol, fid.fid_num, h).ok);
         assert(core->recattr.rtype == ODS2_RFM_STMLF && core->recattr.rattrib == 0 &&
-               core->recattr.rsize == 512 && core->recattr.maxrec == 512);
-        printf("PASS: ods2_create_file() still writes RSIZE = MRS = 512, RAT none\n");
+               core->recattr.rsize == 1500 && core->recattr.maxrec == 0);
+        assert(ods2_create_file(&vol, root, "LEGACY.DAT", kit, 1024, ODS2_RFM_FIX, &fid).ok);
+        assert(ods2_read_header(&vol, fid.fid_num, h).ok);
+        assert(core->recattr.rtype == ODS2_RFM_FIX && core->recattr.rsize == 512 && core->recattr.maxrec == 512);
+        printf("PASS: ods2_create_file() writes a Stream_LF file with MRS 0 and its longest line (1500) as LRL; a fixed one "
+               "is still 512 / 512\n");
+        /* ods2_create_file_attrs(): a record longer than MRS or LRL is refused, not created */
+        {
+            ods2_record_attrs_t a = attrs(ODS2_RFM_STMLF, ODS2_RAT_CR, 0, 512);
+            assert(!ods2_create_file_attrs(&vol, root, "TOOLONG1.TXT", longline, sizeof(longline), &a, &fid).ok);
+            a = attrs(ODS2_RFM_STMLF, ODS2_RAT_CR, 100, 0);
+            assert(!ods2_create_file_attrs(&vol, root, "TOOLONG2.TXT", longline, sizeof(longline), &a, &fid).ok);
+            a = attrs(ODS2_RFM_STMLF, ODS2_RAT_CR, 0, 0);          /* LRL 0: the file's own */
+            assert(ods2_create_file_attrs(&vol, root, "OWN.TXT", longline, sizeof(longline), &a, &fid).ok);
+            assert(ods2_read_header(&vol, fid.fid_num, h).ok);
+            assert(core->recattr.rsize == 1500 && core->recattr.maxrec == 0);
+            a = attrs(ODS2_RFM_UDF, 0, 0, 0);                     /* UDF with no LRL: the length */
+            assert(ods2_create_file_attrs(&vol, root, "UDFOWN.DAT", longline, 777, &a, &fid).ok);
+            assert(ods2_read_header(&vol, fid.fid_num, h).ok);
+            assert(core->recattr.rsize == 777 && core->recattr.maxrec == 0);
+            /* record lengths as RMS reads them (measured on V8.4, V7.3-2 and VAX V7.3) */
+            assert(ods2_longest_record(ODS2_RFM_STMCR, (const uint8_t *) "ab\rcdef\rg", 10) == 4);
+            assert(ods2_longest_record(ODS2_RFM_STM, (const uint8_t *) "ab\r\ncd\nef\r\n", 12) == 3);   /* ab | cd LF | ef */
+            assert(ods2_longest_record(ODS2_RFM_STM, (const uint8_t *) "abc\n", 4) == 4);              /* LF stays */
+            assert(ods2_longest_record(ODS2_RFM_STM, (const uint8_t *) "abc\f", 4) == 4);              /* FF stays */
+            assert(ods2_longest_record(ODS2_RFM_STM, (const uint8_t *) "abc\v", 4) == 4);              /* VT stays */
+            assert(ods2_longest_record(ODS2_RFM_STM, (const uint8_t *) "abc\r\n", 5) == 3);            /* CR LF stripped */
+            assert(ods2_longest_record(ODS2_RFM_STM, (const uint8_t *) "abc\rdef\n", 8) == 8);         /* a lone CR is data */
+            assert(ods2_longest_record(ODS2_RFM_STM, (const uint8_t *) "abc\r\r\ndef", 9) == 4);       /* abc CR | def */
+            assert(ods2_longest_record(ODS2_RFM_STM, (const uint8_t *) "abc\r\fz", 6) == 5);           /* CR FF: CR is data */
+            assert(ods2_longest_record(ODS2_RFM_STMLF, (const uint8_t *) "abc\r\nde", 7) == 4);        /* the CR stays */
+            assert(ods2_longest_record(ODS2_RFM_STMLF, (const uint8_t *) "abc\fde\vf", 8) == 8);       /* FF, VT are data */
+            assert(ods2_longest_record(ODS2_RFM_STMCR, (const uint8_t *) "abc\r\nde\r", 8) == 3);      /* abc | LF de */
+            {
+                ods2_reclen_t st;                                                                      /* CR LF split between two pieces */
+                ods2_reclen_init(&st, ODS2_RFM_STM);
+                ods2_reclen_feed(&st, (const uint8_t *) "abc\r", 4);
+                ods2_reclen_feed(&st, (const uint8_t *) "\ndefg", 5);
+                assert(ods2_reclen_longest(&st) == 4);                                                  /* abc | defg */
+            }
+            printf("PASS: a stream record longer than MRS or LRL is refused; LRL 0 becomes the longest record; the record "
+                   "ends are RMS's\n");
+        }
+        /* an ODS-2 directory name cannot start with '-' (VAX V7.3 reads it as the parent directory) */
+        {
+            ods2_fid_t d;
+            ods2_result_t cr = ods2_create_directory(&vol, root, "-DASH", &d);
+            assert(!cr.ok && strstr(cr.problem, "cannot start with '-'") != NULL);
+            assert(ods2_create_directory(&vol, root, "A-B", &d).ok && ods2_create_directory(&vol, root, "C-", &d).ok);
+            printf("PASS: CREATE/DIRECTORY of -DASH is refused on ODS-2; A-B and C- are fine\n");
+        }
     }
 
     ods2_dismount(&vol);

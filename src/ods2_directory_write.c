@@ -168,6 +168,15 @@ bool ods2_valid_dir_name(const char *name, const char **why)
         *why = "an ODS-2 directory name is limited to 39 characters";
         return false;
     }
+    if (name[0] == '-') {
+        /* VAX VMS (V7.3) reads a '-' that starts a directory component as "the parent directory" ([-], [A.-.B]) and an ODS-2
+           volume has no '^' escape for it, so nothing inside such a directory can be named there (%CLI-W-PARSEFAIL,
+           %RMS-F-SYN, every file in it); Alpha V8.4 can reach it */
+        *why = "an ODS-2 directory name cannot start with '-': VAX VMS (V7.3) reads a leading '-' as the parent directory and "
+               "cannot reach files inside (%RMS-F-SYN; ODS-2 has no '^' escape); Alpha V8.4 can. Refused because an ODS-2 "
+               "volume is the one that goes to VAXen";
+        return false;
+    }
     for (i = 0; i < len; i++) {
         char c = (char) toupper((unsigned char) name[i]);
         if (!name_char_ok(c)) {

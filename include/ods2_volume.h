@@ -363,10 +363,31 @@ const char *ods2_check_record_attrs(const ods2_record_attrs_t *attrs, size_t con
  * one carriage control; no unknown RAT bits. */
 const char *ods2_check_var_record_attrs(const ods2_record_attrs_t *attrs, size_t content_len);
 
+/* Is `rtype` a stream format (STM, STMLF, STMCR)? And the record length rules of stream files as RMS applies them (see
+ * ods2_reclen_feed in ods2_volume.c): the longest record of content fed in order, in any pieces. */
+bool ods2_stream_format(uint8_t rtype);
+typedef struct {
+    uint8_t rtype;
+    size_t cur, longest;
+    bool prev_cr;
+} ods2_reclen_t;
+void ods2_reclen_init(ods2_reclen_t *s, uint8_t rtype);
+void ods2_reclen_feed(ods2_reclen_t *s, const uint8_t *data, size_t len);
+size_t ods2_reclen_longest(const ods2_reclen_t *s);
+size_t ods2_longest_record(uint8_t rtype, const uint8_t *data, size_t len);
+
+/* SET FILE/ATTRIBUTES=(MRS:0): a sequential Stream, Stream_LF or Stream_CR file with a maximum record size (MRS), or with an
+ * LRL below its longest record, gets MRS 0 and its own longest record (at most 32767) as LRL, as VMS makes such files (RMS cannot
+ * read one with a longer line in record mode: %RMS-W-RTB). Only the file's header changes; *changed is 1 if it did, 0 if it
+ * needed nothing (another format, or MRS 0 and LRL enough). */
+ods2_result_t ods2_set_stream_record_sizes(ods2_volume_t *vol, ods2_fid_t fid, unsigned *changed);
+
 /* ods2_create_file() with chosen record attributes, checked first by
  * ods2_check_record_attrs() - a file whose attributes don't fit its
- * content is refused, not created. ods2_create_file(..., rtype, ...)
- * is this with rattrib 0 and RSIZE = MRS = 512, unchecked, as before.
+ * content is refused, not created: so is a stream file with a record longer than its MRS (when not 0) or its LRL; an LRL of 0
+ * for a stream file becomes its longest record (for a UDF file with MRS 0, its length). ods2_create_file(..., rtype, ...) is
+ * this with rattrib 0 and: FIX - RSIZE = MRS = 512, unchecked, as before; stream (STM, STMLF, STMCR) - MRS 0 and RSIZE the
+ * longest record (at most 32767); UDF - MRS 0 and RSIZE the length (at most 32767).
  */
 ods2_result_t ods2_create_file_attrs(ods2_volume_t *vol, const uint8_t *parent_header,
                                       const char *name, const uint8_t *content,

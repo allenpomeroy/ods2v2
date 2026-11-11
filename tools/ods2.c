@@ -612,6 +612,67 @@ static void cmd_set_version_limit(ods2_volume_t *vol, const ods2_parsed_path_t *
     }
 }
 
+/* SET FILE/ATTRIBUTES=(MRS:0) <spec>: repairs Stream, Stream_LF and Stream_CR files whose MRS is not 0 or whose LRL is below
+   their longest record (ods2v2 gave every stream file MRS = LRL = 512; record-mode reads of a file with a longer line then fail:
+   %RMS-W-RTB): MRS 0 and LRL the file's own longest record (at most 32767), as VMS makes such files. A file already in that
+   state is left alone, silently. The data is not touched. */
+typedef struct {
+    unsigned files, changed;
+} recsize_ctx_t;
+
+static void recsize_entry(void *ctx_, ods2_volume_t *vol, const char *dir_spelling, const ods2_dir_entry_t *e)
+{
+    recsize_ctx_t *x = (recsize_ctx_t *) ctx_;
+    unsigned changed = 0;
+    ods2_result_t r;
+
+    if (e->fid.fid_num >= 1 && e->fid.fid_num <= 10 && e->fid.fid_nmx == 0) return;
+    x->files++;
+    r = ods2_set_stream_record_sizes(vol, e->fid, &changed);
+    if (!r.ok) {
+        report_error("%%ODS2-E-RECSIZES, [%s]%s;%u: %s\n", dir_spelling, e->name, (unsigned) e->version, r.problem);
+        return;
+    }
+    x->changed += changed;
+}
+
+static void cmd_set_record_sizes(ods2_volume_t *vol, const ods2_parsed_path_t *p)
+{
+    recsize_ctx_t x;
+    char effective[ODS2_PATH_MAX], spec[ODS2_PATH_MAX + 4], start[ODS2_PATH_MAX], pattern[ODS2_PATH_MAX + 4];
+    const char *rest;
+    dir_walk_t w;
+
+    memset(&x, 0, sizeof(x));
+    resolve_effective_path(p, effective, sizeof(effective));
+    snprintf(spec, sizeof(spec), "%s%s", effective, p->recursive ? "..." : "");
+    rest = ods2_dir_spec_split_prefix(spec, start, sizeof(start));
+    if (rest == NULL) {
+        report_error("%%ODS2-E-BADPATH, [%s]: invalid directory specification\n", spec);
+        return;
+    }
+    if (p->filename[0] == '\0') snprintf(pattern, sizeof(pattern), "*.*");
+    else if (strchr(p->filename, '.') == NULL) snprintf(pattern, sizeof(pattern), "%s.*", p->filename);
+    else snprintf(pattern, sizeof(pattern), "%s", p->filename);
+    memset(&w, 0, sizeof(w));
+    w.vol = vol;
+    w.spec = rest;
+    w.pattern = pattern;
+    w.p = p;
+    g_entry_hook = recsize_entry;
+    g_entry_hook_ctx = &x;
+    g_entry_hook_vol = vol;
+    walk_directories(&w, start, "", 0);
+    g_entry_hook = NULL;
+    g_entry_hook_ctx = NULL;
+    if (x.files == 0 && w.errors == 0) {
+        fprintf(stderr, "%%ODS2-W-NOFILES, no files found\n");
+    } else {
+        printf("%%ODS2-I-RECSIZES, %u file%s looked at, %u stream file%s changed to MRS 0 and LRL the longest record\n",
+               x.files, x.files == 1 ? "" : "s", x.changed, x.changed == 1 ? "" : "s");
+    }
+}
+
 static void cmd_create_directory(ods2_volume_t *vol, const ods2_parsed_path_t *p)
 {
     /* CREATE/DIRECTORY [PARENT.NEWNAME] - the new directory's own
@@ -748,6 +809,7 @@ static bool keyword(const char *word, size_t len, const char *name, size_t min)
 typedef struct {
     bool convert;   /* /CONVERT: host text lines -> VAR records */
     bool mrs_given; /* MRS:n was given */
+    bool lrl_given; /* LRL:n was given */
 } copy_options_t;
 
 /* Parses COPY's qualifiers - everything after "COPY" in the command
@@ -912,6 +974,7 @@ static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a,
     }
 
     opts->mrs_given = mrs_given;
+    opts->lrl_given = lrl_given;
     if (opts->convert) {
         if (!rfm_given) a->rtype = ODS2_RFM_VAR;
         if (a->rtype != ODS2_RFM_VAR) {
@@ -938,6 +1001,50 @@ static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a,
         if (mrs_given && !lrl_given) a->rsize = a->maxrec;
         else if (lrl_given && !mrs_given) a->maxrec = a->rsize;
         else if (!mrs_given && !lrl_given) a->rsize = a->maxrec = 512;
+    }
+    /* A stream or undefined-format file has no maximum record size of its own: MRS 0, as VMS makes such files, unless MRS
+       was given. (The default of 512 left in MRS made RMS refuse any such file with a longer line: %RMS-W-RTB.) The
+       longest record (LRL) is the file's own, known when the host file is read: complete_stream_attrs(). */
+    if (!opts->convert && (a->rtype == ODS2_RFM_STM || a->rtype == ODS2_RFM_STMLF || a->rtype == ODS2_RFM_STMCR ||
+                           a->rtype == ODS2_RFM_UDF)) {
+        if (!mrs_given) a->maxrec = 0;
+    }
+    return true;
+}
+
+/* The record sizes of a stream or undefined-format file: LRL is the longest record of the host file (by RMS's record-end rules
+ * for the format: ods2_reclen_feed; the length for UDF; at most 32767, which is VMS's own state for a binary file with a longer
+ * "record") and MRS is 0 unless it was given. A size the user gave that is smaller than a record of the file is refused:
+ * RMS could not read the file back in record mode (%RMS-W-RTB, record too large for the user's buffer). */
+static bool complete_stream_attrs(const copy_options_t *opts, FILE *f, size_t length, ods2_record_attrs_t *attrs,
+                                  const char *path)
+{
+    uint8_t buf[65536];
+    ods2_reclen_t st;
+    size_t n, longest;
+
+    if (attrs->rtype == ODS2_RFM_UDF) {
+        if (!opts->lrl_given) attrs->rsize = (uint16_t) (length > 32767 ? 32767 : length);
+        return true;
+    }
+    if (!ods2_stream_format(attrs->rtype)) return true;
+    ods2_reclen_init(&st, attrs->rtype);
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) ods2_reclen_feed(&st, buf, n);
+    if (ferror(f) || fseek(f, 0, SEEK_SET) != 0) {
+        report_error("%%ODS2-E-READERR, error reading %s\n", path);
+        return false;
+    }
+    longest = ods2_reclen_longest(&st);
+    if (!opts->lrl_given) attrs->rsize = (uint16_t) (longest > 32767 ? 32767 : longest);
+    if (attrs->rsize < longest && attrs->rsize != 32767) {
+        report_error("%%ODS2-E-RECTOOLONG, %s: a record of %zu bytes is longer than LRL:%u - RMS would refuse to read the file "
+                     "(RMS-W-RTB)\n", path, longest, (unsigned) attrs->rsize);
+        return false;
+    }
+    if (attrs->maxrec != 0 && attrs->maxrec < longest) {
+        report_error("%%ODS2-E-RECTOOLONG, %s: a record of %zu bytes is longer than MRS:%u - RMS would refuse to read the file "
+                     "(RMS-W-RTB)\n", path, longest, (unsigned) attrs->maxrec);
+        return false;
     }
     return true;
 }
@@ -1051,6 +1158,10 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
         }
     }
 
+    if (!opts->convert && !complete_stream_attrs(opts, in.f, in.length, &attrs, local_file)) {
+        fclose(in.f);
+        return;
+    }
     {
         char effective_dir[ODS2_PATH_MAX];
         resolve_effective_path(p, effective_dir, sizeof(effective_dir));
@@ -1388,6 +1499,9 @@ static void print_help(void)
            "  SET DEFAULT path           set the current default directory\n"
            "  SHOW DEFAULT               show the current default directory\n"
            "  SET VOLUME/LABEL=name      relabel the volume (all home block copies)\n"
+           "  SET FILE/ATTRIBUTES=(MRS:0) spec   stream files made with a maximum record size (ods2v2 once gave every\n"
+           "                             Stream_LF file 512): MRS 0 and LRL the longest record, as VMS makes them\n"
+           "                             (RMS refused to read such a file with a longer line: RMS-W-RTB)\n"
            "  SET FILE/VERSION_LIMIT=n spec   the version limit of the entries a spec names (32767 or 0 = no limit,\n"
            "                             what VMS writes; volumes written before carry 1, and VMS then purges\n"
            "                             version 1 when it makes version 2)\n"
@@ -1464,6 +1578,28 @@ static bool execute_line(ods2_volume_t *vol, char *line)
             return true;
         }
         cmd_set_version_limit(vol, &p, (uint16_t) (limit == 0 ? 32767 : limit));
+        return true;
+    }
+    if (matches(tokens[0], "SET") && n > 1 && strncasecmp(tokens[1], "FILE/ATTRIBUTES=", 16) == 0) {
+        /* SET FILE/ATTRIBUTES=(MRS:0) <spec>: the only attribute change implemented */
+        ods2_parsed_path_t p;
+        const char *v = tokens[1] + 16;
+        char norm[32];
+        size_t k = 0;
+        for (; *v != '\0' && k + 1 < sizeof(norm); v++) {
+            if (*v != '(' && *v != ')') norm[k++] = (char) toupper((unsigned char) *v);
+        }
+        norm[k] = '\0';
+        if (n < 3 || (strcmp(norm, "MRS:0") != 0 && strcmp(norm, "MRS=0") != 0)) {
+            report_error("%%ODS2-E-NOPARM, usage: SET FILE/ATTRIBUTES=(MRS:0) <spec>   (the only change implemented: it makes "
+                         "stream files that were made with a maximum record size 512 readable by RMS again)\n");
+            return true;
+        }
+        if (!ods2_parse_path(tokens[2], &p)) {
+            report_error("%%ODS2-E-BADPATH, could not parse %s\n", tokens[2]);
+            return true;
+        }
+        cmd_set_record_sizes(vol, &p);
         return true;
     }
     if (matches(tokens[0], "SET") && n > 1 && is_volume_word(tokens[1])) {
@@ -1571,7 +1707,7 @@ static bool execute_line(ods2_volume_t *vol, char *line)
         attrs.rtype = ODS2_RFM_STMLF;
         attrs.rattrib = 0;
         attrs.rsize = 512;
-        attrs.maxrec = 512;
+        attrs.maxrec = 0;           /* a stream file has MRS 0 and its own longest record as LRL (complete_stream_attrs) */
         if (quals != NULL && !parse_copy_qualifiers(quals, &attrs, &opts)) {
             return true;
         }

@@ -26,7 +26,8 @@ implementation guide here
 (https://www.openvmshobby.com/vax-vms/openvms-on-vax-simh/)
 along with an OpenVMS 7.1 "ISO" image from here
 (http://vaxhaven.com/cd-image/AG-QSBWB-BE.iso.zip)
-to get a VAX8600 running VMS 7.1 on a Ubuntu 24 Linux system.
+to get a VAX8600 running VMS 7.1 on a Rocky Linux 10.2 system.
+Will also work on Ubuntu 24 system.
 
 I also have hosted a copy of that ISO on my website here
 (https://pomeroy.us/vms-software/VAXVMS071.iso)

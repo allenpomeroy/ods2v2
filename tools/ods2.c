@@ -1425,7 +1425,11 @@ static void delete_wildcard(ods2_volume_t *vol, const uint8_t *dir_header, ods2_
     int count = 0, i, rank = 0, matched = 0, deleted = 0, failed = 0;
     ods2_result_t r;
     struct target { char name[ODS2_DIR_MAX_NAME + 1]; uint16_t version; } *targets;
+    char pat[ODS2_PATH_MAX + 2];
 
+    /* A spelling with no type means the null type, not any type (measured on OpenVMS V8.4 and VAX V7.3): "A*;*" is "A*.;*", it
+       takes AB. and ABC. but not A.TXT or AB.DAT; "A*.*" is how to say any type. */
+    snprintf(pat, sizeof(pat), "%s%s", pattern, strchr(pattern, '.') != NULL ? "" : ".");
     r = ods2_list_directory_alloc(vol, dir_header, &entries, &count);
     if (!r.ok) {
         report_error("%%ODS2-E-DELETEERR, %s: %s\n", pattern, r.problem);
@@ -1440,7 +1444,7 @@ static void delete_wildcard(ods2_volume_t *vol, const uint8_t *dir_header, ods2_
     for (i = 0; i < count; i++) {
         bool take;
         rank = (i > 0 && same_name(entries[i].name, entries[i - 1].name)) ? rank + 1 : 0;
-        if (!ods2_wildcard_match(pattern, entries[i].name)) continue;
+        if (!ods2_wildcard_match(pat, entries[i].name)) continue;
         if (p->version_wildcard) take = true;                                   /* ;*  every version */
         else if (!p->has_version || p->version == 0) take = (rank == 0);        /* the highest */
         else if (p->version > 0) take = (entries[i].version == (unsigned) p->version);

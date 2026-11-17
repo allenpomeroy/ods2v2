@@ -36,6 +36,10 @@
  *  - refused attributes create nothing and allocate nothing;
  *  - ods2_create_file() is unchanged: RSIZE = MRS = 512, RAT 0. */
 
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L /* fseeko */
+#endif
+#include <sys/types.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -53,19 +57,19 @@ static void copy_sparse(const char *src, const char *dst)
     static char buf[1 << 20];
     static const char zero[1 << 20];
     size_t n;
-    long total = 0;
+    off_t total = 0;
     char last;
     assert(in != NULL && out != NULL);
     while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
         if (n == sizeof(buf) && memcmp(buf, zero, n) == 0) {
-            assert(fseek(out, (long) n, SEEK_CUR) == 0);
+            assert(fseeko(out, (off_t) n, SEEK_CUR) == 0);
         } else {
             assert(fwrite(buf, 1, n, out) == n);
         }
-        total += (long) n;
+        total += (off_t) n;
     }
-    assert(fseek(in, total - 1, SEEK_SET) == 0 && fread(&last, 1, 1, in) == 1);
-    assert(fseek(out, total - 1, SEEK_SET) == 0 && fwrite(&last, 1, 1, out) == 1);
+    assert(fseeko(in, total - 1, SEEK_SET) == 0 && fread(&last, 1, 1, in) == 1);
+    assert(fseeko(out, total - 1, SEEK_SET) == 0 && fwrite(&last, 1, 1, out) == 1);
     fclose(in);
     fclose(out);
 }
@@ -224,14 +228,14 @@ int main(void)
         uint8_t bitmap_before[512], bitmap_after[512];
         ods2_result_t r;
         assert(ods2_read_header(&vol, 4, root).ok);
-        assert(fseek(vol.fp, (long) vol.home.ibmaplbn * 512, SEEK_SET) == 0);
+        assert(fseeko(vol.fp, (off_t) vol.home.ibmaplbn * 512, SEEK_SET) == 0);
         assert(fread(bitmap_before, 1, 512, vol.fp) == 512);
         r = ods2_create_file_attrs(&vol, root, "SHORT.PCSI", kit, 8192 + 100, &bad, &fid);
         assert(!r.ok);
         assert(strstr(r.problem, "whole number") != NULL);
         assert(ods2_read_header(&vol, 4, root).ok);
         assert(!ods2_lookup_name(&vol, root, "SHORT.PCSI", &fid).ok);
-        assert(fseek(vol.fp, (long) vol.home.ibmaplbn * 512, SEEK_SET) == 0);
+        assert(fseeko(vol.fp, (off_t) vol.home.ibmaplbn * 512, SEEK_SET) == 0);
         assert(fread(bitmap_after, 1, 512, vol.fp) == 512);
         assert(memcmp(bitmap_before, bitmap_after, 512) == 0);
         printf("PASS: a file that isn't a whole number of records is refused before "

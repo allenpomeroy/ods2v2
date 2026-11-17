@@ -38,7 +38,7 @@
    finish. */
 typedef struct {
     size_t records;          /* records the file converts to */
-    size_t converted_length; /* bytes, count words and pads included */
+    uint64_t converted_length; /* bytes, count words and pads included (a host file may exceed size_t on a 32-bit host) */
     size_t longest;          /* longest record (FAT$W_RSIZE), bytes */
     size_t too_long_line;    /* first line over ODS2_VAR_MAX_RECORD, 1-based; 0 if none */
     /* internal */

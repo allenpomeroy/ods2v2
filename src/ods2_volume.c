@@ -25,6 +25,9 @@
 #ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE /* flock(), fileno(), fdatasync() */
 #endif
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS 64 /* off_t is 64 bits: images and files above 2 GiB (the Makefile passes it too) */
+#endif
 
 #include "ods2_volume.h"
 #include "ods2_validate.h"
@@ -37,8 +40,12 @@
 #include <ctype.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sys/types.h>
 #include <sys/file.h>
 #include <stdlib.h>
+
+/* every seek in this file is fseeko() with an off_t: a 32-bit off_t would put LBNs above 2^22 (2 GiB) in the wrong place */
+_Static_assert(sizeof(off_t) >= 8, "off_t must be 64 bits: compile with -D_FILE_OFFSET_BITS=64");
 
 static ods2_result_t ok(void)
 {
@@ -129,7 +136,7 @@ static ods2_result_t mount_internal(const char *path, ods2_volume_t *vol,
                              : "the disk image is being written by another process (it is locked)");
     }
 
-    if (fseek(vol->fp, 512, SEEK_SET) != 0 ||
+    if (fseeko(vol->fp, 512, SEEK_SET) != 0 ||
         fread(&vol->home, 1, sizeof(vol->home), vol->fp) != sizeof(vol->home)) {
         ods2_dismount(vol);
         return fail("could not read home block");
@@ -146,7 +153,7 @@ static ods2_result_t mount_internal(const char *path, ods2_volume_t *vol,
        for the first 16 files. */
     {
         uint32_t lbn = vol->home.ibmaplbn + (vol->home.ibmapsize + 1 - 1);
-        if (fseek(vol->fp, (long) lbn * 512, SEEK_SET) != 0 ||
+        if (fseeko(vol->fp, (off_t) lbn * 512, SEEK_SET) != 0 ||
             fread(indexf_header, 1, sizeof(indexf_header), vol->fp) != sizeof(indexf_header)) {
             ods2_dismount(vol);
             return fail("could not read INDEXF.SYS's own header");
@@ -197,7 +204,7 @@ void ods2_fault_rollback(ods2_volume_t *vol)
 {
     while (fault_journal_n > 0) {
         fault_journal_n--;
-        if (fseek(vol->fp, (long) fault_journal[fault_journal_n].lbn * 512, SEEK_SET) != 0 ||
+        if (fseeko(vol->fp, (off_t) fault_journal[fault_journal_n].lbn * 512, SEEK_SET) != 0 ||
             fwrite(fault_journal[fault_journal_n].old, 1, 512, vol->fp) != 512) {
             abort();
         }
@@ -223,14 +230,14 @@ ods2_result_t ods2_write_block(ods2_volume_t *vol, uint32_t lbn, const uint8_t *
             if (fault_journal == NULL) abort();
         }
         fault_journal[fault_journal_n].lbn = lbn;
-        if (fseek(vol->fp, (long) lbn * 512, SEEK_SET) != 0 ||
+        if (fseeko(vol->fp, (off_t) lbn * 512, SEEK_SET) != 0 ||
             fread(fault_journal[fault_journal_n].old, 1, 512, vol->fp) != 512) {
             memset(fault_journal[fault_journal_n].old, 0, 512);
         }
         fault_journal_n++;
     }
 #endif
-    if (fseek(vol->fp, (long) lbn * 512, SEEK_SET) != 0 ||
+    if (fseeko(vol->fp, (off_t) lbn * 512, SEEK_SET) != 0 ||
         fwrite(block, 1, 512, vol->fp) != 512) {
         return fail("could not write block");
     }
@@ -274,7 +281,7 @@ ods2_result_t ods2_read_header(ods2_volume_t *vol, unsigned file_number, uint8_t
     if (!header_lbn(vol, file_number, &lbn)) {
         return fail("file number's header VBN is not covered by INDEXF.SYS's known extents");
     }
-    if (fseek(vol->fp, (long) lbn * 512, SEEK_SET) != 0 ||
+    if (fseeko(vol->fp, (off_t) lbn * 512, SEEK_SET) != 0 ||
         fread(header_out, 1, 512, vol->fp) != 512) {
         return fail("could not read file header block");
     }
@@ -345,7 +352,7 @@ ods2_result_t ods2_read_file_block(ods2_volume_t *vol, const uint8_t *header,
     if (!vbn_to_lbn(extents, n, vbn, &lbn)) {
         return fail("requested VBN is not covered by this file's extents");
     }
-    if (fseek(vol->fp, (long) lbn * 512, SEEK_SET) != 0 ||
+    if (fseeko(vol->fp, (off_t) lbn * 512, SEEK_SET) != 0 ||
         fread(block_out, 1, 512, vol->fp) != 512) {
         return fail("could not read file content block");
     }
@@ -600,8 +607,8 @@ typedef bool (*dir_visit_fn)(const ods2_dir_entry_t *entry, void *ctx);
    writes for a new one-block directory. */
 static unsigned dir_blocks_in_use(const uint8_t *dir_header, unsigned allocated)
 {
-    size_t len = ods2_file_content_length(dir_header);
-    size_t used = (len + 511) / 512;
+    uint64_t len = ods2_file_content_length(dir_header);
+    uint64_t used = (len + 511) / 512;
     return (used > allocated) ? allocated : (unsigned) used;
 }
 
@@ -758,7 +765,7 @@ ods2_result_t ods2_count_directory_entries(ods2_volume_t *vol, const uint8_t *di
     return ok();
 }
 
-size_t ods2_file_content_length(const uint8_t *header)
+uint64_t ods2_file_content_length(const uint8_t *header)
 {
     const ods2_head_core_t *core = (const ods2_head_core_t *) header;
     uint32_t efblk = ods2_word_swap32(core->recattr.efblk);
@@ -781,22 +788,22 @@ size_t ods2_file_content_length(const uint8_t *header)
     if (ffbyte > 512) {
         ffbyte = 512; /* out of range - never claim more than a block */
     }
-    return (size_t) (efblk - 1) * 512u + ffbyte;
+    return (uint64_t) (efblk - 1) * 512u + ffbyte;
 }
 
-size_t ods2_file_allocated_bytes(const uint8_t *header)
+uint64_t ods2_file_allocated_bytes(const uint8_t *header)
 {
     const ods2_head_core_t *core = (const ods2_head_core_t *) header;
-    return (size_t) ods2_word_swap32(core->recattr.hiblk) * 512u;
+    return (uint64_t) ods2_word_swap32(core->recattr.hiblk) * 512u;
 }
 
 ods2_result_t ods2_read_file_stream(ods2_volume_t *vol, const uint8_t *header,
                                      bool (*sink)(void *ctx, const uint8_t *data, size_t n),
-                                     void *ctx, size_t *bytes_out, bool *sink_failed_out)
+                                     void *ctx, uint64_t *bytes_out, bool *sink_failed_out)
 {
-    size_t content_len = ods2_file_content_length(header);
-    size_t allocated = ods2_file_allocated_bytes(header);
-    size_t written = 0;
+    uint64_t content_len = ods2_file_content_length(header);
+    uint64_t allocated = ods2_file_allocated_bytes(header);
+    uint64_t written = 0;
     ods2_result_t r = ok();
 
     if (bytes_out) *bytes_out = 0;
@@ -814,7 +821,7 @@ ods2_result_t ods2_read_file_stream(ods2_volume_t *vol, const uint8_t *header,
        in memory at once (issue #16). */
     if (content_len > 0) {
         ods2_extent_t extents[ODS2_MAX_EXTENTS];
-        size_t chunk_cap = content_len < ODS2_STREAM_CHUNK ? content_len : ODS2_STREAM_CHUNK;
+        size_t chunk_cap = content_len < ODS2_STREAM_CHUNK ? (size_t) content_len : ODS2_STREAM_CHUNK;
         uint8_t *chunk;
         int n, i;
 
@@ -823,15 +830,15 @@ ods2_result_t ods2_read_file_stream(ods2_volume_t *vol, const uint8_t *header,
         chunk = malloc(chunk_cap);
         if (chunk == NULL) return fail("could not allocate a read buffer");
         for (i = 0; i < n && written < content_len && r.ok; i++) {
-            size_t want = content_len - written;
-            size_t run = (size_t) extents[i].block_count * 512u;
+            uint64_t want = content_len - written;
+            uint64_t run = (uint64_t) extents[i].block_count * 512u;
             if (want > run) want = run;
-            if (fseek(vol->fp, (long) extents[i].lbn * 512, SEEK_SET) != 0) {
+            if (fseeko(vol->fp, (off_t) extents[i].lbn * 512, SEEK_SET) != 0) {
                 r = fail("could not read file content block");
                 break;
             }
             while (want > 0) {
-                size_t piece = want < chunk_cap ? want : chunk_cap;
+                size_t piece = want < chunk_cap ? (size_t) want : chunk_cap;
                 if (fread(chunk, 1, piece, vol->fp) != piece) {
                     r = fail("could not read file content block");
                     break;
@@ -877,7 +884,7 @@ ods2_result_t ods2_read_file(ods2_volume_t *vol, const uint8_t *header,
     if (ods2_file_content_length(header) > ods2_file_allocated_bytes(header)) {
         return fail("file's end-of-file mark lies beyond its allocated blocks");
     }
-    if (ods2_file_content_length(header) > buf_size) {
+    if (ods2_file_content_length(header) > (uint64_t) buf_size) {
         return fail("output buffer too small for file content");
     }
     ctx.buf = buf_out;
@@ -928,7 +935,7 @@ static ods2_result_t mark_index_bitmap(ods2_volume_t *vol, unsigned file_number,
     }
     lbn = vol->home.ibmaplbn + block_index;
 
-    if (fseek(vol->fp, (long) lbn * 512, SEEK_SET) != 0 ||
+    if (fseeko(vol->fp, (off_t) lbn * 512, SEEK_SET) != 0 ||
         fread(block, 1, 512, vol->fp) != 512) {
         return fail("could not read index bitmap block");
     }
@@ -1009,7 +1016,7 @@ static ods2_result_t read_index_bitmap_block(ods2_volume_t *vol, unsigned block_
                                              uint8_t *block)
 {
     uint32_t lbn = vol->home.ibmaplbn + block_index;
-    if (fseek(vol->fp, (long) lbn * 512, SEEK_SET) != 0 ||
+    if (fseeko(vol->fp, (off_t) lbn * 512, SEEK_SET) != 0 ||
         fread(block, 1, 512, vol->fp) != 512) {
         return fail("could not read index bitmap block");
     }
@@ -1594,9 +1601,9 @@ static ods2_result_t write_extents(ods2_volume_t *vol, const ods2_extent_t *exte
                                    int extent_count, ods2_content_source_t *src)
 {
     static const uint8_t zeros[65536];
-    size_t offset = 0;
-    size_t content_len = src->length;
-    size_t chunk_cap = content_len < ODS2_STREAM_CHUNK ? content_len : ODS2_STREAM_CHUNK;
+    uint64_t offset = 0;
+    uint64_t content_len = src->length;
+    size_t chunk_cap = content_len < ODS2_STREAM_CHUNK ? (size_t) content_len : ODS2_STREAM_CHUNK;
     uint8_t *chunk = NULL;
     ods2_result_t r = ok();
     int i;
@@ -1609,17 +1616,17 @@ static ods2_result_t write_extents(ods2_volume_t *vol, const ods2_extent_t *exte
         if (chunk == NULL) return fail("could not allocate a write buffer");
     }
     for (i = 0; i < extent_count && r.ok; i++) {
-        size_t run_bytes = (size_t) extents[i].block_count * 512u;
-        size_t data = (offset < content_len) ? content_len - offset : 0;
+        uint64_t run_bytes = (uint64_t) extents[i].block_count * 512u;
+        uint64_t data = (offset < content_len) ? content_len - offset : 0;
 
         if (data > run_bytes) data = run_bytes;
-        if (fseek(vol->fp, (long) extents[i].lbn * 512, SEEK_SET) != 0) {
+        if (fseeko(vol->fp, (off_t) extents[i].lbn * 512, SEEK_SET) != 0) {
             r = fail("could not seek to file content blocks");
             break;
         }
         run_bytes -= data;
         while (data > 0) {
-            size_t piece = data < chunk_cap ? data : chunk_cap;
+            size_t piece = data < chunk_cap ? (size_t) data : chunk_cap;
             if (!src->read(src->ctx, chunk, piece)) {
                 r = fail(src->problem != NULL ? src->problem
                                               : "could not read the file's content");
@@ -1633,7 +1640,7 @@ static ods2_result_t write_extents(ods2_volume_t *vol, const ods2_extent_t *exte
             offset += piece;
         }
         while (r.ok && run_bytes > 0) {
-            size_t n = (run_bytes < sizeof(zeros)) ? run_bytes : sizeof(zeros);
+            size_t n = (run_bytes < sizeof(zeros)) ? (size_t) run_bytes : sizeof(zeros);
             if (fwrite(zeros, 1, n, vol->fp) != n) {
                 r = fail("could not write file content blocks");
                 break;
@@ -1666,7 +1673,7 @@ static ods2_result_t create_file(ods2_volume_t *vol, const uint8_t *parent_heade
                                  const char *name, ods2_content_source_t *src,
                                  const ods2_record_attrs_t *attrs, ods2_fid_t *new_fid_out);
 
-const char *ods2_check_record_attrs(const ods2_record_attrs_t *attrs, size_t content_len)
+const char *ods2_check_record_attrs(const ods2_record_attrs_t *attrs, uint64_t content_len)
 {
     unsigned cc = attrs->rattrib & (ODS2_RAT_FTN | ODS2_RAT_CR | ODS2_RAT_PRN);
 
@@ -1721,7 +1728,7 @@ const char *ods2_check_record_attrs(const ods2_record_attrs_t *attrs, size_t con
     return NULL;
 }
 
-const char *ods2_check_var_record_attrs(const ods2_record_attrs_t *attrs, size_t content_len)
+const char *ods2_check_var_record_attrs(const ods2_record_attrs_t *attrs, uint64_t content_len)
 {
     unsigned cc = attrs->rattrib & (ODS2_RAT_FTN | ODS2_RAT_CR | ODS2_RAT_PRN);
 
@@ -1911,14 +1918,14 @@ static ods2_result_t create_file(ods2_volume_t *vol, const uint8_t *parent_heade
                                  const char *name, ods2_content_source_t *src,
                                  const ods2_record_attrs_t *attrs, ods2_fid_t *new_fid_out)
 {
-    size_t content_len = src->length;
+    uint64_t content_len = src->length;
     const ods2_head_core_t *parent_core = (const ods2_head_core_t *) parent_header;
     ods2_fid_t existing;
-    size_t blocks_needed;
-    size_t blocks_remaining;
+    uint64_t blocks_needed;
+    uint64_t blocks_remaining;
     ods2_extent_t extents[ODS2_MAX_EXTENTS];
     int extent_count = 0;
-    size_t total_allocated = 0;
+    uint64_t total_allocated = 0;
     unsigned max_request;
     int seg_first[ODS2_MAX_HEADER_SEGMENTS];
     int seg_count[ODS2_MAX_HEADER_SEGMENTS];
@@ -2971,7 +2978,7 @@ ods2_result_t ods2_set_volume_label(ods2_volume_t *vol, const char *label,
             break;
         }
         lbns[i] = lbn;
-        if (fseek(vol->fp, (long) lbn * 512, SEEK_SET) != 0 ||
+        if (fseeko(vol->fp, (off_t) lbn * 512, SEEK_SET) != 0 ||
             fread(blocks[i], 1, 512, vol->fp) != 512) {
             r = fail("could not read a home block copy");
             break;
@@ -3020,7 +3027,7 @@ ods2_result_t ods2_set_volume_label(ods2_volume_t *vol, const char *label,
     /* Read every copy back. */
     for (i = 0; r.ok && i < count; i++) {
         uint8_t back[512];
-        if (fseek(vol->fp, (long) lbns[i] * 512, SEEK_SET) != 0 ||
+        if (fseeko(vol->fp, (off_t) lbns[i] * 512, SEEK_SET) != 0 ||
             fread(back, 1, 512, vol->fp) != 512 || memcmp(back, blocks[i], 512) != 0) {
             r = fail("a home block copy didn't read back as written");
         }
@@ -3059,7 +3066,7 @@ ods2_result_t ods2_volume_space(ods2_volume_t *vol, uint64_t *total_blocks_out,
         uint32_t b;
         for (b = 0; b < extents[i].block_count; b++, vbn++) {
             uint32_t k;
-            if (fseek(vol->fp, (long) (extents[i].lbn + b) * 512, SEEK_SET) != 0 ||
+            if (fseeko(vol->fp, (off_t) (extents[i].lbn + b) * 512, SEEK_SET) != 0 ||
                 fread(block, 1, 512, vol->fp) != 512) {
                 return fail("could not read BITMAP.SYS");
             }

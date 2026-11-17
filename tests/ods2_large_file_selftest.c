@@ -42,6 +42,10 @@
  * Leaves samples/large_file_disk.img (with the 20 MiB file on it) for
  * tests/cli_large_file_check.sh. */
 
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L /* fseeko */
+#endif
+#include <sys/types.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -62,21 +66,21 @@ static void copy_sparse(const char *src, const char *dst)
     static char buf[1 << 20];
     static const char zero[1 << 20];
     size_t n;
-    long total = 0;
+    off_t total = 0;
     assert(in != NULL && out != NULL);
     while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
         if (n == sizeof(buf) && memcmp(buf, zero, n) == 0) {
-            assert(fseek(out, (long) n, SEEK_CUR) == 0);
+            assert(fseeko(out, (off_t) n, SEEK_CUR) == 0);
         } else {
             assert(fwrite(buf, 1, n, out) == n);
         }
-        total += (long) n;
+        total += (off_t) n;
     }
     /* Make sure a trailing hole still gives the full length. */
-    assert(fseek(out, total - 1, SEEK_SET) == 0);
+    assert(fseeko(out, total - 1, SEEK_SET) == 0);
     {
         char last;
-        assert(fseek(in, total - 1, SEEK_SET) == 0);
+        assert(fseeko(in, total - 1, SEEK_SET) == 0);
         assert(fread(&last, 1, 1, in) == 1);
         assert(fwrite(&last, 1, 1, out) == 1);
     }
@@ -138,7 +142,7 @@ static unsigned used_file_numbers(ods2_volume_t *vol)
     unsigned b, i, count = 0;
     for (b = 0; b < vol->home.ibmapsize; b++) {
         uint8_t block[512];
-        assert(fseek(vol->fp, (long) (vol->home.ibmaplbn + b) * 512, SEEK_SET) == 0);
+        assert(fseeko(vol->fp, (off_t) (vol->home.ibmaplbn + b) * 512, SEEK_SET) == 0);
         assert(fread(block, 1, 512, vol->fp) == 512);
         for (i = 0; i < 512; i++) {
             uint8_t v = block[i];
@@ -151,7 +155,7 @@ static unsigned used_file_numbers(ods2_volume_t *vol)
 static bool index_bit(ods2_volume_t *vol, unsigned n)
 {
     uint8_t block[512];
-    assert(fseek(vol->fp, (long) (vol->home.ibmaplbn + (n - 1) / 4096) * 512, SEEK_SET) == 0);
+    assert(fseeko(vol->fp, (off_t) (vol->home.ibmaplbn + (n - 1) / 4096) * 512, SEEK_SET) == 0);
     assert(fread(block, 1, 512, vol->fp) == 512);
     return (block[((n - 1) % 4096) / 8] >> ((n - 1) % 8)) & 1;
 }

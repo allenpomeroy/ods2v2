@@ -22,6 +22,10 @@
  * SOFTWARE.
  */
 
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L /* fseeko, ftello */
+#endif
+#include <sys/types.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,7 +36,7 @@ int main(int argc, char **argv)
 {
     const char *path = (argc > 1) ? argv[1] : "samples/sample.bin";
     FILE *f = fopen(path, "rb");
-    long offset;
+    off_t offset;
     int block_num;
     int copies_found = 0, copies_ok = 0;
 
@@ -49,15 +53,15 @@ int main(int argc, char **argv)
         ods2_home_t home;
         ods2_validate_result_t r;
 
-        offset = (long) block_num * 512;
-        if (fseek(f, offset, SEEK_SET) != 0) break;
+        offset = (off_t) block_num * 512;
+        if (fseeko(f, offset, SEEK_SET) != 0) break;
         if (fread(&home, 1, sizeof(home), f) != sizeof(home)) break;
 
         if (memcmp(home.format, "DECFILE11B  ", 12) != 0) continue;
 
         copies_found++;
-        printf("--- Home block copy at block %d (byte offset %ld) ---\n",
-               block_num, offset);
+        printf("--- Home block copy at block %d (byte offset %lld) ---\n",
+               block_num, (long long) offset);
         printf("  self-reference homelbn = %u (%s)\n", home.homelbn,
                (home.homelbn == (uint32_t) block_num) ? "MATCHES position" : "MISMATCH");
         printf("  volname   = \"%.12s\"\n", home.volname);

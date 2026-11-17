@@ -25,6 +25,7 @@
 /* setenv() is POSIX, not C11. */
 #define _POSIX_C_SOURCE 200809L
 
+#include <sys/types.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -173,7 +174,7 @@ int main(void)
         {
             FILE *check = fopen(DISK_PATH, "rb");
             assert(check != NULL);
-            assert(fseek(check, 500L * 512, SEEK_SET) == 0);
+            assert(fseeko(check, (off_t) 500 * 512, SEEK_SET) == 0);
             assert(fread(readback_block, 1, 512, check) == 512);
             fclose(check);
         }
@@ -211,7 +212,7 @@ int main(void)
         {
             uint8_t scb_pattern[512], scb_readback[512];
             FILE *raw;
-            long scb_offset = 1470477L * 512; /* BITMAP.SYS's VBN 1, from
+            off_t scb_offset = (off_t) 1470477 * 512; /* BITMAP.SYS's VBN 1, from
                                                    its real decoded extent */
             unsigned junk_lbn;
             unsigned junk_count;
@@ -219,7 +220,7 @@ int main(void)
             memset(scb_pattern, 0xaa, sizeof(scb_pattern));
             raw = fopen(DISK_PATH, "r+b");
             assert(raw != NULL);
-            assert(fseek(raw, scb_offset, SEEK_SET) == 0);
+            assert(fseeko(raw, scb_offset, SEEK_SET) == 0);
             assert(fwrite(scb_pattern, 1, sizeof(scb_pattern), raw) == sizeof(scb_pattern));
             fclose(raw);
 
@@ -228,7 +229,7 @@ int main(void)
 
             raw = fopen(DISK_PATH, "rb");
             assert(raw != NULL);
-            assert(fseek(raw, scb_offset, SEEK_SET) == 0);
+            assert(fseeko(raw, scb_offset, SEEK_SET) == 0);
             assert(fread(scb_readback, 1, sizeof(scb_readback), raw) == sizeof(scb_readback));
             fclose(raw);
 
@@ -282,7 +283,7 @@ int main(void)
             uint8_t bitmap_block[512];
             FILE *raw = fopen(DISK_PATH, "rb");
             assert(raw != NULL);
-            assert(fseek(raw, (long) wvol.home.ibmaplbn * 512, SEEK_SET) == 0);
+            assert(fseeko(raw, (off_t) wvol.home.ibmaplbn * 512, SEEK_SET) == 0);
             assert(fread(bitmap_block, 1, 512, raw) == 512);
             fclose(raw);
             assert(((bitmap_block[byte_index] >> bit_in_byte) & 1) == 1);
@@ -699,7 +700,7 @@ int main(void)
             uint8_t bitmap_block[512];
             FILE *raw = fopen(DISK_PATH, "rb");
             assert(raw != NULL);
-            assert(fseek(raw, (long) wvol.home.ibmaplbn * 512, SEEK_SET) == 0);
+            assert(fseeko(raw, (off_t) wvol.home.ibmaplbn * 512, SEEK_SET) == 0);
             assert(fread(bitmap_block, 1, 512, raw) == 512);
             fclose(raw);
             assert(((bitmap_block[byte_index] >> bit_in_byte) & 1) == 0);

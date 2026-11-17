@@ -14,7 +14,8 @@
 # dependencies everywhere - no separate install step on any platform.
 
 CC       = gcc
-CFLAGS   = -Wall -Wextra -std=c11 -Iinclude -g
+# -D_FILE_OFFSET_BITS=64: off_t is 64 bits on a 32-bit Unix host too (images and files above 2 GiB; issue #25)
+CFLAGS   = -Wall -Wextra -std=c11 -Iinclude -g -D_FILE_OFFSET_BITS=64
 SANFLAGS = -fsanitize=address,undefined
 BUILD    = build
 
@@ -41,7 +42,7 @@ MAIN_TOOLS = ods2
 DEV_TOOLS = read_home_block read_file_header ods2_ls ods2_cat ods2_mkdir \
             ods2_put ods2_check_headers ods2_dump_root ods2_dump_header ods2_rm
 
-TESTS = $(BUILD)/ods2_ondisk_selftest $(BUILD)/ods2_checksum_selftest $(BUILD)/ods2_validate_selftest $(BUILD)/ods2_bitmap_selftest $(BUILD)/ods2_indexf_selftest $(BUILD)/ods2_retrieval_selftest $(BUILD)/ods2_root_header_selftest $(BUILD)/ods2_directory_selftest $(BUILD)/ods2_volume_selftest $(BUILD)/ods2_wildcard_selftest $(BUILD)/ods2_read_file_selftest $(BUILD)/ods2_header_build_selftest $(BUILD)/ods2_directory_write_selftest $(BUILD)/ods2_path_selftest $(BUILD)/ods2_versions_selftest $(BUILD)/ods2_time_selftest $(BUILD)/ods2_file_alloc_selftest $(BUILD)/ods2_dir_order_selftest $(BUILD)/ods2_dir_eof_selftest $(BUILD)/ods2_verlimit_selftest $(BUILD)/ods2_fid_selftest $(BUILD)/ods2_integrity_selftest $(BUILD)/ods2_large_file_selftest $(BUILD)/ods2_record_attrs_selftest $(BUILD)/ods2_indexf_large_selftest $(BUILD)/ods2_text_var_selftest
+TESTS = $(BUILD)/ods2_ondisk_selftest $(BUILD)/ods2_checksum_selftest $(BUILD)/ods2_validate_selftest $(BUILD)/ods2_bitmap_selftest $(BUILD)/ods2_indexf_selftest $(BUILD)/ods2_retrieval_selftest $(BUILD)/ods2_root_header_selftest $(BUILD)/ods2_directory_selftest $(BUILD)/ods2_volume_selftest $(BUILD)/ods2_wildcard_selftest $(BUILD)/ods2_read_file_selftest $(BUILD)/ods2_header_build_selftest $(BUILD)/ods2_directory_write_selftest $(BUILD)/ods2_path_selftest $(BUILD)/ods2_versions_selftest $(BUILD)/ods2_time_selftest $(BUILD)/ods2_file_alloc_selftest $(BUILD)/ods2_dir_order_selftest $(BUILD)/ods2_dir_eof_selftest $(BUILD)/ods2_verlimit_selftest $(BUILD)/ods2_fid_selftest $(BUILD)/ods2_integrity_selftest $(BUILD)/ods2_large_file_selftest $(BUILD)/ods2_record_attrs_selftest $(BUILD)/ods2_indexf_large_selftest $(BUILD)/ods2_text_var_selftest $(BUILD)/ods2_off64_selftest
 
 .PHONY: all test tools dev-tools release clean starter-volume
 
@@ -134,6 +135,9 @@ $(BUILD)/ods2_verlimit_selftest: tests/ods2_verlimit_selftest.c $(VOLUME_SRCS) i
 
 $(BUILD)/ods2_dir_eof_selftest: tests/ods2_dir_eof_selftest.c $(VOLUME_SRCS) include/ods2_volume.h include/ods2_directory.h samples/synthetic_disk.img | $(BUILD)
 	$(CC) $(CFLAGS) $(SANFLAGS) tests/ods2_dir_eof_selftest.c $(VOLUME_SRCS) -o $@
+
+$(BUILD)/ods2_off64_selftest: tests/ods2_off64_selftest.c $(VOLUME_SRCS) include/ods2_volume.h include/ods2_header_build.h samples/synthetic_disk.img | $(BUILD)
+	$(CC) $(CFLAGS) $(SANFLAGS) tests/ods2_off64_selftest.c $(VOLUME_SRCS) -o $@
 
 $(BUILD)/ods2_large_file_selftest: tests/ods2_large_file_selftest.c $(VOLUME_SRCS) include/ods2_volume.h include/ods2_header_build.h samples/synthetic_disk.img | $(BUILD)
 	$(CC) $(CFLAGS) $(SANFLAGS) tests/ods2_large_file_selftest.c $(VOLUME_SRCS) -o $@
@@ -240,6 +244,8 @@ test: $(TESTS) tools ods2_put ods2_dump_header
 	@$(BUILD)/ods2_indexf_large_selftest
 	@echo "--- ods2_text_var_selftest ---"
 	@$(BUILD)/ods2_text_var_selftest
+	@echo "--- ods2_off64_selftest ---"
+	@$(BUILD)/ods2_off64_selftest
 	@echo "--- CLI file version checks ---"
 	@sh tests/cli_versions_check.sh
 	@echo "--- CLI directory wildcard checks ---"
@@ -262,6 +268,8 @@ test: $(TESTS) tools ods2_put ods2_dump_header
 	@sh tests/cli_volume_end_check.sh
 	@echo "--- cli_delete_wildcard_check ---"
 	@sh tests/cli_delete_wildcard_check.sh
+	@echo "--- cli_off64_check ---"
+	@sh tests/cli_off64_check.sh
 	@echo "--- CLI recursive DIR regression check ---"
 	@if command -v timeout >/dev/null 2>&1; then \
 		rm -f samples/cli_regression_disk.img; \

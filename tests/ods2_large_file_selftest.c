@@ -326,9 +326,9 @@ int main(void)
             assert(used_file_numbers(&vol) == files_before);
             assert(ods2_read_header(&vol, 4, root).ok);
             assert(!ods2_lookup_name(&vol, root, "BROKEN.BIN", &fid).ok);
-            printf("PASS: a streamed source failing after %zu of %zu bytes leaves no "
+            printf("PASS: a streamed source failing after %zu of %llu bytes leaves no "
                    "file and gives back every block and file number (%s)\n",
-                   fs.delivered, src.length, r.problem);
+                   fs.delivered, (unsigned long long) src.length, r.problem);
         }
 
         /* Content that takes every hole leaves no room for INDEXF.SYS

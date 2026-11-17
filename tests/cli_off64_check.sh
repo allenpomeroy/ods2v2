@@ -1,5 +1,5 @@
 #!/bin/sh
-# MIT License - Copyright (c) 2026 Allen Pomeroy (see LICENSE)
+# MIT License - Copyright (c) 2026 Douglas P. Fields, Jr. (symbolics@lisp.engineer) (see LICENSE)
 #
 # cli_off64_check.sh - a source-level guard for issue #25: nothing in the program may address an image or a host file with a
 # `long`. On a 64-bit Unix host `long` is 64 bits, so no run can tell the two apart; on a 32-bit host or on Windows (LLP64) a

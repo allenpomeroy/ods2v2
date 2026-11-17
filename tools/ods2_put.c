@@ -37,6 +37,10 @@
  *
  * Any size of file the volume has room for - see ods2_create_file().
  */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L /* fseeko, ftello */
+#endif
+#include <sys/types.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -51,13 +55,13 @@ static bool read_whole_file(const char *path, uint8_t **buf_out, size_t *len_out
     FILE *f = fopen(path, "rb");
     uint8_t *buf = NULL;
     size_t cap = 0, len = 0;
-    long size;
+    off_t size;
 
     if (f == NULL) {
         fprintf(stderr, "%%ODS2-E-OPENIN, could not open %s\n", path);
         return false;
     }
-    if (fseek(f, 0, SEEK_END) == 0 && (size = ftell(f)) >= 0 && fseek(f, 0, SEEK_SET) == 0) {
+    if (fseeko(f, 0, SEEK_END) == 0 && (size = ftello(f)) >= 0 && fseeko(f, 0, SEEK_SET) == 0) {
         cap = (size_t) size + 1; /* +1: a read that fills it means the file grew */
     } else {
         clearerr(f);

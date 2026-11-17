@@ -22,6 +22,10 @@
  * SOFTWARE.
  */
 
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L /* fseeko */
+#endif
+#include <sys/types.h>
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
@@ -136,7 +140,7 @@ int main(void)
             uint8_t raw[512];
             ods2_validate_result_t hr;
             size_t got;
-            if (fseek(f, 90L * 512, SEEK_SET) != 0) {
+            if (fseeko(f, (off_t) 90 * 512, SEEK_SET) != 0) {
                 printf("SKIP: could not seek to header 1\n");
             } else {
                 got = fread(raw, 1, sizeof(raw), f);

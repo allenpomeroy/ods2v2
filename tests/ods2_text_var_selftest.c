@@ -19,6 +19,10 @@
  *  - the volume refuses VAR content not marked as converted, and
  *    converted records with RAT:BLK or a longest record over MRS. */
 
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L /* fseeko */
+#endif
+#include <sys/types.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -139,7 +143,7 @@ static void copy_sparse(const char *src, const char *dst)
     assert(in != NULL && out != NULL);
     while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
         if (n == sizeof(buf) && memcmp(buf, zero, n) == 0) {
-            assert(fseek(out, (long) n, SEEK_CUR) == 0);
+            assert(fseeko(out, (off_t) n, SEEK_CUR) == 0);
         } else {
             assert(fwrite(buf, 1, n, out) == n);
         }

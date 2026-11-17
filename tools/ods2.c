@@ -718,7 +718,7 @@ static void cmd_create_directory(ods2_volume_t *vol, const ods2_parsed_path_t *p
 typedef struct {
     FILE *f;
     const char *path;
-    size_t length;
+    uint64_t length;   /* a host file may be larger than size_t holds on a 32-bit host */
     char problem[256];
 } host_input_t;
 
@@ -731,8 +731,8 @@ static bool host_input_read(void *ctx_, uint8_t *buf, size_t n)
         snprintf(in->problem, sizeof(in->problem), "error reading %s", in->path);
     } else {
         snprintf(in->problem, sizeof(in->problem),
-                 "%s became shorter while being copied (expected %zu bytes)",
-                 in->path, in->length);
+                 "%s became shorter while being copied (expected %llu bytes)",
+                 in->path, (unsigned long long) in->length);
     }
     return false;
 }
@@ -752,14 +752,15 @@ static bool host_input_open(const char *path, host_input_t *in)
     }
     if (fstat(fileno(f), &st) == 0 && S_ISREG(st.st_mode)) {
         in->f = f;
-        in->length = (size_t) st.st_size;
+        in->length = (uint64_t) st.st_size;
         return true;
     }
     /* No length to go by: spool it to a temporary file first. */
     {
         static uint8_t buf[1 << 16];
         FILE *spool = tmpfile();
-        size_t n, total = 0;
+        size_t n;
+        uint64_t total = 0;
 
         if (spool == NULL) {
             report_error("%%ODS2-E-OPENIN, could not create a temporary file to "
@@ -784,7 +785,7 @@ static bool host_input_open(const char *path, host_input_t *in)
             return false;
         }
         fclose(f);
-        if (fflush(spool) != 0 || fseek(spool, 0, SEEK_SET) != 0) {
+        if (fflush(spool) != 0 || fseeko(spool, 0, SEEK_SET) != 0) {
             report_error("%%ODS2-E-READERR, could not reread the temporary copy of %s\n",
                          path);
             fclose(spool);
@@ -1019,7 +1020,7 @@ static bool parse_copy_qualifiers(const char *quals, ods2_record_attrs_t *a,
  * for the format: ods2_reclen_feed; the length for UDF; at most 32767, which is VMS's own state for a binary file with a longer
  * "record") and MRS is 0 unless it was given. A size the user gave that is smaller than a record of the file is refused:
  * RMS could not read the file back in record mode (%RMS-W-RTB, record too large for the user's buffer). */
-static bool complete_stream_attrs(const copy_options_t *opts, FILE *f, size_t length, ods2_record_attrs_t *attrs,
+static bool complete_stream_attrs(const copy_options_t *opts, FILE *f, uint64_t length, ods2_record_attrs_t *attrs,
                                   const char *path)
 {
     uint8_t buf[65536];
@@ -1033,7 +1034,7 @@ static bool complete_stream_attrs(const copy_options_t *opts, FILE *f, size_t le
     if (!ods2_stream_format(attrs->rtype)) return true;
     ods2_reclen_init(&st, attrs->rtype);
     while ((n = fread(buf, 1, sizeof(buf), f)) > 0) ods2_reclen_feed(&st, buf, n);
-    if (ferror(f) || fseek(f, 0, SEEK_SET) != 0) {
+    if (ferror(f) || fseeko(f, 0, SEEK_SET) != 0) {
         report_error("%%ODS2-E-READERR, error reading %s\n", path);
         return false;
     }
@@ -1101,7 +1102,7 @@ static bool convert_scan(host_input_t *in, ods2_text_var_scan_t *scan)
                      ODS2_VAR_MAX_RECORD);
         return false;
     }
-    if (fseek(in->f, 0, SEEK_SET) != 0) {
+    if (fseeko(in->f, 0, SEEK_SET) != 0) {
         report_error("%%ODS2-E-READERR, could not reread %s\n", in->path);
         return false;
     }
@@ -1201,8 +1202,8 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
                          local_file);
         } else if (grew) {
             fprintf(stderr, "%%ODS2-W-CHANGED, %s grew while being copied; only its "
-                    "first %zu bytes were written - copy it again\n",
-                    local_file, in.length);
+                    "first %llu bytes were written - copy it again\n",
+                    local_file, (unsigned long long) in.length);
         }
     }
     ods2_text_var_encoder_free(conv.enc);
@@ -1219,11 +1220,11 @@ static void cmd_copy(ods2_volume_t *vol, const char *local_file, const ods2_pars
             snprintf(stored, sizeof(stored), "%s", name);
         }
         if (opts->convert) {
-            printf("%%ODS2-I-COPIED, %zu bytes to %s;1 as %zu variable-length "
-                   "record%s (longest %zu)\n", in.length, stored, scan.records,
+            printf("%%ODS2-I-COPIED, %llu bytes to %s;1 as %zu variable-length "
+                   "record%s (longest %zu)\n", (unsigned long long) in.length, stored, scan.records,
                    scan.records == 1 ? "" : "s", scan.longest);
         } else {
-            printf("%%ODS2-I-COPIED, %zu bytes to %s;1\n", in.length, stored);
+            printf("%%ODS2-I-COPIED, %llu bytes to %s;1\n", (unsigned long long) in.length, stored);
         }
     }
 }
@@ -1401,12 +1402,12 @@ static void cmd_type(ods2_volume_t *vol, const ods2_parsed_path_t *p)
        the file got less than all of it. */
     {
         bool sink_failed = false;
-        size_t bytes = 0;
+        uint64_t bytes = 0;
         r = ods2_read_file_stream(vol, file_header, stdout_sink, NULL, &bytes, &sink_failed);
         if (r.ok && fflush(stdout) != 0) sink_failed = true;
         if (sink_failed) {
-            report_error("%%ODS2-E-WRITEERR, %s: could not write all %zu bytes to output\n",
-                         spec, ods2_file_content_length(file_header));
+            report_error("%%ODS2-E-WRITEERR, %s: could not write all %llu bytes to output\n",
+                         spec, (unsigned long long) ods2_file_content_length(file_header));
         } else if (!r.ok) {
             report_error("%%ODS2-E-READERR, %s: %s\n", spec, r.problem);
         }

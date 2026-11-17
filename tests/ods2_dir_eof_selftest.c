@@ -42,6 +42,10 @@
  *    (2,0), the zero block outside it, block 1 holding the entry or,
  *    after a delete, its end-of-records marker. */
 
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L /* fseeko */
+#endif
+#include <sys/types.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -61,18 +65,18 @@ static void copy_sparse(const char *src, const char *dst)
     static const uint8_t zero[512];
     uint8_t buf[512];
     size_t n;
-    long total = 0;
+    off_t total = 0;
 
     assert(in != NULL && out != NULL);
     while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
         if (n == sizeof(buf) && memcmp(buf, zero, sizeof(buf)) == 0) {
-            assert(fseek(out, (long) n, SEEK_CUR) == 0);
+            assert(fseeko(out, (off_t) n, SEEK_CUR) == 0);
         } else {
             assert(fwrite(buf, 1, n, out) == n);
         }
-        total += (long) n;
+        total += (off_t) n;
     }
-    assert(fseek(out, total - 1, SEEK_SET) == 0);
+    assert(fseeko(out, total - 1, SEEK_SET) == 0);
     assert(fputc(0, out) != EOF);
     fclose(in);
     fclose(out);

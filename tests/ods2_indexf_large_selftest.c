@@ -44,6 +44,10 @@
  * in that extent. Every one is found at the LBN expected, valid, and
  * INDEXF.SYS's header and backup stay identical and valid. */
 
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L /* fseeko */
+#endif
+#include <sys/types.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -73,7 +77,7 @@ static void copy_sparse(const char *src, const char *dst)
     assert(in != NULL && out != NULL);
     while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
         if (n == sizeof(buf) && memcmp(buf, zero, n) == 0) {
-            assert(fseek(out, (long) n, SEEK_CUR) == 0);
+            assert(fseeko(out, (off_t) n, SEEK_CUR) == 0);
         } else {
             assert(fwrite(buf, 1, n, out) == n);
         }
@@ -84,7 +88,7 @@ static void copy_sparse(const char *src, const char *dst)
 
 static void read_block(ods2_volume_t *vol, uint32_t lbn, uint8_t *block)
 {
-    assert(fseek(vol->fp, (long) lbn * 512, SEEK_SET) == 0);
+    assert(fseeko(vol->fp, (off_t) lbn * 512, SEEK_SET) == 0);
     assert(fread(block, 1, 512, vol->fp) == 512);
 }
 

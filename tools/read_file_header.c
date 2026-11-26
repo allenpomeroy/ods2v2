@@ -22,6 +22,10 @@
  * SOFTWARE.
  */
 
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L /* fseeko, ftello */
+#endif
+#include <sys/types.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "ods2_ondisk.h"
@@ -29,7 +33,7 @@
 int main(int argc, char **argv)
 {
     const char *path = (argc > 1) ? argv[1] : "samples/indexf_headers.bin";
-    long header_byte_offset = (argc > 2) ? atol(argv[2]) : (90L * 512); /* header 1, right after the 90-block bitmap extract */
+    off_t header_byte_offset = (argc > 2) ? (off_t) atoll(argv[2]) : (off_t) 90 * 512; /* header 1, right after the 90-block bitmap extract */
     FILE *f = fopen(path, "rb");
     ods2_head_core_t head;
 
@@ -37,8 +41,8 @@ int main(int argc, char **argv)
         perror("fopen");
         return 1;
     }
-    if (fseek(f, header_byte_offset, SEEK_SET) != 0) {
-        perror("fseek");
+    if (fseeko(f, header_byte_offset, SEEK_SET) != 0) {
+        perror("fseeko");
         return 1;
     }
     if (fread(&head, 1, sizeof(head), f) != sizeof(head)) {
@@ -47,7 +51,7 @@ int main(int argc, char **argv)
     }
     fclose(f);
 
-    printf("--- File header at byte offset %ld ---\n", header_byte_offset);
+    printf("--- File header at byte offset %lld ---\n", (long long) header_byte_offset);
     printf("mpoffset  = %u (word offset to Map Area)\n", head.mpoffset);
     printf("idoffset  = %u (word offset to Ident Area)\n", head.idoffset);
     printf("rsoffset  = %u\n", head.rsoffset);

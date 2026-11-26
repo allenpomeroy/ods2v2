@@ -109,7 +109,15 @@ int main(int argc, char **argv)
        ods2_read_file() will return), after checking the header does
        not claim more than the file actually has allocated - a
        corrupt header must not drive an absurd allocation. */
-    buf_size = ods2_file_content_length(file_header);
+    {
+        uint64_t content = ods2_file_content_length(file_header);
+        if (content > SIZE_MAX) {
+            fprintf(stderr, "%s: the file is larger than this program can hold in memory\n", argv[3]);
+            ods2_dismount(&vol);
+            return 1;
+        }
+        buf_size = (size_t) content;
+    }
     if (buf_size > ods2_file_allocated_bytes(file_header)) {
         fprintf(stderr, "%s: end-of-file mark lies beyond the file's allocated "
                         "blocks (corrupt header?)\n", argv[3]);

@@ -36,6 +36,10 @@
  *  - a volume left with headers beyond the end-of-file by earlier
  *    ods2v2 versions is put right by the next create. */
 
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L /* fseeko */
+#endif
+#include <sys/types.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -65,7 +69,7 @@ static uint32_t word_swap(uint32_t v) { return (v << 16) | (v >> 16); }
 
 static void read_block(ods2_volume_t *vol, uint32_t lbn, uint8_t *block)
 {
-    assert(fseek(vol->fp, (long) lbn * 512, SEEK_SET) == 0);
+    assert(fseeko(vol->fp, (off_t) lbn * 512, SEEK_SET) == 0);
     assert(fread(block, 1, 512, vol->fp) == 512);
 }
 
